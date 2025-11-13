@@ -126,41 +126,71 @@ class AsyncPingExecutor(PingExecutor):
         self.tester = tester
     
     async def tcp_ping_async(self, ip: str) -> Optional[Tuple[float, float]]:
-        """异步TCP连接测试"""
+        """异步TCP连接测试（激进策略：第一次失败立即放弃）"""
         success_count = 0
         total_latency = 0.0
+        latencies = []
+        timeout = self.tester.args.timeout
         
-        for _ in range(self.tester.args.t):
+        # ✅ 添加初始随机延迟，避免多个IP同步竞争
+        initial_delay = random.uniform(0, 0.02)  # 0-20ms随机延迟
+        await asyncio.sleep(initial_delay)
+        
+        for i in range(self.tester.args.t):
+            writer = None
             try:
                 start = time.perf_counter()
                 reader, writer = await asyncio.wait_for(
                     asyncio.open_connection(ip, self.tester.args.tp),
-                    timeout=DEFAULT_TIMEOUT
+                    timeout=timeout
                 )
-                # ✅ 连接成功立即记录延迟（不包括关闭时间）
                 latency_ms = (time.perf_counter() - start) * 1000
                 total_latency += latency_ms
                 success_count += 1
+                latencies.append(latency_ms)
                 
-                # ✅ 关闭操作在延迟测量之后（不影响结果）
-                writer.close()
-                try:
-                    await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
-                except asyncio.TimeoutError:
-                    pass  # 关闭超时不影响测试结果
-                    
-            except (asyncio.TimeoutError, OSError, ConnectionRefusedError):
+                if self.tester.debug:
+                    print(f"      [{ip}] 第{i+1}次: {latency_ms:.2f}ms")
+                
+            except (asyncio.TimeoutError, OSError, ConnectionRefusedError) as e:
+                if self.tester.debug:
+                    print(f"      [{ip}] 第{i+1}次: 失败 ({type(e).__name__})")
+                
+                # 激进策略：第一次失败直接放弃
+                if i == 0:
+                    if self.tester.debug:
+                        print(f"      [{ip}] 第一次测试失败，放弃该IP")
+                    return None
+                
                 continue
+            finally:
+                if writer:
+                    try:
+                        writer.close()
+                    except:
+                        pass
+                
+                # ✅ 固定延迟 + 随机抖动，打破同步
+                if i < self.tester.args.t - 1:
+                    jitter = random.uniform(0, 0.01)  # 0-10ms随机抖动
+                    await asyncio.sleep(0.05 + jitter)  # 50ms + 抖动
         
         if success_count == 0:
             return None
         
         avg_latency = total_latency / success_count
         loss_rate = 1 - (success_count / self.tester.args.t)
+        
+        if self.tester.debug and latencies:
+            min_lat = min(latencies)
+            max_lat = max(latencies)
+            print(f"      [{ip}] 平均:{avg_latency:.2f}ms, 最小:{min_lat:.2f}ms, 最大:{max_lat:.2f}ms, 成功:{success_count}/{self.tester.args.t}")
+        
         return avg_latency, loss_rate
     
     async def worker_async(self, ip: str, semaphore: asyncio.Semaphore) -> Optional[TestResult]:
-        """异步工作协程（带信号量限制）"""
+        """异步工作协程（信号量控制整个IP的测试）"""
+        # ✅ 在整个IP测试期间持有信号量，而不是每次连接时获取
         async with semaphore:
             result = await self.tcp_ping_async(ip)
             
@@ -462,6 +492,8 @@ class CloudflareSpeedTest:
                           help="测试端口 (默认443)")
         parser.add_argument("-url", default=DEFAULT_URL, 
                           help="下载测试URL")
+        parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
+                          help="连接超时时间/秒 (默认5，建议3-10)")
         
         # 异步参数（新增）
         parser.add_argument("--async-ping", action="store_true",
@@ -530,6 +562,8 @@ class CloudflareSpeedTest:
             parser.error("下载测试次数必须在1-5之间")
         if not 0.5 <= args.sample_rate <= 5.0:
             parser.error("采样倍率必须在0.5-5.0之间")
+        if not 1 <= args.timeout <= 30:
+            parser.error("超时时间必须在1-30秒之间")
         
         return args
     
@@ -706,15 +740,25 @@ class CloudflareSpeedTest:
         """同步TCP连接测试"""
         success_count = 0
         total_latency = 0.0
+        latencies = []
+        timeout = self.args.timeout
         
-        for _ in range(self.args.t):
+        for i in range(self.args.t):
             start = time.perf_counter()
             try:
-                with socket.create_connection((ip, self.args.tp), timeout=DEFAULT_TIMEOUT):
+                with socket.create_connection((ip, self.args.tp), timeout=timeout):
                     latency_ms = (time.perf_counter() - start) * 1000
                     total_latency += latency_ms
                     success_count += 1
-            except (socket.timeout, socket.error, OSError):
+                    latencies.append(latency_ms)
+                    
+                    # ✅ 添加调试输出
+                    if self.debug:
+                        print(f"      [{ip}] 第{i+1}次: {latency_ms:.2f}ms")
+                        
+            except (socket.timeout, socket.error, OSError) as e:
+                if self.debug:
+                    print(f"      [{ip}] 第{i+1}次: 失败 ({type(e).__name__})")
                 continue
         
         if success_count == 0:
@@ -722,6 +766,13 @@ class CloudflareSpeedTest:
         
         avg_latency = total_latency / success_count
         loss_rate = 1 - (success_count / self.args.t)
+        
+        # ✅ 添加汇总信息
+        if self.debug and latencies:
+            min_lat = min(latencies)
+            max_lat = max(latencies)
+            print(f"      [{ip}] 平均:{avg_latency:.2f}ms, 最小:{min_lat:.2f}ms, 最大:{max_lat:.2f}ms, 成功:{success_count}/{self.args.t}")
+        
         return avg_latency, loss_rate
     
     def http_ping(self, ip: str) -> Optional[Tuple[float, float]]:
@@ -732,6 +783,7 @@ class CloudflareSpeedTest:
         
         url = f"{scheme}://{ip}:{self.args.tp}{path}"
         headers = {'Host': hostname}
+        timeout = self.args.timeout  # ✅ 使用参数指定的超时时间
         
         success_count = 0
         total_latency = 0.0
@@ -740,7 +792,7 @@ class CloudflareSpeedTest:
             start = time.perf_counter()
             try:
                 response = requests.head(
-                    url, headers=headers, timeout=DEFAULT_TIMEOUT,
+                    url, headers=headers, timeout=timeout,
                     verify=False, allow_redirects=False
                 )
                 latency_ms = (time.perf_counter() - start) * 1000
