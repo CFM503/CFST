@@ -131,18 +131,24 @@ class AsyncPingExecutor(PingExecutor):
         total_latency = 0.0
         
         for _ in range(self.tester.args.t):
-            start = time.perf_counter()
             try:
+                start = time.perf_counter()
                 reader, writer = await asyncio.wait_for(
                     asyncio.open_connection(ip, self.tester.args.tp),
                     timeout=DEFAULT_TIMEOUT
                 )
+                # ✅ 连接成功立即记录延迟（不包括关闭时间）
                 latency_ms = (time.perf_counter() - start) * 1000
                 total_latency += latency_ms
                 success_count += 1
                 
+                # ✅ 关闭操作在延迟测量之后（不影响结果）
                 writer.close()
-                await writer.wait_closed()
+                try:
+                    await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    pass  # 关闭超时不影响测试结果
+                    
             except (asyncio.TimeoutError, OSError, ConnectionRefusedError):
                 continue
         
