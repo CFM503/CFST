@@ -19,6 +19,7 @@ import ssl
 import csv
 import json
 import asyncio
+import math
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Tuple, List, Iterator, Dict
@@ -55,7 +56,8 @@ DEFAULT_DOWNLOAD_SECONDS = 10
 DEFAULT_IP_FILE = "ip.txt"
 DEFAULT_TIMEOUT = 5
 DEFAULT_MAX_LOSS_RATE = 0.0
-DEFAULT_ASYNC_LIMIT = 5000
+DEFAULT_ASYNC_LIMIT = 512
+MAX_SAFE_ASYNC_LIMIT = 2048
 VERSION = "v3.5-asyncio"
 
 # 采样限制
@@ -125,81 +127,77 @@ class AsyncPingExecutor(PingExecutor):
     def __init__(self, tester):
         self.tester = tester
     
-    async def tcp_ping_async(self, ip: str) -> Optional[Tuple[float, float]]:
-        """异步TCP连接测试（激进策略：第一次失败立即放弃）"""
+    async def tcp_ping_async(self, ip: str, semaphore: asyncio.Semaphore) -> Optional[Tuple[float, float]]:
+        """异步TCP连接测试"""
         success_count = 0
-        total_latency = 0.0
         latencies = []
         timeout = self.tester.args.timeout
-        
-        # ✅ 添加初始随机延迟，避免多个IP同步竞争
-        initial_delay = random.uniform(0, 0.02)  # 0-20ms随机延迟
-        await asyncio.sleep(initial_delay)
+        consecutive_failures = 0
         
         for i in range(self.tester.args.t):
-            writer = None
             try:
-                start = time.perf_counter()
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(ip, self.tester.args.tp),
-                    timeout=timeout
-                )
-                latency_ms = (time.perf_counter() - start) * 1000
-                total_latency += latency_ms
+                async with semaphore:
+                    # 计时从获得信号量之后开始，只测量实际连接时间
+                    start = time.perf_counter()
+                    reader, writer = await asyncio.wait_for(
+                        asyncio.open_connection(ip, self.tester.args.tp),
+                        timeout=timeout
+                    )
+                    latency_ms = (time.perf_counter() - start) * 1000
+                    
+                    # 立即关闭连接（在semaphore保护内）
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except:
+                        pass
+                
                 success_count += 1
                 latencies.append(latency_ms)
+                consecutive_failures = 0  # 重置连续失败计数
                 
                 if self.tester.debug:
                     print(f"      [{ip}] 第{i+1}次: {latency_ms:.2f}ms")
                 
             except (asyncio.TimeoutError, OSError, ConnectionRefusedError) as e:
+                consecutive_failures += 1
                 if self.tester.debug:
                     print(f"      [{ip}] 第{i+1}次: 失败 ({type(e).__name__})")
                 
-                # 激进策略：第一次失败直接放弃
-                if i == 0:
+                # 如果前2次都失败，直接放弃该IP
+                if consecutive_failures >= 2 and success_count == 0:
                     if self.tester.debug:
-                        print(f"      [{ip}] 第一次测试失败，放弃该IP")
+                        print(f"      [{ip}] 连续失败{consecutive_failures}次，放弃测试")
                     return None
-                
                 continue
             finally:
-                if writer:
-                    try:
-                        writer.close()
-                    except:
-                        pass
-                
-                # ✅ 固定延迟 + 随机抖动，打破同步
                 if i < self.tester.args.t - 1:
-                    jitter = random.uniform(0, 0.01)  # 0-10ms随机抖动
-                    await asyncio.sleep(0.05 + jitter)  # 50ms + 抖动
+                    await asyncio.sleep(0.001)  # 1ms延迟，避免连接风暴
         
         if success_count == 0:
             return None
         
-        avg_latency = total_latency / success_count
+        filtered_latencies = self.tester.filter_latency_samples(ip, latencies)
+        avg_latency = self.tester.aggregate_latency(filtered_latencies)
         loss_rate = 1 - (success_count / self.tester.args.t)
         
-        if self.tester.debug and latencies:
-            min_lat = min(latencies)
-            max_lat = max(latencies)
+        if self.tester.debug and filtered_latencies:
+            min_lat = min(filtered_latencies)
+            max_lat = max(filtered_latencies)
             print(f"      [{ip}] 平均:{avg_latency:.2f}ms, 最小:{min_lat:.2f}ms, 最大:{max_lat:.2f}ms, 成功:{success_count}/{self.tester.args.t}")
         
         return avg_latency, loss_rate
     
     async def worker_async(self, ip: str, semaphore: asyncio.Semaphore) -> Optional[TestResult]:
-        """异步工作协程（信号量控制整个IP的测试）"""
-        # ✅ 在整个IP测试期间持有信号量，而不是每次连接时获取
-        async with semaphore:
-            result = await self.tcp_ping_async(ip)
-            
-            if result:
-                latency, loss_rate = result
-                if (self.tester.args.tll <= latency <= self.tester.args.tl and 
-                    loss_rate <= self.tester.args.tlr):
-                    return TestResult(ip, latency, loss_rate)
-            return None
+        """异步工作协程"""
+        result = await self.tcp_ping_async(ip, semaphore)
+        
+        if result:
+            latency, loss_rate = result
+            if (self.tester.args.tll <= latency <= self.tester.args.tl and 
+                loss_rate <= self.tester.args.tlr):
+                return TestResult(ip, latency, loss_rate)
+        return None
     
     async def execute_async(self, ip_list: List[str]) -> List[TestResult]:
         """异步执行Ping测试"""
@@ -579,6 +577,18 @@ class CloudflareSpeedTest:
             print("❌ 错误: 异步功能需要Python 3.7+")
             sys.exit(1)
         
+        if self.args.async_ping:
+            if self.args.async_ping_limit <= 0:
+                print(f"⚠️  警告: --async-ping-limit 必须大于0，已恢复为默认值 {DEFAULT_ASYNC_LIMIT}")
+                self.args.async_ping_limit = DEFAULT_ASYNC_LIMIT
+            elif self.args.async_ping_limit > MAX_SAFE_ASYNC_LIMIT:
+                print(
+                    f"⚠️  警告: --async-ping-limit={self.args.async_ping_limit} 并发数过高，"
+                    "会显著抬高延迟测量值，已自动限制为 "
+                    f"{MAX_SAFE_ASYNC_LIMIT}"
+                )
+                self.args.async_ping_limit = MAX_SAFE_ASYNC_LIMIT
+        
         # 并行下载需要异步下载
         if self.args.parallel_download and not self.args.async_download:
             print("⚠️  警告: --parallel-download 需要配合 --async-download 使用")
@@ -616,6 +626,56 @@ class CloudflareSpeedTest:
         """调试信息打印"""
         if self.debug:
             print(f"[DEBUG] {msg}")
+    
+    def filter_latency_samples(self, ip: str, latencies: List[float]) -> List[float]:
+        """对延迟样本进行多阶段过滤，去除调度造成的异常高值"""
+        if not latencies:
+            return []
+        filtered = list(latencies)
+        
+        # IQR过滤（针对偶发尖刺）
+        if len(filtered) >= 10:
+            sorted_latencies = sorted(filtered)
+            q1_idx = len(sorted_latencies) // 4
+            q3_idx = (len(sorted_latencies) * 3) // 4
+            q1 = sorted_latencies[q1_idx]
+            q3 = sorted_latencies[q3_idx]
+            iqr = q3 - q1
+            upper_bound = q3 + 1.5 * iqr
+            iqr_filtered = [lat for lat in filtered if lat <= upper_bound]
+            if iqr_filtered and len(iqr_filtered) < len(filtered):
+                if self.debug:
+                    print(f"      [{ip}] 过滤了 {len(filtered) - len(iqr_filtered)} 个异常值（阈值:{upper_bound:.2f}ms）")
+                filtered = iqr_filtered
+        
+        if filtered:
+            # 针对异步高并发引起的整体抬升，使用动态阈值再次清洗
+            min_latency = min(filtered)
+            dynamic_window = max(15.0, min_latency * 0.5)
+            dynamic_threshold = min_latency + dynamic_window
+            dynamic_filtered = [lat for lat in filtered if lat <= dynamic_threshold]
+            if dynamic_filtered and len(dynamic_filtered) < len(filtered):
+                if self.debug:
+                    print(f"      [{ip}] 移除了 {len(filtered) - len(dynamic_filtered)} 个明显偏高的样本（动态阈值:{dynamic_threshold:.2f}ms）")
+                filtered = dynamic_filtered
+        
+        return filtered if filtered else list(latencies)
+    
+    def aggregate_latency(self, latencies: List[float]) -> float:
+        """将过滤后的延迟样本压缩成代表值"""
+        if not latencies:
+            return 0.0
+        sorted_latencies = sorted(latencies)
+        if len(sorted_latencies) <= 2:
+            return sum(sorted_latencies) / len(sorted_latencies)
+        span = sorted_latencies[-1] - sorted_latencies[0]
+        tolerance = max(15.0, sorted_latencies[0] * 0.4)
+        if span <= tolerance:
+            return sum(sorted_latencies) / len(sorted_latencies)
+        take_count = max(1, int(math.ceil(len(sorted_latencies) * 0.3)))
+        take_count = min(take_count, len(sorted_latencies))
+        trimmed = sorted_latencies[:take_count]
+        return sum(trimmed) / len(trimmed)
     
     def update_result(self, ip: str, **kwargs):
         """统一的结果更新方法"""
@@ -739,38 +799,46 @@ class CloudflareSpeedTest:
     def tcp_ping(self, ip: str) -> Optional[Tuple[float, float]]:
         """同步TCP连接测试"""
         success_count = 0
-        total_latency = 0.0
         latencies = []
         timeout = self.args.timeout
+        consecutive_failures = 0
         
         for i in range(self.args.t):
             start = time.perf_counter()
             try:
                 with socket.create_connection((ip, self.args.tp), timeout=timeout):
                     latency_ms = (time.perf_counter() - start) * 1000
-                    total_latency += latency_ms
                     success_count += 1
                     latencies.append(latency_ms)
+                    consecutive_failures = 0  # 重置连续失败计数
                     
                     # ✅ 添加调试输出
                     if self.debug:
                         print(f"      [{ip}] 第{i+1}次: {latency_ms:.2f}ms")
                         
             except (socket.timeout, socket.error, OSError) as e:
+                consecutive_failures += 1
                 if self.debug:
                     print(f"      [{ip}] 第{i+1}次: 失败 ({type(e).__name__})")
+                
+                # 如果前2次都失败，直接放弃该IP
+                if consecutive_failures >= 2 and success_count == 0:
+                    if self.debug:
+                        print(f"      [{ip}] 连续失败{consecutive_failures}次，放弃测试")
+                    return None
                 continue
         
         if success_count == 0:
             return None
         
-        avg_latency = total_latency / success_count
+        filtered_latencies = self.filter_latency_samples(ip, latencies)
+        avg_latency = self.aggregate_latency(filtered_latencies)
         loss_rate = 1 - (success_count / self.args.t)
         
         # ✅ 添加汇总信息
-        if self.debug and latencies:
-            min_lat = min(latencies)
-            max_lat = max(latencies)
+        if self.debug and filtered_latencies:
+            min_lat = min(filtered_latencies)
+            max_lat = max(filtered_latencies)
             print(f"      [{ip}] 平均:{avg_latency:.2f}ms, 最小:{min_lat:.2f}ms, 最大:{max_lat:.2f}ms, 成功:{success_count}/{self.args.t}")
         
         return avg_latency, loss_rate
@@ -786,9 +854,10 @@ class CloudflareSpeedTest:
         timeout = self.args.timeout  # ✅ 使用参数指定的超时时间
         
         success_count = 0
-        total_latency = 0.0
+        latencies = []
+        consecutive_failures = 0
         
-        for _ in range(self.args.t):
+        for i in range(self.args.t):
             start = time.perf_counter()
             try:
                 response = requests.head(
@@ -798,21 +867,43 @@ class CloudflareSpeedTest:
                 latency_ms = (time.perf_counter() - start) * 1000
                 
                 if str(response.status_code) in self.valid_http_codes:
-                    total_latency += latency_ms
                     success_count += 1
+                    latencies.append(latency_ms)
+                    consecutive_failures = 0  # 重置连续失败计数
+                    
+                    if self.debug:
+                        print(f"      [{ip}] 第{i+1}次: {latency_ms:.2f}ms")
                     
                     if self.args.cfcolo:
                         colo = response.headers.get('CF-RAY', '').split('-')[-1]
                         if colo.upper() != self.args.cfcolo.upper():
                             return None
+                else:
+                    consecutive_failures += 1
             except (requests.RequestException, OSError):
+                consecutive_failures += 1
+                if self.debug:
+                    print(f"      [{ip}] 第{i+1}次: HTTP请求失败")
+                
+                # 如果前2次都失败，直接放弃该IP
+                if consecutive_failures >= 2 and success_count == 0:
+                    if self.debug:
+                        print(f"      [{ip}] 连续失败{consecutive_failures}次，放弃测试")
+                    return None
                 continue
         
         if success_count == 0:
             return None
         
-        avg_latency = total_latency / success_count
+        filtered_latencies = self.filter_latency_samples(ip, latencies)
+        avg_latency = self.aggregate_latency(filtered_latencies)
         loss_rate = 1 - (success_count / self.args.t)
+        
+        if self.debug and filtered_latencies:
+            min_lat = min(filtered_latencies)
+            max_lat = max(filtered_latencies)
+            print(f"      [{ip}] 平均:{avg_latency:.2f}ms, 最小:{min_lat:.2f}ms, 最大:{max_lat:.2f}ms, 成功:{success_count}/{self.args.t}")
+        
         return avg_latency, loss_rate
     
     def download_test_socket(self, ip: str) -> float:
