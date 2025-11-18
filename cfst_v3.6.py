@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CloudflareSpeedTest Asyncio版 v3.6
+CloudflareSpeedTest Asyncio版 v3.6cto
 新功能：
 - 异步Ping测试（速度提升2-5倍）
 - 异步下载测试（可选）
