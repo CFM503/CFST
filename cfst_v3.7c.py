@@ -575,37 +575,57 @@ class CloudflareSpeedTest:
             if total_hosts <= 0:
                 return
             
+            # 应用采样倍率
             max_samples = int(max_samples * self.sample_multiplier)
             
-            # 简化采样策略
+            if self.debug:
+                print(f"  处理 {cidr} (/{network.prefixlen}), 总主机数: {total_hosts}, 采样上限: {max_samples}")
+            
+            # 根据网段大小采样
             if network.prefixlen <= 16:
-                # 大网段：采样少量/24子网
-                sample_count = min(max_samples // 2, 100)
+                # /16 大网段：采样更多/24子网
+                subnets_to_sample = min(int(500 * self.sample_multiplier), max_samples // 5)
                 subnets = list(network.subnets(new_prefix=24))
-                for subnet in random.sample(subnets, min(len(subnets), sample_count)):
+                
+                if self.debug:
+                    print(f"    策略: 采样 {subnets_to_sample}/{len(subnets)} 个/24子网")
+                
+                for subnet in random.sample(subnets, min(len(subnets), subnets_to_sample)):
                     hosts = list(subnet.hosts())
                     if hosts:
-                        for _ in range(min(2, len(hosts))):
-                            yield str(random.choice(hosts))
+                        ips_per_subnet = min(int(5 * self.sample_multiplier), len(hosts))
+                        for ip in random.sample(hosts, ips_per_subnet):
+                            yield str(ip)
                             
             elif network.prefixlen <= 20:
-                # 中等网段
+                # /17-/20 网段：采样中等数量
                 hosts = list(network.hosts())
-                sample_count = min(50, len(hosts))
+                sample_count = min(int(200 * self.sample_multiplier), len(hosts), max_samples)
+                
+                if self.debug:
+                    print(f"    策略: 采样 {sample_count}/{len(hosts)} 个IP")
+                
                 for ip in random.sample(hosts, sample_count):
                     yield str(ip)
                     
             elif network.prefixlen <= 24:
-                # 小网段
+                # /21-/24 网段：采样较多
                 hosts = list(network.hosts())
-                sample_count = min(10, len(hosts))
+                sample_count = min(int(50 * self.sample_multiplier), len(hosts), max_samples)
+                
+                if self.debug:
+                    print(f"    策略: 采样 {sample_count}/{len(hosts)} 个IP")
+                
                 for ip in random.sample(hosts, sample_count):
                     yield str(ip)
             else:
-                # 很小的网段
+                # /25+ 小网段：全部测试
                 hosts = list(network.hosts())
-                sample_count = min(3, len(hosts))
-                for ip in random.sample(hosts, sample_count):
+                
+                if self.debug:
+                    print(f"    策略: 全部测试 {len(hosts)} 个IP")
+                
+                for ip in hosts:
                     yield str(ip)
                     
         except ValueError as e:
