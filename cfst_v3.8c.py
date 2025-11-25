@@ -439,35 +439,106 @@ class CloudflareSpeedTest:
             print(f"   • 延迟: {best.latency:.2f}ms {best.get_latency_grade()} (得分 {best.latency_score:.1f})")
     
     def save_results(self):
-        if not self.args.o: return
+        if not self.args.o:
+            return
+        
         filtered = [r for r in self.results if r.speed_cv <= self.args.max_cv and r.stability_score >= self.args.min_stability]
         key = {'composite': lambda x: x.composite_score, 'speed': lambda x: x.download_speed, 'stability': lambda x: x.stability_score, 'latency': lambda x: x.latency}[self.args.sort]
         filtered.sort(key=key, reverse=(self.args.sort != 'latency'))
+        
         if self.args.o.endswith('.csv'):
             with open(self.args.o, 'w', newline='', encoding='utf-8-sig') as f:
                 writer = csv.writer(f)
                 writer.writerow(['IP','延迟ms','丢包%','平均MB/s','最小','最大','标准差','CV%','速度分','稳定分','延迟分','综合分'])
                 for r in filtered[:self.args.dn]:
                     writer.writerow([r.ip, f"{r.latency:.2f}", f"{r.loss_rate*100:.1f}", f"{r.download_speed:.2f}", f"{r.speed_min:.2f}", f"{r.speed_max:.2f}", f"{r.speed_std:.2f}", f"{r.speed_cv:.2f}", f"{r.speed_score:.1f}", f"{r.stability_score:.1f}", f"{r.latency_score:.1f}", f"{r.composite_score:.1f}"])
-        print(f"💾 已保存: {self.args.o}")
+            print(f"💾 已保存: {self.args.o}")
+        
+        elif self.args.o.endswith('.json'):
+            data = {
+                'test_info': {
+                    'version': VERSION,
+                    'test_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    'total_ips': self.total_ips_tested,
+                    'weights': {'speed': self.args.speed_weight, 'stability': self.args.stability_weight, 'latency': self.args.latency_weight}
+                },
+                'results': []
+            }
+            for r in filtered[:self.args.dn]:
+                data['results'].append({
+                    'ip': r.ip,
+                    'latency_ms': round(r.latency, 2),
+                    'download_mbps': round(r.download_speed, 2),
+                    'stability_cv': round(r.speed_cv, 2),
+                    'composite_score': round(r.composite_score, 1)
+                })
+            with open(self.args.o, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            print(f"💾 已保存: {self.args.o}")
+        
+        elif self.args.o.endswith('.txt'):
+            with open(self.args.o, 'w', encoding='utf-8') as f:
+                f.write(f"CloudflareSpeedTest {VERSION} - 测试结果\n")
+                f.write(f"{'='*80}\n")
+                f.write(f"测试时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"评分权重: 速度{self.args.speed_weight:.0%} + 稳定{self.args.stability_weight:.0%} + 延迟{self.args.latency_weight:.0%}\n")
+                f.write(f"{'='*80}\n\n")
+                
+                for i, r in enumerate(filtered[:self.args.dn], 1):
+                    f.write(f"[{i}] {r.ip}\n")
+                    f.write(f"  延迟: {r.latency:.2f}ms ({r.get_latency_grade()})\n")
+                    f.write(f"  速度: {r.download_speed:.2f} MB/s (范围: {r.speed_min:.2f}-{r.speed_max:.2f})\n")
+                    f.write(f"  稳定性: {r.get_stability_stars()} (CV: {r.speed_cv:.1f}%)\n")
+                    f.write(f"  综合得分: {r.composite_score:.1f}/100\n")
+                    f.write(f"  {r.get_recommendation()}\n")
+                    f.write(f"{'-'*80}\n")
+                
+                if filtered:
+                    f.write(f"\n🎯 最佳推荐: {filtered[0].ip}\n")
+                    f.write(f"   综合得分: {filtered[0].composite_score:.1f}/100\n")
+            print(f"💾 已保存: {self.args.o}")
+        
+        else:
+            # 默认保存为CSV
+            self.args.o += '.csv'
+            self.save_results()
     
     def run(self):
         print(f"{'='*80}\n🚀 CloudflareSpeedTest {VERSION}\n{'='*80}")
         ip_ranges = self.load_ip_ranges()
         print(f"📂 IP范围: {len(ip_ranges)} | 最大测试: {self.args.max_ips}")
         print(f"⚖️  权重: 速度{self.args.speed_weight:.0%} + 稳定{self.args.stability_weight:.0%} + 延迟{self.args.latency_weight:.0%}\n")
+        
+        # 阶段1: Ping测试
         print(f"{'='*80}\n🔍 阶段1: Ping测试\n{'='*80}\n")
         ip_list = list(self.generate_test_ips(ip_ranges))
         self.total_ips_tested = len(ip_list)
+        
+        if not ip_list:
+            print("❌ 没有可测试的IP！")
+            return
+        
+        print(f"📊 准备测试 {len(ip_list)} 个IP...\n")
         results = self.ping_executor.execute(ip_list)
+        
         with self.lock:
             self.results.extend(results)
-            for r in results: self.results_dict[r.ip] = r
+            for r in results:
+                self.results_dict[r.ip] = r
+        
         self.results.sort(key=lambda x: x.latency)
-        print(f"\n✅ 完成: {len(self.results)}个IP通过\n")
-        if not self.args.dd and self.results:
+        print(f"\n✅ 完成: {len(self.results)}个IP通过筛选\n")
+        
+        # 如果没有通过Ping的IP，退出
+        if not self.results:
+            print("❌ 没有IP通过延迟测试！")
+            return
+        
+        # 阶段2: 下载测试
+        if not self.args.dd:
             print(f"{'='*80}\n🚀 阶段2: 下载测试\n{'='*80}\n")
-            self.download_executor.execute([r.ip for r in self.results[:self.args.dn]])
+            test_ips = [r.ip for r in self.results[:self.args.dn]]
+            self.download_executor.execute(test_ips)
             print("\n✅ 完成!\n")
     
     def main(self):
