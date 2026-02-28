@@ -188,7 +188,7 @@ func RunCLI(cfg Config) {
 	validNodes := ScanPing(ips, cfg.Port, cfg.ScanConcurrent, func(done, total, valid int) {
 		fmt.Printf("\r  Process: %d/%d | Valid: %d", done, total, valid)
 	})
-	fmt.Println("\n")
+	fmt.Println()
 
 	if len(validNodes) == 0 {
 		fmt.Println("[!] No valid IPs found. Please check your network or routing.")
