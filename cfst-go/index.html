@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CFST v1.0.1</title>
+    <title>CFST v1.0.2</title>
     <!-- Google Fonts for modern typography -->
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
@@ -281,7 +281,7 @@
             <div class="header">
                 <div style="display: flex; align-items: baseline; gap: 12px;">
                     <h1>✨ CFST Ultimate</h1>
-                    <span style="color: var(--text-dim); font-size: 1.1rem; font-weight: 600;">v1.0.1</span>
+                    <span style="color: var(--text-dim); font-size: 1.1rem; font-weight: 600;">v1.0.2</span>
                 </div>
                 <button id="startBtn">
                     <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -365,6 +365,18 @@
         </div>
 
         <div class="glass-panel" id="resultsPanel" style="display: none;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+                <h3 style="margin: 0; font-size: 1.1rem; font-weight: 500;">Test Results</h3>
+                <button id="btnExport" class="btn"
+                    style="padding: 0.4rem 1rem; font-size: 0.85rem; background: var(--purple); width: auto; box-shadow: 0 4px 15px rgba(168, 85, 247, 0.3);">
+                    <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+                        style="margin-right: 6px; vertical-align: text-bottom;">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                            d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path>
+                    </svg>
+                    Export IPs
+                </button>
+            </div>
             <table>
                 <thead>
                     <tr>
@@ -391,9 +403,13 @@
         const progValid = document.getElementById('progValid');
         const resultsPanel = document.getElementById('resultsPanel');
         const resultsBody = document.getElementById('resultsBody');
+        const btnExport = document.getElementById('btnExport');
+
+        let scannedIPs = [];
 
         startBtn.addEventListener('click', () => {
             // Reset UI
+            scannedIPs = [];
             startBtn.disabled = true;
             startBtn.innerHTML = `
             <svg class="animate-spin" width="18" height="18" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
@@ -457,6 +473,7 @@
 
             evtSource.addEventListener('progress_download', (e) => {
                 const res = JSON.parse(e.data);
+                scannedIPs.push(res.ip);
                 resultsPanel.style.display = 'block';
 
                 let speedClass = 'val-speed-bad';
@@ -528,6 +545,29 @@
                 console.error('Failed to copy text: ', err);
             });
         }
+
+        btnExport.addEventListener('click', () => {
+            if (scannedIPs.length === 0) return;
+            const text = scannedIPs.join('\\n');
+            const blob = new Blob([text], { type: 'text/plain' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'cfst_fast_ips.txt';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+
+            // Visual feedback
+            const originalHTML = btnExport.innerHTML;
+            btnExport.innerHTML = `<svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24" style="margin-right: 6px; vertical-align: text-bottom;"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg> Exported!`;
+            btnExport.style.background = 'var(--green)';
+            setTimeout(() => {
+                btnExport.innerHTML = originalHTML;
+                btnExport.style.background = 'var(--purple)';
+            }, 2000);
+        });
 
         // Add CSS for spinning icon
         const style = document.createElement('style');

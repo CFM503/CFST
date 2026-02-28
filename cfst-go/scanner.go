@@ -180,7 +180,7 @@ func RunDownloadTest(candidates []NodeResult, cfg Config, progressRow func(res N
 }
 
 func RunCLI(cfg Config) {
-	fmt.Printf("Cloudflare SpeedTest v1.0.1 (Go Edition)\n\n")
+	fmt.Printf("Cloudflare SpeedTest v1.0.2 (Go Edition)\n\n")
 
 	ips := GenerateIPs(cfg.MaxScan, cfg.Unique, cfg.IPFile)
 	fmt.Printf("🔍 Scanning %d IPs (concurrency: %d)...\n", len(ips), cfg.ScanConcurrent)
