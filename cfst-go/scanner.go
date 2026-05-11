@@ -21,6 +21,7 @@ type Config struct {
 	Unique         bool
 	Output         string
 	ScanConcurrent int
+	ColoConcurrent int
 	WebPort        string
 	WebMode        bool
 	URL            string
@@ -38,6 +39,7 @@ func DefaultConfig() Config {
 		Unique:         false,
 		Output:         "result_colo.csv",
 		ScanConcurrent: 200,
+		ColoConcurrent: 20,
 		WebPort:        "9876",
 		URL:            "https://speed.cloudflare.com/__down?bytes=50000000",
 		Skip429:        true,
@@ -47,7 +49,7 @@ func DefaultConfig() Config {
 func ScanPing(ips []string, port int, concurrency int, progressCallback func(done, total, valid int)) []NodeResult {
 	var validNodes []NodeResult
 	var mu sync.Mutex
-	var done atomic.Int32
+	var done, validCount atomic.Int32
 	total := len(ips)
 
 	sem := make(chan struct{}, concurrency)
@@ -70,17 +72,14 @@ func ScanPing(ips []string, port int, concurrency int, progressCallback func(don
 			if lat > 0 {
 				mu.Lock()
 				validNodes = append(validNodes, NodeResult{IP: ip, Port: port, TCPLatency: lat})
-				v := len(validNodes)
 				mu.Unlock()
+				v := int(validCount.Add(1))
 				if progressCallback != nil {
 					progressCallback(int(d), total, v)
 				}
 			} else {
-				mu.Lock()
-				v := len(validNodes)
-				mu.Unlock()
 				if progressCallback != nil {
-					progressCallback(int(d), total, v)
+					progressCallback(int(d), total, int(validCount.Load()))
 				}
 			}
 		}(ip)
@@ -89,11 +88,11 @@ func ScanPing(ips []string, port int, concurrency int, progressCallback func(don
 	return validNodes
 }
 
-func DetectColo(candidates []NodeResult, port int, progressCallback func(done, total int)) {
+func DetectColo(candidates []NodeResult, port int, concurrency int, progressCallback func(done, total int)) {
 	var wg sync.WaitGroup
 	var done atomic.Int32
 	total := len(candidates)
-	sem := make(chan struct{}, 20)
+	sem := make(chan struct{}, concurrency)
 
 	for i := range candidates {
 		wg.Add(1)
@@ -180,7 +179,7 @@ func RunDownloadTest(candidates []NodeResult, cfg Config, progressRow func(res N
 }
 
 func RunCLI(cfg Config) {
-	fmt.Printf("Cloudflare SpeedTest v1.0.3 (Go Edition)\n\n")
+	fmt.Printf("Cloudflare SpeedTest v1.0.5 (Go Edition)\n\n")
 
 	ips := GenerateIPs(cfg.MaxScan, cfg.Unique, cfg.IPFile)
 	fmt.Printf("🔍 Scanning %d IPs (concurrency: %d)...\n", len(ips), cfg.ScanConcurrent)
@@ -202,7 +201,7 @@ func RunCLI(cfg Config) {
 	candidates := validNodes
 
 	fmt.Printf("🌐 Detecting Colo (Top %d)...\n", len(candidates))
-	DetectColo(candidates, cfg.Port, nil)
+	DetectColo(candidates, cfg.Port, cfg.ColoConcurrent, nil)
 
 	fmt.Printf("\n🚀 Test Download (%d threads, %ds duration)\n", cfg.Conc, cfg.Duration)
 	fmt.Printf("%-16s %-6s %-8s %-20s %-6s\n", "IP", "Colo", "Latency", "Speed", "Score")

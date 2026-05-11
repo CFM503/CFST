@@ -155,22 +155,34 @@ func TCPPing(ip string, port int, timeout time.Duration) float64 {
 
 var coloRe = regexp.MustCompile(`colo=([A-Z]+)`)
 
-func GetColo(ip string, port int) string {
-	client := &http.Client{
+func makeHTTPClient(ip string, port int, timeout time.Duration) *http.Client {
+	return &http.Client{
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				return net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ip, port), 2*time.Second)
 			},
-			TLSClientConfig: &tls.Config{
-				ServerName:         "speed.cloudflare.com",
-				InsecureSkipVerify: true,
-			},
+			TLSClientConfig:    &tls.Config{InsecureSkipVerify: true},
+			MaxIdleConnsPerHost: 10,
 		},
-		Timeout: 3 * time.Second,
+		Timeout: timeout,
 	}
+}
 
-	req, _ := http.NewRequest("GET", "https://speed.cloudflare.com/cdn-cgi/trace", nil)
+func newCFRequest(method, url string) (*http.Request, error) {
+	req, err := http.NewRequest(method, url, nil)
+	if err != nil {
+		return nil, err
+	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0 Safari/537.36")
+	return req, nil
+}
+
+func GetColo(ip string, port int) string {
+	client := makeHTTPClient(ip, port, 3*time.Second)
+	req, err := newCFRequest("GET", "https://speed.cloudflare.com/cdn-cgi/trace")
+	if err != nil {
+		return "ERR"
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -198,22 +210,13 @@ func CheckBlocked(ip string, port int, testURL string) bool {
 	}
 	host := parsedURL.Hostname()
 
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ip, port), 2*time.Second)
-			},
-			TLSClientConfig: &tls.Config{
-				ServerName:         host,
-				InsecureSkipVerify: true,
-			},
-		},
-		Timeout: 3 * time.Second,
-	}
+	client := makeHTTPClient(ip, port, 3*time.Second)
 
-	req, _ := http.NewRequest("GET", testURL, nil)
+	req, err := newCFRequest("GET", testURL)
+	if err != nil {
+		return true
+	}
 	req.Host = host
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0 Safari/537.36")
 	req.Header.Set("Connection", "close")
 
 	resp, err := client.Do(req)
@@ -222,14 +225,7 @@ func CheckBlocked(ip string, port int, testURL string) bool {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden || resp.StatusCode == 400 || resp.StatusCode == 404 || resp.StatusCode == 403 {
-		return true
-	}
-	// Any other 5xx or unhandled could also mean blocked, but we mainly catch WAF rules
-	if resp.StatusCode >= 400 {
-		return true
-	}
-	return false
+	return resp.StatusCode >= 400
 }
 
 func DownloadTest(ip string, port int, threads int, duration int, testURL string) float64 {
@@ -239,18 +235,7 @@ func DownloadTest(ip string, port int, threads int, duration int, testURL string
 	var totalBytes int64
 	var wg sync.WaitGroup
 
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ip, port), 3*time.Second)
-			},
-			TLSClientConfig: &tls.Config{
-				ServerName:         host,
-				InsecureSkipVerify: true,
-			},
-			MaxIdleConnsPerHost: threads,
-		},
-	}
+	client := makeHTTPClient(ip, port, 0)
 
 	startGlobal := time.Now()
 	for i := 0; i < threads; i++ {
@@ -258,9 +243,11 @@ func DownloadTest(ip string, port int, threads int, duration int, testURL string
 		go func() {
 			defer wg.Done()
 
-			req, _ := http.NewRequest("GET", testURL, nil)
+			req, err := newCFRequest("GET", testURL)
+			if err != nil {
+				return
+			}
 			req.Host = host
-			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0 Safari/537.36")
 			req.Header.Set("Connection", "keep-alive")
 
 			resp, err := client.Do(req)
@@ -270,9 +257,9 @@ func DownloadTest(ip string, port int, threads int, duration int, testURL string
 			defer resp.Body.Close()
 
 			buf := make([]byte, 65536)
-			dur := float64(duration)
+			dur := time.Duration(duration) * time.Second
 			for {
-				if time.Since(startGlobal).Seconds() > dur {
+				if time.Since(startGlobal) > dur {
 					break
 				}
 				n, err := resp.Body.Read(buf)

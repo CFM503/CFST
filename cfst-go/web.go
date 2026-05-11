@@ -24,6 +24,10 @@ func RunWeb(cfg Config) {
 	})
 
 	http.HandleFunc("/api/test", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
@@ -89,7 +93,7 @@ func RunWeb(cfg Config) {
 		candidates := validNodes
 
 		sendEvent("status", fmt.Sprintf("Detecting Colo for %d nodes...", len(candidates)))
-		DetectColo(candidates, reqCfg.Port, func(done, total int) {
+		DetectColo(candidates, reqCfg.Port, reqCfg.ColoConcurrent, func(done, total int) {
 			if done%5 == 0 || done == total {
 				sendEvent("progress_colo", map[string]int{"done": done, "total": total})
 			}
