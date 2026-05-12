@@ -207,9 +207,9 @@ func RunDownloadTest(candidates []NodeResult, cfg Config, progressRow func(res N
 
 func RunCLI(cfg Config) {
 	if cfg.YouTubeMode {
-		fmt.Printf("YouTube CDN SpeedTest v1.1.1 (Go Edition)\n\n")
+		fmt.Printf("YouTube CDN SpeedTest v1.2.0 (Go Edition)\n\n")
 	} else {
-		fmt.Printf("Cloudflare SpeedTest v1.1.1 (Go Edition)\n\n")
+		fmt.Printf("Cloudflare SpeedTest v1.2.0 (Go Edition)\n\n")
 	}
 
 	if cfg.Proxy != "" {
