@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -113,65 +114,30 @@ func randIPFromCIDR(cidr string) string {
 	return net.IP(buf[:]).String()
 }
 
-// ResolveYouTubeCDNIPs 通过 DNS 解析 googlevideo.com 子域名获取 YouTube CDN 节点 IP
+// ResolveYouTubeCDNIPs 发现 YouTube CDN 节点 IP
+// 策略：1) DoH 解析 redirector  2) 抓取 YouTube 页面提取真实域名  3) DoH 解析所有域名
 func ResolveYouTubeCDNIPs(maxIPs int) []string {
-	// YouTube CDN 节点域名前缀（rr{1-9} 表示不同机房，sn-{hash} 表示不同节点）
-	prefixes := []string{
-		"rr1---sn-", "rr2---sn-", "rr3---sn-", "rr4---sn-",
-		"rr5---sn-", "rr6---sn-", "rr7---sn-", "rr8---sn-",
-		"rr9---sn-",
-	}
-	// 常见的 YouTube CDN 节点 hash（不同地区有不同的 hash）
-	hashes := []string{
-		"a5mlrn76", "a5mekned", "a5meknsd", "a5meknzs",
-		"a5mekn7d", "a5meknes", "a5mekney", "a5meknez",
-		"a5meknzd", "a5mekn7y", "a5meknsy", "a5mekn7s",
-		"a5meknes", "a5mlrnek", "a5mlrnsz", "a5mlrn7y",
-		"a5mlrnsy", "a5mlrn7z", "a5mlrnsr", "a5mlrn7k",
-		"a5mlrnsk", "a5mlrn7l", "a5mlrnsl", "a5mlrn7m",
-		"a5mlrnsm", "a5mlrn7n", "a5mlrnsn", "a5mlrn7p",
-		"a5mlrnsp", "a5mlrn7q", "a5mlrnsq", "a5mlrn7r",
-		"n4v7sn7s", "n4v7sn7k", "n4v7sn7y", "n4v7sn7z",
-		"n4v7snee", "n4v7snes", "n4v7sney", "n4v7snez",
-		"n4v7sn7l", "n4v7sn7m", "n4v7sn7n", "n4v7sn7p",
-		"cuhx0gbq", "cuhx0gbk", "cuhx0gby", "cuhx0gbz",
-		"cuhx0gbs", "cuhx0gbr", "cuhx0gbp", "cuhx0gbn",
-		"pouxgp5k", "pouxgp5y", "pouxgp5z", "pouxgp5s",
-		"pouxgp5r", "pouxgp5p", "pouxgp5n", "pouxgp5m",
-	}
-
-	// SOCKS5 代理时 DNS 也走代理，否则用系统 DNS
-	resolver := &net.Resolver{
-		PreferGo: true,
-		Dial:     proxyDNSDial,
-	}
-
 	seen := make(map[string]bool)
 	var ips []string
+	var domains []string
 
-	// 解析 redirector.googlevideo.com（YouTube 的通用重定向节点）
-	for _, ip := range resolveHost(resolver, "redirector.googlevideo.com") {
-		if !seen[ip] {
-			seen[ip] = true
-			ips = append(ips, ip)
-		}
-	}
+	// Step 1: 解析 redirector.googlevideo.com（通用重定向节点）
+	domains = append(domains, "redirector.googlevideo.com")
 
-	// 解析不同的 CDN 子域名
-	for _, prefix := range prefixes {
+	// Step 2: 抓取 YouTube 页面，提取真实 CDN 域名
+	realDomains := discoverYouTubeCDNDomains()
+	domains = append(domains, realDomains...)
+	fmt.Printf("  Discovered %d CDN domains\n", len(realDomains))
+
+	// Step 3: DoH 解析所有域名
+	for _, domain := range domains {
 		if len(ips) >= maxIPs {
 			break
 		}
-		for _, hash := range hashes {
-			if len(ips) >= maxIPs {
-				break
-			}
-			host := prefix + hash + ".googlevideo.com"
-			for _, ip := range resolveHost(resolver, host) {
-				if !seen[ip] {
-					seen[ip] = true
-					ips = append(ips, ip)
-				}
+		for _, ip := range dohResolve(domain) {
+			if !seen[ip] {
+				seen[ip] = true
+				ips = append(ips, ip)
 			}
 		}
 	}
@@ -182,27 +148,81 @@ func ResolveYouTubeCDNIPs(maxIPs int) []string {
 	return ips
 }
 
-func proxyDNSDial(ctx context.Context, network, address string) (net.Conn, error) {
-	if proxyDialer != nil {
-		// SOCKS5 代理：DNS 查询也走代理（解决 DNS 劫持问题）
-		return proxyDialer.Dial(network, address)
+// discoverYouTubeCDNDomains 抓取 YouTube 页面提取 googlevideo.com CDN 域名
+func discoverYouTubeCDNDomains() []string {
+	// 用几个热门视频 ID 来发现 CDN 节点
+	videoIDs := []string{
+		"dQw4w9WgXcQ", "jNQXAC9IVRw", "9bZkp7q19f0",
+		"kJQP7kiw5Fk", "RgKAFK5djSk", "fJ9rUzIMcZQ",
 	}
-	// 直连：使用系统 DNS
-	var d net.Dialer
-	return d.DialContext(ctx, network, address)
+
+	client := makeHTTPClient("", 0, 10*time.Second)
+	domainRe := regexp.MustCompile(`([a-z0-9]+---sn-[a-z0-9]+\.googlevideo\.com)`)
+	seen := make(map[string]bool)
+	var domains []string
+
+	for _, vid := range videoIDs {
+		reqURL := fmt.Sprintf("https://www.youtube.com/watch?v=%s", vid)
+		req, err := newCFRequest("GET", reqURL)
+		if err != nil {
+			continue
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+
+		matches := domainRe.FindAllString(string(body), -1)
+		for _, m := range matches {
+			if !seen[m] {
+				seen[m] = true
+				domains = append(domains, m)
+			}
+		}
+		if len(domains) > 50 {
+			break
+		}
+	}
+	return domains
 }
 
-func resolveHost(resolver *net.Resolver, host string) []string {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	addrs, err := resolver.LookupHost(ctx, host)
+// dohResolve 通过 DNS-over-HTTPS 解析域名（HTTP 请求走代理）
+func dohResolve(host string) []string {
+	client := makeHTTPClient("", 0, 5*time.Second)
+	reqURL := fmt.Sprintf("https://cloudflare-dns.com/dns-query?name=%s&type=A", host)
+	req, err := http.NewRequest("GET", reqURL, nil)
 	if err != nil {
 		return nil
 	}
+	req.Header.Set("Accept", "application/dns-json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Answer []struct {
+			Data string `json:"data"`
+			Type int    `json:"type"`
+		} `json:"Answer"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil
+	}
+
 	var ips []string
-	for _, addr := range addrs {
-		if ip := net.ParseIP(addr); ip != nil && ip.To4() != nil {
-			ips = append(ips, addr)
+	for _, a := range result.Answer {
+		if a.Type == 1 { // A record
+			if ip := net.ParseIP(a.Data); ip != nil && ip.To4() != nil {
+				ips = append(ips, a.Data)
+			}
 		}
 	}
 	return ips
@@ -329,28 +349,37 @@ func makeHTTPClient(ip string, port int, timeout time.Duration) *http.Client {
 	if v, ok := clientPool.Load(key); ok {
 		return v.(*http.Client)
 	}
-	addr := net.JoinHostPort(ip, fmt.Sprintf("%d", port))
 
 	tr := &http.Transport{
 		TLSClientConfig:    sharedTLSConfig,
 		MaxIdleConnsPerHost: 10,
 	}
 
-	if proxyDialer != nil {
-		// SOCKS5 代理：通过代理拨号，DNS 也走代理
-		tr.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return proxyDialer.Dial(network, addr)
-		}
-	} else if proxyURL != nil {
-		// HTTP 代理：设置 Proxy
-		tr.Proxy = http.ProxyURL(proxyURL)
-		tr.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return net.DialTimeout("tcp", addr, 2*time.Second)
+	if ip != "" {
+		// 强制拨号到指定 IP（用于测速特定节点）
+		addr := net.JoinHostPort(ip, fmt.Sprintf("%d", port))
+		if proxyDialer != nil {
+			tr.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+				return proxyDialer.Dial(network, addr)
+			}
+		} else if proxyURL != nil {
+			tr.Proxy = http.ProxyURL(proxyURL)
+			tr.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+				return net.DialTimeout("tcp", addr, 2*time.Second)
+			}
+		} else {
+			tr.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+				return net.DialTimeout("tcp", addr, 2*time.Second)
+			}
 		}
 	} else {
-		// 直连
-		tr.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return net.DialTimeout("tcp", addr, 2*time.Second)
+		// 普通请求（YouTube 页面、DoH），通过代理但使用正常 DNS
+		if proxyDialer != nil {
+			tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return proxyDialer.Dial(network, addr)
+			}
+		} else if proxyURL != nil {
+			tr.Proxy = http.ProxyURL(proxyURL)
 		}
 	}
 
