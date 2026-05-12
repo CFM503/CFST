@@ -61,6 +61,12 @@ func RunWeb(cfg Config) {
 		if s := q.Get("skip429"); s != "" {
 			reqCfg.Skip429 = (s == "true")
 		}
+		if s := q.Get("yt"); s == "true" {
+			reqCfg.YouTubeMode = true
+		}
+		if p := q.Get("proxy"); p != "" {
+			reqCfg.Proxy = p
+		}
 
 		var sendMu sync.Mutex
 		sendEvent := func(evtType string, data interface{}) {
@@ -71,8 +77,23 @@ func RunWeb(cfg Config) {
 			flusher.Flush()
 		}
 
-		sendEvent("status", "Generating IP Ranges...")
-		ips := GenerateIPs(reqCfg.MaxScan, reqCfg.Unique, reqCfg.IPFile)
+		if reqCfg.Proxy != "" {
+			initProxy(reqCfg.Proxy)
+		}
+
+		var ips []string
+		if reqCfg.YouTubeMode {
+			sendEvent("status", "Resolving YouTube CDN nodes...")
+			ips = ResolveYouTubeCDNIPs(reqCfg.MaxScan)
+			if len(ips) == 0 {
+				sendEvent("error", "No YouTube CDN IPs found. Check network/DNS (YouTube requires proxy in some regions).")
+				return
+			}
+			sendEvent("status", fmt.Sprintf("Found %d YouTube CDN IPs", len(ips)))
+		} else {
+			sendEvent("status", "Generating IP Ranges...")
+			ips = GenerateIPs(reqCfg.MaxScan, reqCfg.Unique, reqCfg.IPFile)
+		}
 
 		sendEvent("status", fmt.Sprintf("Ping Scanning %d IPs...", len(ips)))
 		validNodes := ScanPing(ips, reqCfg.Port, reqCfg.ScanConcurrent, func(done, total, valid int) {

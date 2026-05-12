@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/csv"
 	"fmt"
+	"math"
 	"os"
 	"sort"
 	"sync"
@@ -26,6 +27,8 @@ type Config struct {
 	WebMode        bool
 	URL            string
 	Skip429        bool
+	YouTubeMode    bool
+	Proxy          string
 }
 
 func DefaultConfig() Config {
@@ -34,7 +37,7 @@ func DefaultConfig() Config {
 		MaxScan:        2000,
 		Conc:           4,
 		DownloadNum:    10,
-		Duration:       6,
+		Duration:       15,
 		StopThreshold:  25.0,
 		Unique:         false,
 		Output:         "result_colo.csv",
@@ -62,25 +65,47 @@ func ScanPing(ips []string, port int, concurrency int, progressCallback func(don
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			lat := TCPPing(ip, port, 1000*time.Millisecond)
-			if lat <= 0 {
-				time.Sleep(50 * time.Millisecond)
-				lat = TCPPing(ip, port, 1000*time.Millisecond)
+			// 3 次 ping 测量延迟和抖动
+			pingCount := 3
+			var lats []float64
+			for i := 0; i < pingCount; i++ {
+				lat := TCPPing(ip, port, 1000*time.Millisecond)
+				if lat > 0 {
+					lats = append(lats, lat)
+				}
+				if i < pingCount-1 {
+					time.Sleep(30 * time.Millisecond)
+				}
 			}
 
 			d := done.Add(1)
-			if lat > 0 {
+			if len(lats) > 0 {
+				// 平均延迟
+				var sum float64
+				for _, l := range lats {
+					sum += l
+				}
+				avgLat := sum / float64(len(lats))
+
+				// 抖动（标准差）
+				jitter := 0.0
+				if len(lats) > 1 {
+					var variance float64
+					for _, l := range lats {
+						diff := l - avgLat
+						variance += diff * diff
+					}
+					variance /= float64(len(lats))
+					jitter = math.Sqrt(variance)
+				}
+
 				mu.Lock()
-				validNodes = append(validNodes, NodeResult{IP: ip, Port: port, TCPLatency: lat})
+				validNodes = append(validNodes, NodeResult{IP: ip, Port: port, TCPLatency: avgLat, Jitter: jitter})
 				mu.Unlock()
-				v := int(validCount.Add(1))
-				if progressCallback != nil {
-					progressCallback(int(d), total, v)
-				}
-			} else {
-				if progressCallback != nil {
-					progressCallback(int(d), total, int(validCount.Load()))
-				}
+				validCount.Add(1)
+			}
+			if progressCallback != nil && (d%10 == 0 || d == int32(total)) {
+				progressCallback(int(d), total, int(validCount.Load()))
 			}
 		}(ip)
 	}
@@ -141,8 +166,10 @@ func RunDownloadTest(candidates []NodeResult, cfg Config, progressRow func(res N
 			}
 			results = append(results, candidates[i])
 		} else {
-			speed := DownloadTest(candidates[i].IP, cfg.Port, cfg.Conc, cfg.Duration, cfg.URL)
+			speed, minSpd, stab := DownloadTest(candidates[i].IP, cfg.Port, cfg.Conc, cfg.Duration, cfg.URL)
 			candidates[i].DownloadSpeed = speed
+			candidates[i].MinSpeed = minSpd
+			candidates[i].Stability = stab
 			candidates[i].CalcScore()
 			results = append(results, candidates[i])
 
@@ -179,9 +206,28 @@ func RunDownloadTest(candidates []NodeResult, cfg Config, progressRow func(res N
 }
 
 func RunCLI(cfg Config) {
-	fmt.Printf("Cloudflare SpeedTest v1.0.5 (Go Edition)\n\n")
+	if cfg.YouTubeMode {
+		fmt.Printf("YouTube CDN SpeedTest v1.1.1 (Go Edition)\n\n")
+	} else {
+		fmt.Printf("Cloudflare SpeedTest v1.1.1 (Go Edition)\n\n")
+	}
 
-	ips := GenerateIPs(cfg.MaxScan, cfg.Unique, cfg.IPFile)
+	if cfg.Proxy != "" {
+		initProxy(cfg.Proxy)
+	}
+
+	var ips []string
+	if cfg.YouTubeMode {
+		fmt.Printf("🔍 Resolving YouTube CDN nodes (max: %d)...\n", cfg.MaxScan)
+		ips = ResolveYouTubeCDNIPs(cfg.MaxScan)
+		if len(ips) == 0 {
+			fmt.Println("[!] No YouTube CDN IPs found. Please check your network/DNS (YouTube requires proxy in some regions).")
+			return
+		}
+		fmt.Printf("  Found %d unique CDN IPs\n", len(ips))
+	} else {
+		ips = GenerateIPs(cfg.MaxScan, cfg.Unique, cfg.IPFile)
+	}
 	fmt.Printf("🔍 Scanning %d IPs (concurrency: %d)...\n", len(ips), cfg.ScanConcurrent)
 
 	validNodes := ScanPing(ips, cfg.Port, cfg.ScanConcurrent, func(done, total, valid int) {
@@ -204,12 +250,12 @@ func RunCLI(cfg Config) {
 	DetectColo(candidates, cfg.Port, cfg.ColoConcurrent, nil)
 
 	fmt.Printf("\n🚀 Test Download (%d threads, %ds duration)\n", cfg.Conc, cfg.Duration)
-	fmt.Printf("%-16s %-6s %-8s %-20s %-6s\n", "IP", "Colo", "Latency", "Speed", "Score")
-	fmt.Println("-----------------------------------------------------------------")
+	fmt.Printf("%-16s %-6s %-8s %-8s %-14s %-8s %-6s\n", "IP", "Colo", "Latency", "Jitter", "Speed", "Stable", "Score")
+	fmt.Println("---------------------------------------------------------------------------------")
 
 	results := RunDownloadTest(candidates, cfg, func(res NodeResult) {
 		if res.Colo != "429" || !cfg.Skip429 {
-			fmt.Printf("%-16s %-6s %5.1fms  %5.2f MB/s             %5.1f\n", res.IP, res.Colo, res.TCPLatency, res.DownloadSpeed, res.Score)
+			fmt.Printf("%-16s %-6s %5.1fms  %5.1fms  %5.2f MB/s    %4.0f%%   %5.1f\n", res.IP, res.Colo, res.TCPLatency, res.Jitter, res.DownloadSpeed, res.Stability, res.Score)
 		}
 	}, nil, func() {
 		fmt.Println("\n⚡ Fast-exit triggered.")
@@ -238,13 +284,16 @@ func saveCSV(path string, results []NodeResult) {
 	w := csv.NewWriter(f)
 	defer w.Flush()
 
-	w.Write([]string{"IP", "Colo", "Latency", "Speed_MB", "Score"})
+	w.Write([]string{"IP", "Colo", "Latency", "Jitter", "Speed_MB", "MinSpeed_MB", "Stability", "Score"})
 	for _, r := range results {
 		w.Write([]string{
 			r.IP,
 			r.Colo,
 			fmt.Sprintf("%.1f", r.TCPLatency),
+			fmt.Sprintf("%.1f", r.Jitter),
 			fmt.Sprintf("%.2f", r.DownloadSpeed),
+			fmt.Sprintf("%.2f", r.MinSpeed),
+			fmt.Sprintf("%.0f", r.Stability),
 			fmt.Sprintf("%.1f", r.Score),
 		})
 	}
