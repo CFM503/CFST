@@ -136,18 +136,46 @@ func DetectColo(candidates []NodeResult, port int, concurrency int, progressCall
 	wg.Wait()
 }
 
-func RunDownloadTest(candidates []NodeResult, cfg Config, progressRow func(res NodeResult), progressStatus func(msg string), fastExitHost func()) []NodeResult {
+func RunDownloadTest(candidates []NodeResult, cfg Config,
+	progressRow func(res NodeResult),
+	progressStatus func(msg string),
+	progressLive func(LiveProgress),
+	progressCooldown func(remaining int),
+	fastExitHost func()) []NodeResult {
+
 	var results []NodeResult
 	var fastCount int
 	var skipped int
+	var consecutive429 int
+	cooldownMs := 500       // IP 间冷却时间，动态调整
+	maxConsecutive := 5     // 触发全局暂停的阈值
+	globalCooldownSec := 15 // 全局暂停时长
 
 	for i := range candidates {
-		msg := fmt.Sprintf("Testing [%d/%d] %s (Skipped: %d)", i+1, len(candidates), candidates[i].IP, skipped)
-		if !cfg.WebMode {
-			fmt.Printf("\r  --> %-50s", msg)
+		// === 动态节奏控制：连续 429 触发全局冷却 ===
+		if consecutive429 >= maxConsecutive {
+			if !cfg.WebMode {
+				fmt.Println()
+			}
+			for sec := globalCooldownSec; sec > 0; sec-- {
+				if !cfg.WebMode {
+					fmt.Printf("\r  ⏳ Rate limited, cooling down %ds... (Skipped: %d)   ", sec, skipped)
+				}
+				if progressCooldown != nil {
+					progressCooldown(sec)
+				}
+				time.Sleep(1 * time.Second)
+			}
+			if !cfg.WebMode {
+				fmt.Print("\r                                                          \r")
+			}
+			consecutive429 = 0
+			cooldownMs = 500
 		}
-		if progressStatus != nil {
-			progressStatus(msg)
+
+		// IP 间冷却
+		if i > 0 && cooldownMs > 0 {
+			time.Sleep(time.Duration(cooldownMs) * time.Millisecond)
 		}
 
 		// Determine test URL for this node
@@ -156,16 +184,27 @@ func RunDownloadTest(candidates []NodeResult, cfg Config, progressRow func(res N
 			testURL = candidates[i].TestURL
 		}
 
-		// YouTube mode: skip CheckBlocked (YouTube CDN won't serve Cloudflare content)
-		isYouTube := candidates[i].Domain != ""
+		msg := fmt.Sprintf("Testing [%d/%d] %s (Skipped: %d)", i+1, len(candidates), candidates[i].IP, skipped)
+		if !cfg.WebMode {
+			fmt.Printf("\r  --> %-50s", msg)
+		}
+		if progressStatus != nil {
+			progressStatus(msg)
+		}
 
-		if !isYouTube && CheckBlocked(candidates[i].IP, cfg.Port, testURL) {
+		// 直接下载测试，由 DownloadTest 内部检测 429
+		speed, minSpd, stab, blocked := DownloadTest(candidates[i].IP, cfg.Port, cfg.Conc, cfg.Duration, testURL, progressLive)
+
+		if blocked {
+			consecutive429++
 			skipped++
+			cooldownMs = min(cooldownMs*2, 5000) // 指数退避，上限 5 秒
 			if cfg.Skip429 {
-				continue // Silently discard and do not consume a DownloadNum slot
+				continue
 			}
+			// Skip429=false: 记录 429 结果
 			candidates[i].DownloadSpeed = 0.0
-			candidates[i].Colo = "429" // Marked as rate limited
+			candidates[i].Colo = "429"
 			candidates[i].Score = 0.0
 			if !cfg.WebMode {
 				fmt.Print("\r                                                               \r")
@@ -175,11 +214,10 @@ func RunDownloadTest(candidates []NodeResult, cfg Config, progressRow func(res N
 			}
 			results = append(results, candidates[i])
 		} else {
-			speed, minSpd, stab, blocked := DownloadTest(candidates[i].IP, cfg.Port, cfg.Conc, cfg.Duration, testURL)
-			if blocked && cfg.Skip429 {
-				skipped++
-				continue // Silently discard 429/403 detected during download
-			}
+			// 成功，重置连续 429 计数和冷却时间
+			consecutive429 = 0
+			cooldownMs = 500
+
 			candidates[i].DownloadSpeed = speed
 			candidates[i].MinSpeed = minSpd
 			candidates[i].Stability = stab
@@ -220,9 +258,9 @@ func RunDownloadTest(candidates []NodeResult, cfg Config, progressRow func(res N
 
 func RunCLI(cfg Config) {
 	if cfg.YouTubeMode {
-		fmt.Printf("YouTube CDN SpeedTest v1.2.2 (Go Edition)\n\n")
+		fmt.Printf("YouTube CDN SpeedTest v1.2.3 (Go Edition)\n\n")
 	} else {
-		fmt.Printf("Cloudflare SpeedTest v1.2.2 (Go Edition)\n\n")
+		fmt.Printf("Cloudflare SpeedTest v1.2.3 (Go Edition)\n\n")
 	}
 
 	if cfg.Proxy != "" {
@@ -286,6 +324,8 @@ func RunCLI(cfg Config) {
 		if res.Colo != "429" || !cfg.Skip429 {
 			fmt.Printf("%-16s %-6s %5.1fms  %5.1fms  %5.2f MB/s    %4.0f%%   %5.1f\n", res.IP, res.Colo, res.TCPLatency, res.Jitter, res.DownloadSpeed, res.Stability, res.Score)
 		}
+	}, nil, func(p LiveProgress) {
+		fmt.Printf("\r  📥 %-16s %6.1f MB  %6.2f MB/s  %4.0f/%ds    ", p.IP, float64(p.Bytes)/1024.0/1024.0, p.Speed, p.Elapsed, int(p.Duration))
 	}, nil, func() {
 		fmt.Println("\n⚡ Fast-exit triggered.")
 	})

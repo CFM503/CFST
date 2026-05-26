@@ -477,38 +477,24 @@ func GetColo(ip string, port int) string {
 	return "UNK"
 }
 
-func CheckBlocked(ip string, port int, testURL string) bool {
-	parsedURL, err := url.Parse(testURL)
-	if err != nil {
-		return false
-	}
-	host := parsedURL.Hostname()
-
-	client := makeHTTPClient(ip, port, 3*time.Second)
-
-	req, err := newCFRequest("GET", testURL)
-	if err != nil {
-		return true
-	}
-	req.Host = host
-	req.Header.Set("Connection", "close")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return true
-	}
-	defer resp.Body.Close()
-
-	return resp.StatusCode >= 400
+// LiveProgress 实时下载进度
+type LiveProgress struct {
+	IP       string  `json:"ip"`
+	Bytes    int64   `json:"bytes"`
+	Speed    float64 `json:"speed"` // MB/s
+	Elapsed  float64 `json:"elapsed"`
+	Duration float64 `json:"duration"`
 }
 
-func DownloadTest(ip string, port int, threads int, duration int, testURL string) (avgSpeed, minSpeed, stability float64, blocked bool) {
+func DownloadTest(ip string, port int, threads int, duration int, testURL string,
+	progressCallback func(LiveProgress)) (avgSpeed, minSpeed, stability float64, blocked bool) {
 	parsedURL, _ := url.Parse(testURL)
 	host := parsedURL.Hostname()
 
 	var totalBytes int64
 	var wg sync.WaitGroup
-	var blockedFlag atomic.Bool
+	var blockedCount atomic.Int32
+	var successCount atomic.Int32
 
 	client := makeHTTPClient(ip, port, 0)
 
@@ -516,7 +502,7 @@ func DownloadTest(ip string, port int, threads int, duration int, testURL string
 	sampleInterval := 2 * time.Second
 	startGlobal := time.Now()
 
-	// 启动采样协定：每 2 秒记录累计字节数
+	// 启动采样协定：每 2 秒记录累计字节数，并触发进度回调
 	var samples []float64 // 每个采样点的累计 MB
 	var sampleMu sync.Mutex
 	done := make(chan struct{})
@@ -527,22 +513,43 @@ func DownloadTest(ip string, port int, threads int, duration int, testURL string
 			select {
 			case <-ticker.C:
 				b := atomic.LoadInt64(&totalBytes)
+				mb := float64(b) / 1024.0 / 1024.0
 				sampleMu.Lock()
-				samples = append(samples, float64(b)/1024.0/1024.0)
+				samples = append(samples, mb)
 				sampleMu.Unlock()
+				elapsed := time.Since(startGlobal).Seconds()
+				if progressCallback != nil {
+					progressCallback(LiveProgress{
+						IP:       ip,
+						Bytes:    b,
+						Speed:    mb / elapsed,
+						Elapsed:  elapsed,
+						Duration: float64(duration),
+					})
+				}
 			case <-done:
 				return
 			}
 		}
 	}()
 
+	// 所有线程启动完成的信号，用于快速中止
+	allStarted := make(chan struct{})
+	var startedCount atomic.Int32
+
 	for i := 0; i < threads; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer func() {
+				if startedCount.Add(1) == int32(threads) {
+					close(allStarted)
+				}
+			}()
 
 			req, err := newCFRequest("GET", testURL)
 			if err != nil {
+				blockedCount.Add(1)
 				return
 			}
 			req.Host = host
@@ -550,14 +557,16 @@ func DownloadTest(ip string, port int, threads int, duration int, testURL string
 
 			resp, err := client.Do(req)
 			if err != nil {
+				blockedCount.Add(1)
 				return
 			}
 			defer resp.Body.Close()
 
 			if resp.StatusCode >= 400 {
-				blockedFlag.Store(true)
+				blockedCount.Add(1)
 				return
 			}
+			successCount.Add(1)
 
 			buf := make([]byte, 65536)
 			for {
@@ -573,6 +582,15 @@ func DownloadTest(ip string, port int, threads int, duration int, testURL string
 				}
 			}
 		}()
+	}
+
+	// 等待所有线程启动，如果全部 blocked 则快速中止
+	<-allStarted
+	if int(blockedCount.Load()) == threads {
+		// 所有线程都返回 429，快速中止
+		wg.Wait()
+		close(done)
+		return 0, 0, 0, true
 	}
 
 	wg.Wait()
@@ -593,7 +611,7 @@ func DownloadTest(ip string, port int, threads int, duration int, testURL string
 
 	// 计算每个区间的瞬时速度
 	if len(samples) < 2 {
-		return avgSpeed, avgSpeed, 0.0, blockedFlag.Load()
+		return avgSpeed, avgSpeed, 0.0, false
 	}
 
 	var intervalSpeeds []float64
@@ -613,7 +631,7 @@ func DownloadTest(ip string, port int, threads int, duration int, testURL string
 	}
 
 	if len(intervalSpeeds) == 0 {
-		return avgSpeed, avgSpeed, 0.0, blockedFlag.Load()
+		return avgSpeed, avgSpeed, 0.0, false
 	}
 
 	// 最低速度
@@ -629,7 +647,7 @@ func DownloadTest(ip string, port int, threads int, duration int, testURL string
 	// 稳定性 = 100 - 变异系数*100 (变异系数 = 标准差/均值)
 	mean := sum / float64(len(intervalSpeeds))
 	if mean < 0.01 {
-		return avgSpeed, minSpeed, 0.0, blockedFlag.Load()
+		return avgSpeed, minSpeed, 0.0, false
 	}
 	var variance float64
 	for _, s := range intervalSpeeds {
@@ -647,5 +665,5 @@ func DownloadTest(ip string, port int, threads int, duration int, testURL string
 		stability = 100
 	}
 
-	return avgSpeed, minSpeed, stability, blockedFlag.Load()
+	return avgSpeed, minSpeed, stability, false
 }

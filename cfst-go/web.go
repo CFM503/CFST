@@ -143,6 +143,10 @@ func RunWeb(cfg Config) {
 			}
 		}, func(msg string) {
 			sendEvent("status", msg)
+		}, func(p LiveProgress) {
+			sendEvent("progress_live", p)
+		}, func(remaining int) {
+			sendEvent("cooldown", map[string]int{"remaining": remaining, "skipped": 0})
 		}, func() {
 			sendEvent("fast_exit", "Target speed threshold reached, stopping early.")
 		})
