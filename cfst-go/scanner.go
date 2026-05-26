@@ -175,7 +175,11 @@ func RunDownloadTest(candidates []NodeResult, cfg Config, progressRow func(res N
 			}
 			results = append(results, candidates[i])
 		} else {
-			speed, minSpd, stab := DownloadTest(candidates[i].IP, cfg.Port, cfg.Conc, cfg.Duration, testURL)
+			speed, minSpd, stab, blocked := DownloadTest(candidates[i].IP, cfg.Port, cfg.Conc, cfg.Duration, testURL)
+			if blocked && cfg.Skip429 {
+				skipped++
+				continue // Silently discard 429/403 detected during download
+			}
 			candidates[i].DownloadSpeed = speed
 			candidates[i].MinSpeed = minSpd
 			candidates[i].Stability = stab
