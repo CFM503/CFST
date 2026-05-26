@@ -82,12 +82,18 @@ func RunWeb(cfg Config) {
 		}
 
 		var ips []string
+		var ytNodeMap map[string]NodeResult
 		if reqCfg.YouTubeMode {
 			sendEvent("status", "Resolving YouTube CDN nodes...")
-			ips = ResolveYouTubeCDNIPs(reqCfg.MaxScan)
-			if len(ips) == 0 {
+			ytNodes := ResolveYouTubeCDNIPs(reqCfg.MaxScan)
+			if len(ytNodes) == 0 {
 				sendEvent("error", "No YouTube CDN IPs found. Check network/DNS (YouTube requires proxy in some regions).")
 				return
+			}
+			ytNodeMap = make(map[string]NodeResult, len(ytNodes))
+			for _, n := range ytNodes {
+				ips = append(ips, n.IP)
+				ytNodeMap[n.IP] = n
 			}
 			sendEvent("status", fmt.Sprintf("Found %d YouTube CDN IPs", len(ips)))
 		} else {
@@ -112,6 +118,16 @@ func RunWeb(cfg Config) {
 		})
 
 		candidates := validNodes
+
+		// For YouTube mode, inject TestURL/Domain into candidates
+		if ytNodeMap != nil {
+			for i := range candidates {
+				if yt, ok := ytNodeMap[candidates[i].IP]; ok {
+					candidates[i].TestURL = yt.TestURL
+					candidates[i].Domain = yt.Domain
+				}
+			}
+		}
 
 		sendEvent("status", fmt.Sprintf("Detecting Colo for %d nodes...", len(candidates)))
 		DetectColo(candidates, reqCfg.Port, reqCfg.ColoConcurrent, func(done, total int) {

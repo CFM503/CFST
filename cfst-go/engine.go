@@ -66,6 +66,8 @@ type NodeResult struct {
 	Jitter        float64 `json:"jitter"`
 	Stability     float64 `json:"stability"`
 	MinSpeed      float64 `json:"min_speed"`
+	TestURL       string  `json:"test_url,omitempty"`
+	Domain        string  `json:"domain,omitempty"`
 }
 
 func (n *NodeResult) CalcScore() {
@@ -114,43 +116,45 @@ func randIPFromCIDR(cidr string) string {
 	return net.IP(buf[:]).String()
 }
 
-// ResolveYouTubeCDNIPs 发现 YouTube CDN 节点 IP
-// 策略：1) DoH 解析 redirector  2) 抓取 YouTube 页面提取真实域名  3) DoH 解析所有域名
-func ResolveYouTubeCDNIPs(maxIPs int) []string {
+// ResolveYouTubeCDNIPs 发现 YouTube CDN 节点 IP，返回含 TestURL 的 NodeResult
+func ResolveYouTubeCDNIPs(maxIPs int) []NodeResult {
 	seen := make(map[string]bool)
-	var ips []string
-	var domains []string
+	var nodes []NodeResult
 
 	// Step 1: 解析 redirector.googlevideo.com（通用重定向节点）
-	domains = append(domains, "redirector.googlevideo.com")
+	redirectorIPs := dohResolve("redirector.googlevideo.com")
+	for _, ip := range redirectorIPs {
+		if !seen[ip] {
+			seen[ip] = true
+			nodes = append(nodes, NodeResult{IP: ip, Port: 443, Domain: "redirector.googlevideo.com", TestURL: "https://redirector.googlevideo.com/videoplayback"})
+		}
+	}
 
-	// Step 2: 抓取 YouTube 页面，提取真实 CDN 域名
-	realDomains := discoverYouTubeCDNDomains()
-	domains = append(domains, realDomains...)
-	fmt.Printf("  Discovered %d CDN domains\n", len(realDomains))
+	// Step 2: 抓取 YouTube 页面，提取真实 CDN 域名和 videoplayback URL
+	domainURLs := discoverYouTubeCDNDomains()
+	fmt.Printf("  Discovered %d CDN domains\n", len(domainURLs))
 
 	// Step 3: DoH 解析所有域名
-	for _, domain := range domains {
-		if len(ips) >= maxIPs {
+	for domain, testURL := range domainURLs {
+		if len(nodes) >= maxIPs {
 			break
 		}
 		for _, ip := range dohResolve(domain) {
 			if !seen[ip] {
 				seen[ip] = true
-				ips = append(ips, ip)
+				nodes = append(nodes, NodeResult{IP: ip, Port: 443, Domain: domain, TestURL: testURL})
 			}
 		}
 	}
 
-	if len(ips) > maxIPs {
-		ips = ips[:maxIPs]
+	if len(nodes) > maxIPs {
+		nodes = nodes[:maxIPs]
 	}
-	return ips
+	return nodes
 }
 
-// discoverYouTubeCDNDomains 抓取 YouTube 页面提取 googlevideo.com CDN 域名
-func discoverYouTubeCDNDomains() []string {
-	// 用几个热门视频 ID 来发现 CDN 节点
+// discoverYouTubeCDNDomains 抓取 YouTube 页面提取 googlevideo.com CDN 域名及可用的测试 URL
+func discoverYouTubeCDNDomains() map[string]string {
 	videoIDs := []string{
 		"dQw4w9WgXcQ", "jNQXAC9IVRw", "9bZkp7q19f0",
 		"kJQP7kiw5Fk", "RgKAFK5djSk", "fJ9rUzIMcZQ",
@@ -159,7 +163,7 @@ func discoverYouTubeCDNDomains() []string {
 	client := makeHTTPClient("", 0, 10*time.Second)
 	domainRe := regexp.MustCompile(`([a-z0-9]+---sn-[a-z0-9]+\.googlevideo\.com)`)
 	seen := make(map[string]bool)
-	var domains []string
+	domainURLs := make(map[string]string) // domain -> videoplayback URL
 
 	for _, vid := range videoIDs {
 		reqURL := fmt.Sprintf("https://www.youtube.com/watch?v=%s", vid)
@@ -177,18 +181,67 @@ func discoverYouTubeCDNDomains() []string {
 			continue
 		}
 
-		matches := domainRe.FindAllString(string(body), -1)
+		bodyStr := string(body)
+		matches := domainRe.FindAllString(bodyStr, -1)
 		for _, m := range matches {
 			if !seen[m] {
 				seen[m] = true
-				domains = append(domains, m)
+				domainURLs[m] = "" // placeholder, will be filled
 			}
 		}
-		if len(domains) > 50 {
+		if len(domainURLs) > 50 {
 			break
 		}
 	}
-	return domains
+
+	// 提取可用的 videoplayback URL 作为测试 URL
+	playbackRe := regexp.MustCompile(`https://([a-z0-9]+---sn-[a-z0-9]+\.googlevideo\.com)/videoplayback[^"'\s]*`)
+	for _, vid := range videoIDs {
+		reqURL := fmt.Sprintf("https://www.youtube.com/watch?v=%s", vid)
+		req, err := newCFRequest("GET", reqURL)
+		if err != nil {
+			continue
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+
+		bodyStr := string(body)
+		playbackMatches := playbackRe.FindAllString(bodyStr, -1)
+		for _, m := range playbackMatches {
+			domain := domainRe.FindString(m)
+			if domain != "" {
+				domainURLs[domain] = m
+			}
+		}
+
+		// 如果所有域名都有了测试 URL，提前退出
+		allHave := true
+		for _, u := range domainURLs {
+			if u == "" {
+				allHave = false
+				break
+			}
+		}
+		if allHave {
+			break
+		}
+	}
+
+	// 对于没有找到 videoplayback URL 的域名，使用域名本身构造测试 URL
+	for domain, u := range domainURLs {
+		if u == "" {
+			domainURLs[domain] = fmt.Sprintf("https://%s/videoplayback", domain)
+		}
+	}
+
+	return domainURLs
 }
 
 // dohResolve 通过 DNS-over-HTTPS 解析域名（HTTP 请求走代理）

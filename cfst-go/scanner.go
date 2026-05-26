@@ -150,7 +150,16 @@ func RunDownloadTest(candidates []NodeResult, cfg Config, progressRow func(res N
 			progressStatus(msg)
 		}
 
-		if CheckBlocked(candidates[i].IP, cfg.Port, cfg.URL) {
+		// Determine test URL for this node
+		testURL := cfg.URL
+		if candidates[i].TestURL != "" {
+			testURL = candidates[i].TestURL
+		}
+
+		// YouTube mode: skip CheckBlocked (YouTube CDN won't serve Cloudflare content)
+		isYouTube := candidates[i].Domain != ""
+
+		if !isYouTube && CheckBlocked(candidates[i].IP, cfg.Port, testURL) {
 			skipped++
 			if cfg.Skip429 {
 				continue // Silently discard and do not consume a DownloadNum slot
@@ -166,7 +175,7 @@ func RunDownloadTest(candidates []NodeResult, cfg Config, progressRow func(res N
 			}
 			results = append(results, candidates[i])
 		} else {
-			speed, minSpd, stab := DownloadTest(candidates[i].IP, cfg.Port, cfg.Conc, cfg.Duration, cfg.URL)
+			speed, minSpd, stab := DownloadTest(candidates[i].IP, cfg.Port, cfg.Conc, cfg.Duration, testURL)
 			candidates[i].DownloadSpeed = speed
 			candidates[i].MinSpeed = minSpd
 			candidates[i].Stability = stab
@@ -207,9 +216,9 @@ func RunDownloadTest(candidates []NodeResult, cfg Config, progressRow func(res N
 
 func RunCLI(cfg Config) {
 	if cfg.YouTubeMode {
-		fmt.Printf("YouTube CDN SpeedTest v1.2.0 (Go Edition)\n\n")
+		fmt.Printf("YouTube CDN SpeedTest v1.2.1 (Go Edition)\n\n")
 	} else {
-		fmt.Printf("Cloudflare SpeedTest v1.2.0 (Go Edition)\n\n")
+		fmt.Printf("Cloudflare SpeedTest v1.2.1 (Go Edition)\n\n")
 	}
 
 	if cfg.Proxy != "" {
@@ -217,12 +226,18 @@ func RunCLI(cfg Config) {
 	}
 
 	var ips []string
+	var ytNodeMap map[string]NodeResult // IP -> NodeResult with TestURL/Domain
 	if cfg.YouTubeMode {
 		fmt.Printf("🔍 Resolving YouTube CDN nodes (max: %d)...\n", cfg.MaxScan)
-		ips = ResolveYouTubeCDNIPs(cfg.MaxScan)
-		if len(ips) == 0 {
+		ytNodes := ResolveYouTubeCDNIPs(cfg.MaxScan)
+		if len(ytNodes) == 0 {
 			fmt.Println("[!] No YouTube CDN IPs found. Please check your network/DNS (YouTube requires proxy in some regions).")
 			return
+		}
+		ytNodeMap = make(map[string]NodeResult, len(ytNodes))
+		for _, n := range ytNodes {
+			ips = append(ips, n.IP)
+			ytNodeMap[n.IP] = n
 		}
 		fmt.Printf("  Found %d unique CDN IPs\n", len(ips))
 	} else {
@@ -245,6 +260,16 @@ func RunCLI(cfg Config) {
 	})
 
 	candidates := validNodes
+
+	// For YouTube mode, inject TestURL/Domain into candidates
+	if ytNodeMap != nil {
+		for i := range candidates {
+			if yt, ok := ytNodeMap[candidates[i].IP]; ok {
+				candidates[i].TestURL = yt.TestURL
+				candidates[i].Domain = yt.Domain
+			}
+		}
+	}
 
 	fmt.Printf("🌐 Detecting Colo (Top %d)...\n", len(candidates))
 	DetectColo(candidates, cfg.Port, cfg.ColoConcurrent, nil)
