@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -117,12 +118,15 @@ func randIPFromCIDR(cidr string) string {
 }
 
 // ResolveYouTubeCDNIPs 发现 YouTube CDN 节点 IP，返回含 TestURL 的 NodeResult
-func ResolveYouTubeCDNIPs(maxIPs int) []NodeResult {
+func ResolveYouTubeCDNIPs(maxIPs int, proxyAddr string) []NodeResult {
+	if maxIPs <= 0 {
+		return nil
+	}
 	seen := make(map[string]bool)
 	var nodes []NodeResult
 
 	// Step 1: 解析 redirector.googlevideo.com（通用重定向节点）
-	redirectorIPs := dohResolve("redirector.googlevideo.com")
+	redirectorIPs := dohResolve("redirector.googlevideo.com", proxyAddr)
 	for _, ip := range redirectorIPs {
 		if !seen[ip] {
 			seen[ip] = true
@@ -131,7 +135,7 @@ func ResolveYouTubeCDNIPs(maxIPs int) []NodeResult {
 	}
 
 	// Step 2: 抓取 YouTube 页面，提取真实 CDN 域名和 videoplayback URL
-	domainURLs := discoverYouTubeCDNDomains()
+	domainURLs := discoverYouTubeCDNDomains(proxyAddr)
 	fmt.Printf("  Discovered %d CDN domains\n", len(domainURLs))
 
 	// Step 3: DoH 解析所有域名
@@ -139,7 +143,7 @@ func ResolveYouTubeCDNIPs(maxIPs int) []NodeResult {
 		if len(nodes) >= maxIPs {
 			break
 		}
-		for _, ip := range dohResolve(domain) {
+		for _, ip := range dohResolve(domain, proxyAddr) {
 			if !seen[ip] {
 				seen[ip] = true
 				nodes = append(nodes, NodeResult{IP: ip, Port: 443, Domain: domain, TestURL: testURL})
@@ -154,13 +158,13 @@ func ResolveYouTubeCDNIPs(maxIPs int) []NodeResult {
 }
 
 // discoverYouTubeCDNDomains 抓取 YouTube 页面提取 googlevideo.com CDN 域名及可用的测试 URL
-func discoverYouTubeCDNDomains() map[string]string {
+func discoverYouTubeCDNDomains(proxyAddr string) map[string]string {
 	videoIDs := []string{
 		"dQw4w9WgXcQ", "jNQXAC9IVRw", "9bZkp7q19f0",
 		"kJQP7kiw5Fk", "RgKAFK5djSk", "fJ9rUzIMcZQ",
 	}
 
-	client := makeHTTPClient("", 0, 10*time.Second)
+	client := makeHTTPClient("", 0, 10*time.Second, proxyAddr)
 	domainRe := regexp.MustCompile(`([a-z0-9]+---sn-[a-z0-9]+\.googlevideo\.com)`)
 	seen := make(map[string]bool)
 	domainURLs := make(map[string]string) // domain -> videoplayback URL
@@ -245,8 +249,8 @@ func discoverYouTubeCDNDomains() map[string]string {
 }
 
 // dohResolve 通过 DNS-over-HTTPS 解析域名（HTTP 请求走代理）
-func dohResolve(host string) []string {
-	client := makeHTTPClient("", 0, 5*time.Second)
+func dohResolve(host string, proxyAddr string) []string {
+	client := makeHTTPClient("", 0, 5*time.Second, proxyAddr)
 	reqURL := fmt.Sprintf("https://cloudflare-dns.com/dns-query?name=%s&type=A", host)
 	req, err := http.NewRequest("GET", reqURL, nil)
 	if err != nil {
@@ -282,6 +286,9 @@ func dohResolve(host string) []string {
 }
 
 func GenerateIPs(maxScan int, unique bool, ipFile string) []string {
+	if maxScan <= 0 {
+		return nil
+	}
 	ranges := CloudflareIPv4Ranges
 	if ipFile != "" {
 		if content, err := os.ReadFile(ipFile); err == nil {
@@ -364,43 +371,28 @@ var coloRe = regexp.MustCompile(`colo=([A-Z]+)`)
 
 var sharedTLSConfig = &tls.Config{InsecureSkipVerify: true}
 var clientPool sync.Map // map[string]*http.Client
-var proxyDialer proxy.Dialer // nil = direct connection
-var proxyURL *url.URL        // for HTTP proxy
 
-func initProxy(addr string) {
-	if addr == "" {
-		return
-	}
-	// 自动补全协议前缀
-	if !strings.Contains(addr, "://") {
-		addr = "socks5://" + addr
-	}
-	u, err := url.Parse(addr)
-	if err != nil {
-		fmt.Printf("[!] Invalid proxy: %v\n", err)
-		return
-	}
-	switch u.Scheme {
-	case "socks5", "socks5h":
-		dialer, err := proxy.FromURL(u, proxy.Direct)
-		if err != nil {
-			fmt.Printf("[!] SOCKS5 proxy error: %v\n", err)
-			return
-		}
-		proxyDialer = dialer
-		fmt.Printf("  Proxy: SOCKS5 %s\n", u.Host)
-	case "http", "https":
-		proxyURL = u
-		fmt.Printf("  Proxy: HTTP %s\n", u.Host)
-	default:
-		fmt.Printf("[!] Unsupported proxy scheme: %s\n", u.Scheme)
+var downloadBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 65536)
+		return &b
+	},
+}
+
+func init() {
+	for _, cidr := range CloudflareIPv4Ranges {
+		parseCIDRCached(cidr)
 	}
 }
 
-func makeHTTPClient(ip string, port int, timeout time.Duration) *http.Client {
-	key := fmt.Sprintf("%s:%d:%v", ip, port, timeout)
-	if v, ok := clientPool.Load(key); ok {
-		return v.(*http.Client)
+func makeHTTPClient(ip string, port int, timeout time.Duration, proxyAddr string) *http.Client {
+	var key string
+	var useCache = (ip == "")
+	if useCache {
+		key = fmt.Sprintf("global:%d:%v:%s", port, timeout, proxyAddr)
+		if v, ok := clientPool.Load(key); ok {
+			return v.(*http.Client)
+		}
 	}
 
 	tr := &http.Transport{
@@ -408,15 +400,34 @@ func makeHTTPClient(ip string, port int, timeout time.Duration) *http.Client {
 		MaxIdleConnsPerHost: 10,
 	}
 
+	var localProxyDialer proxy.Dialer
+	var localProxyURL *url.URL
+	if proxyAddr != "" {
+		pAddr := proxyAddr
+		if !strings.Contains(pAddr, "://") {
+			pAddr = "socks5://" + pAddr
+		}
+		if u, err := url.Parse(pAddr); err == nil {
+			switch u.Scheme {
+			case "socks5", "socks5h":
+				if dialer, err := proxy.FromURL(u, proxy.Direct); err == nil {
+					localProxyDialer = dialer
+				}
+			case "http", "https":
+				localProxyURL = u
+			}
+		}
+	}
+
 	if ip != "" {
 		// 强制拨号到指定 IP（用于测速特定节点）
-		addr := net.JoinHostPort(ip, fmt.Sprintf("%d", port))
-		if proxyDialer != nil {
+		addr := net.JoinHostPort(ip, strconv.Itoa(port))
+		if localProxyDialer != nil {
 			tr.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
-				return proxyDialer.Dial(network, addr)
+				return localProxyDialer.Dial(network, addr)
 			}
-		} else if proxyURL != nil {
-			tr.Proxy = http.ProxyURL(proxyURL)
+		} else if localProxyURL != nil {
+			tr.Proxy = http.ProxyURL(localProxyURL)
 			tr.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
 				return net.DialTimeout("tcp", addr, 2*time.Second)
 			}
@@ -427,12 +438,12 @@ func makeHTTPClient(ip string, port int, timeout time.Duration) *http.Client {
 		}
 	} else {
 		// 普通请求（YouTube 页面、DoH），通过代理但使用正常 DNS
-		if proxyDialer != nil {
+		if localProxyDialer != nil {
 			tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return proxyDialer.Dial(network, addr)
+				return localProxyDialer.Dial(network, addr)
 			}
-		} else if proxyURL != nil {
-			tr.Proxy = http.ProxyURL(proxyURL)
+		} else if localProxyURL != nil {
+			tr.Proxy = http.ProxyURL(localProxyURL)
 		}
 	}
 
@@ -440,7 +451,10 @@ func makeHTTPClient(ip string, port int, timeout time.Duration) *http.Client {
 		Transport: tr,
 		Timeout:   timeout,
 	}
-	clientPool.Store(key, client)
+
+	if useCache {
+		clientPool.Store(key, client)
+	}
 	return client
 }
 
@@ -449,12 +463,44 @@ func newCFRequest(method, url string) (*http.Request, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0 Safari/537.36")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+	req.Header.Set("Referer", "https://speed.cloudflare.com/")
+	req.Header.Set("Origin", "https://speed.cloudflare.com")
+	req.Header.Set("Sec-Ch-Ua", `"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"`)
+	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
+	req.Header.Set("Sec-Ch-Ua-Platform", `"Windows"`)
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	return req, nil
 }
 
-func GetColo(ip string, port int) string {
-	client := makeHTTPClient(ip, port, 3*time.Second)
+func newCFRequestWithContext(ctx context.Context, method, url string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+	req.Header.Set("Referer", "https://speed.cloudflare.com/")
+	req.Header.Set("Origin", "https://speed.cloudflare.com")
+	req.Header.Set("Sec-Ch-Ua", `"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"`)
+	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
+	req.Header.Set("Sec-Ch-Ua-Platform", `"Windows"`)
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	return req, nil
+}
+
+func GetColo(ip string, port int, proxyAddr string) string {
+	client := makeHTTPClient(ip, port, 3*time.Second, proxyAddr)
+	if tr, ok := client.Transport.(*http.Transport); ok {
+		defer tr.CloseIdleConnections()
+	}
 	req, err := newCFRequest("GET", "https://speed.cloudflare.com/cdn-cgi/trace")
 	if err != nil {
 		return "ERR"
@@ -486,9 +532,12 @@ type LiveProgress struct {
 	Duration float64 `json:"duration"`
 }
 
-func DownloadTest(ip string, port int, threads int, duration int, testURL string,
+func DownloadTest(ctx context.Context, ip string, port int, threads int, duration int, testURL string, proxyAddr string,
 	progressCallback func(LiveProgress)) (avgSpeed, minSpeed, stability float64, blocked bool) {
-	parsedURL, _ := url.Parse(testURL)
+	parsedURL, err := url.Parse(testURL)
+	if err != nil {
+		return 0, 0, 0, true
+	}
 	host := parsedURL.Hostname()
 
 	var totalBytes int64
@@ -496,9 +545,15 @@ func DownloadTest(ip string, port int, threads int, duration int, testURL string
 	var blockedCount atomic.Int32
 	var successCount atomic.Int32
 
-	client := makeHTTPClient(ip, port, 0)
+	client := makeHTTPClient(ip, port, 0, proxyAddr)
+	if tr, ok := client.Transport.(*http.Transport); ok {
+		defer tr.CloseIdleConnections()
+	}
 
 	dur := time.Duration(duration) * time.Second
+	downloadCtx, cancel := context.WithTimeout(ctx, dur)
+	defer cancel()
+
 	sampleInterval := 2 * time.Second
 	startGlobal := time.Now()
 
@@ -527,6 +582,8 @@ func DownloadTest(ip string, port int, threads int, duration int, testURL string
 						Duration: float64(duration),
 					})
 				}
+			case <-downloadCtx.Done():
+				return
 			case <-done:
 				return
 			}
@@ -547,7 +604,7 @@ func DownloadTest(ip string, port int, threads int, duration int, testURL string
 				}
 			}()
 
-			req, err := newCFRequest("GET", testURL)
+			req, err := newCFRequestWithContext(downloadCtx, "GET", testURL)
 			if err != nil {
 				blockedCount.Add(1)
 				return
@@ -568,11 +625,11 @@ func DownloadTest(ip string, port int, threads int, duration int, testURL string
 			}
 			successCount.Add(1)
 
-			buf := make([]byte, 65536)
+			bufPtr := downloadBufPool.Get().(*[]byte)
+			buf := *bufPtr
+			defer downloadBufPool.Put(bufPtr)
+
 			for {
-				if time.Since(startGlobal) > dur {
-					break
-				}
 				n, err := resp.Body.Read(buf)
 				if n > 0 {
 					atomic.AddInt64(&totalBytes, int64(n))

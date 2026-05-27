@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/csv"
 	"fmt"
 	"math"
@@ -49,7 +50,7 @@ func DefaultConfig() Config {
 	}
 }
 
-func ScanPing(ips []string, port int, concurrency int, progressCallback func(done, total, valid int)) []NodeResult {
+func ScanPing(ctx context.Context, ips []string, port int, concurrency int, progressCallback func(done, total, valid int)) []NodeResult {
 	var validNodes []NodeResult
 	var mu sync.Mutex
 	var done, validCount atomic.Int32
@@ -59,22 +60,42 @@ func ScanPing(ips []string, port int, concurrency int, progressCallback func(don
 	var wg sync.WaitGroup
 
 	for _, ip := range ips {
+		if ctx.Err() != nil {
+			break
+		}
 		wg.Add(1)
-		sem <- struct{}{}
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			wg.Done()
+			break
+		}
+
 		go func(ip string) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
+			if ctx.Err() != nil {
+				return
+			}
+
 			// 3 次 ping 测量延迟和抖动
 			pingCount := 3
-			var lats []float64
+			lats := make([]float64, 0, 3)
 			for i := 0; i < pingCount; i++ {
+				if ctx.Err() != nil {
+					return
+				}
 				lat := TCPPing(ip, port, 1000*time.Millisecond)
 				if lat > 0 {
 					lats = append(lats, lat)
 				}
 				if i < pingCount-1 {
-					time.Sleep(30 * time.Millisecond)
+					select {
+					case <-time.After(30 * time.Millisecond):
+					case <-ctx.Done():
+						return
+					}
 				}
 			}
 
@@ -113,20 +134,32 @@ func ScanPing(ips []string, port int, concurrency int, progressCallback func(don
 	return validNodes
 }
 
-func DetectColo(candidates []NodeResult, port int, concurrency int, progressCallback func(done, total int)) {
+func DetectColo(ctx context.Context, candidates []NodeResult, port int, concurrency int, proxyAddr string, progressCallback func(done, total int)) {
 	var wg sync.WaitGroup
 	var done atomic.Int32
 	total := len(candidates)
 	sem := make(chan struct{}, concurrency)
 
 	for i := range candidates {
+		if ctx.Err() != nil {
+			break
+		}
 		wg.Add(1)
-		sem <- struct{}{}
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			wg.Done()
+			break
+		}
+
 		go func(idx int) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			candidates[idx].Colo = GetColo(candidates[idx].IP, port)
+			if ctx.Err() != nil {
+				return
+			}
+			candidates[idx].Colo = GetColo(candidates[idx].IP, port, proxyAddr)
 			d := done.Add(1)
 			if progressCallback != nil {
 				progressCallback(int(d), total)
@@ -136,7 +169,7 @@ func DetectColo(candidates []NodeResult, port int, concurrency int, progressCall
 	wg.Wait()
 }
 
-func RunDownloadTest(candidates []NodeResult, cfg Config,
+func RunDownloadTest(ctx context.Context, candidates []NodeResult, cfg Config,
 	progressRow func(res NodeResult),
 	progressStatus func(msg string),
 	progressLive func(LiveProgress),
@@ -152,19 +185,30 @@ func RunDownloadTest(candidates []NodeResult, cfg Config,
 	globalCooldownSec := 15 // 全局暂停时长
 
 	for i := range candidates {
+		if ctx.Err() != nil {
+			break
+		}
+
 		// === 动态节奏控制：连续 429 触发全局冷却 ===
 		if consecutive429 >= maxConsecutive {
 			if !cfg.WebMode {
 				fmt.Println()
 			}
 			for sec := globalCooldownSec; sec > 0; sec-- {
+				if ctx.Err() != nil {
+					return results
+				}
 				if !cfg.WebMode {
 					fmt.Printf("\r  ⏳ Rate limited, cooling down %ds... (Skipped: %d)   ", sec, skipped)
 				}
 				if progressCooldown != nil {
 					progressCooldown(sec)
 				}
-				time.Sleep(1 * time.Second)
+				select {
+				case <-time.After(1 * time.Second):
+				case <-ctx.Done():
+					return results
+				}
 			}
 			if !cfg.WebMode {
 				fmt.Print("\r                                                          \r")
@@ -175,7 +219,15 @@ func RunDownloadTest(candidates []NodeResult, cfg Config,
 
 		// IP 间冷却
 		if i > 0 && cooldownMs > 0 {
-			time.Sleep(time.Duration(cooldownMs) * time.Millisecond)
+			select {
+			case <-time.After(time.Duration(cooldownMs) * time.Millisecond):
+			case <-ctx.Done():
+				return results
+			}
+		}
+
+		if ctx.Err() != nil {
+			break
 		}
 
 		// Determine test URL for this node
@@ -193,7 +245,7 @@ func RunDownloadTest(candidates []NodeResult, cfg Config,
 		}
 
 		// 直接下载测试，由 DownloadTest 内部检测 429
-		speed, minSpd, stab, blocked := DownloadTest(candidates[i].IP, cfg.Port, cfg.Conc, cfg.Duration, testURL, progressLive)
+		speed, minSpd, stab, blocked := DownloadTest(ctx, candidates[i].IP, cfg.Port, cfg.Conc, cfg.Duration, testURL, cfg.Proxy, progressLive)
 
 		if blocked {
 			consecutive429++
@@ -217,6 +269,9 @@ func RunDownloadTest(candidates []NodeResult, cfg Config,
 			// 成功，重置连续 429 计数和冷却时间
 			consecutive429 = 0
 			cooldownMs = 500
+
+			// Lazy Colo Detection: Only query Colo for successful downloads (Item 2)
+			candidates[i].Colo = GetColo(candidates[i].IP, cfg.Port, cfg.Proxy)
 
 			candidates[i].DownloadSpeed = speed
 			candidates[i].MinSpeed = minSpd
@@ -258,20 +313,16 @@ func RunDownloadTest(candidates []NodeResult, cfg Config,
 
 func RunCLI(cfg Config) {
 	if cfg.YouTubeMode {
-		fmt.Printf("YouTube CDN SpeedTest v1.2.3 (Go Edition)\n\n")
+		fmt.Printf("YouTube CDN SpeedTest v1.3.1 (Go Edition)\n\n")
 	} else {
-		fmt.Printf("Cloudflare SpeedTest v1.2.3 (Go Edition)\n\n")
-	}
-
-	if cfg.Proxy != "" {
-		initProxy(cfg.Proxy)
+		fmt.Printf("Cloudflare SpeedTest v1.3.1 (Go Edition)\n\n")
 	}
 
 	var ips []string
 	var ytNodeMap map[string]NodeResult // IP -> NodeResult with TestURL/Domain
 	if cfg.YouTubeMode {
 		fmt.Printf("🔍 Resolving YouTube CDN nodes (max: %d)...\n", cfg.MaxScan)
-		ytNodes := ResolveYouTubeCDNIPs(cfg.MaxScan)
+		ytNodes := ResolveYouTubeCDNIPs(cfg.MaxScan, cfg.Proxy)
 		if len(ytNodes) == 0 {
 			fmt.Println("[!] No YouTube CDN IPs found. Please check your network/DNS (YouTube requires proxy in some regions).")
 			return
@@ -287,7 +338,9 @@ func RunCLI(cfg Config) {
 	}
 	fmt.Printf("🔍 Scanning %d IPs (concurrency: %d)...\n", len(ips), cfg.ScanConcurrent)
 
-	validNodes := ScanPing(ips, cfg.Port, cfg.ScanConcurrent, func(done, total, valid int) {
+	ctx := context.Background()
+
+	validNodes := ScanPing(ctx, ips, cfg.Port, cfg.ScanConcurrent, func(done, total, valid int) {
 		fmt.Printf("\r  Process: %d/%d | Valid: %d", done, total, valid)
 	})
 	fmt.Println()
@@ -313,14 +366,11 @@ func RunCLI(cfg Config) {
 		}
 	}
 
-	fmt.Printf("🌐 Detecting Colo (Top %d)...\n", len(candidates))
-	DetectColo(candidates, cfg.Port, cfg.ColoConcurrent, nil)
-
 	fmt.Printf("\n🚀 Test Download (%d threads, %ds duration)\n", cfg.Conc, cfg.Duration)
 	fmt.Printf("%-16s %-6s %-8s %-8s %-14s %-8s %-6s\n", "IP", "Colo", "Latency", "Jitter", "Speed", "Stable", "Score")
 	fmt.Println("---------------------------------------------------------------------------------")
 
-	results := RunDownloadTest(candidates, cfg, func(res NodeResult) {
+	results := RunDownloadTest(ctx, candidates, cfg, func(res NodeResult) {
 		if res.Colo != "429" || !cfg.Skip429 {
 			fmt.Printf("%-16s %-6s %5.1fms  %5.1fms  %5.2f MB/s    %4.0f%%   %5.1f\n", res.IP, res.Colo, res.TCPLatency, res.Jitter, res.DownloadSpeed, res.Stability, res.Score)
 		}

@@ -73,19 +73,17 @@ func RunWeb(cfg Config) {
 			sendMu.Lock()
 			defer sendMu.Unlock()
 			b, _ := json.Marshal(data)
-			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", evtType, string(b))
+			fmt.Fprintf(w, "event: %s\ndata: ", evtType)
+			w.Write(b)
+			fmt.Fprint(w, "\n\n")
 			flusher.Flush()
-		}
-
-		if reqCfg.Proxy != "" {
-			initProxy(reqCfg.Proxy)
 		}
 
 		var ips []string
 		var ytNodeMap map[string]NodeResult
 		if reqCfg.YouTubeMode {
 			sendEvent("status", "Resolving YouTube CDN nodes...")
-			ytNodes := ResolveYouTubeCDNIPs(reqCfg.MaxScan)
+			ytNodes := ResolveYouTubeCDNIPs(reqCfg.MaxScan, reqCfg.Proxy)
 			if len(ytNodes) == 0 {
 				sendEvent("error", "No YouTube CDN IPs found. Check network/DNS (YouTube requires proxy in some regions).")
 				return
@@ -102,7 +100,7 @@ func RunWeb(cfg Config) {
 		}
 
 		sendEvent("status", fmt.Sprintf("Ping Scanning %d IPs...", len(ips)))
-		validNodes := ScanPing(ips, reqCfg.Port, reqCfg.ScanConcurrent, func(done, total, valid int) {
+		validNodes := ScanPing(r.Context(), ips, reqCfg.Port, reqCfg.ScanConcurrent, func(done, total, valid int) {
 			if done%10 == 0 || done == total {
 				sendEvent("progress_scan", map[string]int{"done": done, "total": total, "valid": valid})
 			}
@@ -129,15 +127,11 @@ func RunWeb(cfg Config) {
 			}
 		}
 
-		sendEvent("status", fmt.Sprintf("Detecting Colo for %d nodes...", len(candidates)))
-		DetectColo(candidates, reqCfg.Port, reqCfg.ColoConcurrent, func(done, total int) {
-			if done%5 == 0 || done == total {
-				sendEvent("progress_colo", map[string]int{"done": done, "total": total})
-			}
-		})
+		// Instant transition to satisfy the Web UI frontend state
+		sendEvent("progress_colo", map[string]int{"done": 100, "total": 100})
 
 		sendEvent("status", "Running Download Speed Tests...")
-		results := RunDownloadTest(candidates, reqCfg, func(res NodeResult) {
+		results := RunDownloadTest(r.Context(), candidates, reqCfg, func(res NodeResult) {
 			if res.Colo != "429" || !reqCfg.Skip429 {
 				sendEvent("progress_download", res)
 			}
