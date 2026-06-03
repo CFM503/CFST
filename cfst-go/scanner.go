@@ -276,6 +276,21 @@ func RunDownloadTest(ctx context.Context, candidates []NodeResult, cfg Config,
 			candidates[i].DownloadSpeed = speed
 			candidates[i].MinSpeed = minSpd
 			candidates[i].Stability = stab
+
+			// Single-stream speed test (more realistic for YouTube streaming)
+			if !cfg.WebMode {
+				fmt.Printf("\r  --> %-50s", fmt.Sprintf("Single-stream test %s", candidates[i].IP))
+			}
+			sgSpeed, _ := SingleStreamTest(ctx, candidates[i].IP, cfg.Port, testURL, cfg.Proxy)
+			candidates[i].SingleSpeed = sgSpeed
+
+			// Latency under load test (catches bufferbloat)
+			if !cfg.WebMode {
+				fmt.Printf("\r  --> %-50s", fmt.Sprintf("Load-latency test %s", candidates[i].IP))
+			}
+			loadLat := MeasureLoadLatency(candidates[i].IP, cfg.Port, cfg.Proxy)
+			candidates[i].LoadLatency = loadLat
+
 			candidates[i].CalcScore()
 			results = append(results, candidates[i])
 
@@ -313,9 +328,9 @@ func RunDownloadTest(ctx context.Context, candidates []NodeResult, cfg Config,
 
 func RunCLI(cfg Config) {
 	if cfg.YouTubeMode {
-		fmt.Printf("YouTube CDN SpeedTest v1.3.1 (Go Edition)\n\n")
+		fmt.Printf("YouTube CDN SpeedTest v1.4.0 (Go Edition)\n\n")
 	} else {
-		fmt.Printf("Cloudflare SpeedTest v1.3.1 (Go Edition)\n\n")
+		fmt.Printf("Cloudflare SpeedTest v1.4.0 (Go Edition)\n\n")
 	}
 
 	var ips []string
@@ -367,12 +382,12 @@ func RunCLI(cfg Config) {
 	}
 
 	fmt.Printf("\n🚀 Test Download (%d threads, %ds duration)\n", cfg.Conc, cfg.Duration)
-	fmt.Printf("%-16s %-6s %-8s %-8s %-14s %-8s %-6s\n", "IP", "Colo", "Latency", "Jitter", "Speed", "Stable", "Score")
+	fmt.Printf("%-16s %-6s %-8s %-8s %-10s %-10s %-8s %-8s %-6s\n", "IP", "Colo", "Latency", "Jitter", "SgSpeed", "Speed", "MinSpd", "Stable", "Score")
 	fmt.Println("---------------------------------------------------------------------------------")
 
 	results := RunDownloadTest(ctx, candidates, cfg, func(res NodeResult) {
 		if res.Colo != "429" || !cfg.Skip429 {
-			fmt.Printf("%-16s %-6s %5.1fms  %5.1fms  %5.2f MB/s    %4.0f%%   %5.1f\n", res.IP, res.Colo, res.TCPLatency, res.Jitter, res.DownloadSpeed, res.Stability, res.Score)
+			fmt.Printf("%-16s %-6s %5.1fms  %5.1fms  %5.2f     %5.2f     %5.2f  %4.0f%%   %5.1f\n", res.IP, res.Colo, res.TCPLatency, res.Jitter, res.SingleSpeed, res.DownloadSpeed, res.MinSpeed, res.Stability, res.Score)
 		}
 	}, nil, func(p LiveProgress) {
 		fmt.Printf("\r  📥 %-16s %6.1f MB  %6.2f MB/s  %4.0f/%ds    ", p.IP, float64(p.Bytes)/1024.0/1024.0, p.Speed, p.Elapsed, int(p.Duration))
@@ -403,15 +418,17 @@ func saveCSV(path string, results []NodeResult) {
 	w := csv.NewWriter(f)
 	defer w.Flush()
 
-	w.Write([]string{"IP", "Colo", "Latency", "Jitter", "Speed_MB", "MinSpeed_MB", "Stability", "Score"})
+	w.Write([]string{"IP", "Colo", "Latency", "Jitter", "SgSpeed_MB", "Speed_MB", "MinSpeed_MB", "LoadLatency", "Stability", "Score"})
 	for _, r := range results {
 		w.Write([]string{
 			r.IP,
 			r.Colo,
 			fmt.Sprintf("%.1f", r.TCPLatency),
 			fmt.Sprintf("%.1f", r.Jitter),
+			fmt.Sprintf("%.2f", r.SingleSpeed),
 			fmt.Sprintf("%.2f", r.DownloadSpeed),
 			fmt.Sprintf("%.2f", r.MinSpeed),
+			fmt.Sprintf("%.1f", r.LoadLatency),
 			fmt.Sprintf("%.0f", r.Stability),
 			fmt.Sprintf("%.1f", r.Score),
 		})

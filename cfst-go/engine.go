@@ -1,4 +1,4 @@
-package main
+﻿package main
 
 import (
 	"context"
@@ -62,6 +62,8 @@ type NodeResult struct {
 	Port          int     `json:"port"`
 	TCPLatency    float64 `json:"tcp_latency"`
 	DownloadSpeed float64 `json:"download_speed"`
+	SingleSpeed   float64 `json:"single_speed"`
+	LoadLatency   float64 `json:"load_latency"`
 	Colo          string  `json:"colo"`
 	Score         float64 `json:"score"`
 	Jitter        float64 `json:"jitter"`
@@ -72,28 +74,42 @@ type NodeResult struct {
 }
 
 func (n *NodeResult) CalcScore() {
-	// 速度分 (45%): YouTube 4K 需要 25-40 Mbps ≈ 3-5 MB/s
-	scoreSpeed := 100.0
-	if n.DownloadSpeed < 40.0 {
-		scoreSpeed = (n.DownloadSpeed / 40.0) * 100.0
+	// Speed score (25%): Use single-stream speed, cap 15 MB/s (120 Mbps, enough for 4K)
+	effectiveSpeed := n.DownloadSpeed
+	if n.SingleSpeed > 0 {
+		effectiveSpeed = n.SingleSpeed
 	}
+	scoreSpeed := math.Min(effectiveSpeed/15.0*100.0, 100.0)
 
-	// 延迟分 (15%): 越低越好
+	// MinSpeed score (20%): Floor speed determines buffering, cap 10 MB/s (80 Mbps)
+	scoreMinSpeed := math.Min(n.MinSpeed/10.0*100.0, 100.0)
+
+	// Latency score (10%): Lower is better
 	scoreLatency := 100.0 - (n.TCPLatency-30.0)*0.5
 	if scoreLatency < 0 {
 		scoreLatency = 0
 	}
 
-	// 抖动分 (15%): 越低越好，>10ms 开始扣分
+	// Load latency score (15%): Latency under load, catches bufferbloat
+	scoreLoadLatency := 100.0
+	if n.LoadLatency > 0 {
+		scoreLoadLatency = 100.0 - (n.LoadLatency-50.0)*0.3
+		if scoreLoadLatency < 0 {
+			scoreLoadLatency = 0
+		}
+	}
+
+	// Jitter score (10%): Lower is better, >10ms starts penalizing
 	scoreJitter := 100.0 - n.Jitter*2.0
 	if scoreJitter < 0 {
 		scoreJitter = 0
 	}
 
-	// 稳定性分 (25%): 已经是 0-100
+	// Stability score (20%): Already 0-100
 	scoreStability := n.Stability
 
-	n.Score = scoreSpeed*0.45 + scoreLatency*0.15 + scoreJitter*0.15 + scoreStability*0.25
+	n.Score = scoreSpeed*0.25 + scoreMinSpeed*0.20 + scoreLatency*0.10 +
+		scoreLoadLatency*0.15 + scoreJitter*0.10 + scoreStability*0.20
 
 	if n.Colo != "UNK" && n.Colo != "ERR" && n.Colo != "" {
 		n.Score += 5.0
@@ -283,6 +299,182 @@ func dohResolve(host string, proxyAddr string) []string {
 		}
 	}
 	return ips
+}
+
+
+// SingleStreamTest measures single-connection download speed (more realistic for streaming)
+func SingleStreamTest(ctx context.Context, ip string, port int, testURL string, proxyAddr string) (avgSpeed, minSpeed float64) {
+	client := makeHTTPClient(ip, port, 0, proxyAddr)
+	if tr, ok := client.Transport.(*http.Transport); ok {
+		defer tr.CloseIdleConnections()
+	}
+
+	parsedURL, err := url.Parse(testURL)
+	if err != nil {
+		return 0, 0
+	}
+	host := parsedURL.Hostname()
+
+	downloadCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	req, err := newCFRequestWithContext(downloadCtx, "GET", testURL)
+	if err != nil {
+		return 0, 0
+	}
+	req.Host = host
+	req.Header.Set("Connection", "keep-alive")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, 0
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return 0, 0
+	}
+
+	startGlobal := time.Now()
+	var totalBytes int64
+	sampleInterval := 2 * time.Second
+	var samples []float64
+	var sampleMu sync.Mutex
+
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(sampleInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				b := atomic.LoadInt64(&totalBytes)
+				mb := float64(b) / 1024.0 / 1024.0
+				sampleMu.Lock()
+				samples = append(samples, mb)
+				sampleMu.Unlock()
+			case <-downloadCtx.Done():
+				return
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	bufPtr := downloadBufPool.Get().(*[]byte)
+	buf := *bufPtr
+	for {
+		n, err := resp.Body.Read(buf)
+		if n > 0 {
+			atomic.AddInt64(&totalBytes, int64(n))
+		}
+		if err != nil {
+			break
+		}
+	}
+	downloadBufPool.Put(bufPtr)
+	close(done)
+
+	finalMB := float64(atomic.LoadInt64(&totalBytes)) / 1024.0 / 1024.0
+	sampleMu.Lock()
+	samples = append(samples, finalMB)
+	sampleMu.Unlock()
+
+	realTime := time.Since(startGlobal).Seconds()
+	if realTime < 0.1 {
+		return 0, 0
+	}
+
+	avgSpeed = finalMB / realTime
+
+	if len(samples) < 2 {
+		return avgSpeed, avgSpeed
+	}
+
+	var intervalSpeeds []float64
+	for i := 1; i < len(samples); i++ {
+		dt := sampleInterval.Seconds()
+		if i == len(samples)-1 {
+			elapsed := realTime - float64(i-1)*sampleInterval.Seconds()
+			if elapsed > 0.1 {
+				dt = elapsed
+			}
+		}
+		speed := (samples[i] - samples[i-1]) / dt
+		if speed > 0 {
+			intervalSpeeds = append(intervalSpeeds, speed)
+		}
+	}
+
+	if len(intervalSpeeds) == 0 {
+		return avgSpeed, avgSpeed
+	}
+
+	minSpeed = intervalSpeeds[0]
+	for _, s := range intervalSpeeds {
+		if s < minSpeed {
+			minSpeed = s
+		}
+	}
+
+	return avgSpeed, minSpeed
+}
+
+// MeasureLoadLatency measures TCP latency while download is in progress (catches bufferbloat)
+func MeasureLoadLatency(ip string, port int, proxyAddr string) float64 {
+	client := makeHTTPClient(ip, port, 0, proxyAddr)
+	testURL := "https://speed.cloudflare.com/__down?bytes=10000000"
+	parsedURL, _ := url.Parse(testURL)
+	host := parsedURL.Hostname()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+
+	req, err := newCFRequestWithContext(ctx, "GET", testURL)
+	if err != nil {
+		return 0
+	}
+	req.Host = host
+
+	// Start background download to load the connection
+	go func() {
+		resp, err := client.Do(req)
+		if err == nil {
+			bufPtr := downloadBufPool.Get().(*[]byte)
+			buf := *bufPtr
+			for {
+				if _, err := resp.Body.Read(buf); err != nil {
+					break
+				}
+			}
+			resp.Body.Close()
+			downloadBufPool.Put(bufPtr)
+		}
+	}()
+
+	// Wait for download to saturate the connection
+	time.Sleep(500 * time.Millisecond)
+
+	// Measure latency under load: 3 pings
+	var lats []float64
+	for i := 0; i < 3; i++ {
+		lat := TCPPing(ip, port, 2*time.Second)
+		if lat > 0 {
+			lats = append(lats, lat)
+		}
+		if i < 2 {
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
+
+	if len(lats) == 0 {
+		return 0
+	}
+	var sum float64
+	for _, l := range lats {
+		sum += l
+	}
+	return sum / float64(len(lats))
 }
 
 func GenerateIPs(maxScan int, unique bool, ipFile string) []string {
