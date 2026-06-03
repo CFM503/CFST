@@ -74,7 +74,7 @@ type NodeResult struct {
 }
 
 func (n *NodeResult) CalcScore() {
-	// Speed score (25%): Use single-stream speed, cap 15 MB/s (120 Mbps, enough for 4K)
+	// Speed score (35%): Use single-stream speed, cap 15 MB/s (120 Mbps, enough for 4K)
 	effectiveSpeed := n.DownloadSpeed
 	if n.SingleSpeed > 0 {
 		effectiveSpeed = n.SingleSpeed
@@ -90,26 +90,17 @@ func (n *NodeResult) CalcScore() {
 		scoreLatency = 0
 	}
 
-	// Load latency score (15%): Latency under load, catches bufferbloat
-	scoreLoadLatency := 100.0
-	if n.LoadLatency > 0 {
-		scoreLoadLatency = 100.0 - (n.LoadLatency-50.0)*0.3
-		if scoreLoadLatency < 0 {
-			scoreLoadLatency = 0
-		}
-	}
-
 	// Jitter score (10%): Lower is better, >10ms starts penalizing
 	scoreJitter := 100.0 - n.Jitter*2.0
 	if scoreJitter < 0 {
 		scoreJitter = 0
 	}
 
-	// Stability score (20%): Already 0-100
+	// Stability score (25%): Already 0-100
 	scoreStability := n.Stability
 
-	n.Score = scoreSpeed*0.25 + scoreMinSpeed*0.20 + scoreLatency*0.10 +
-		scoreLoadLatency*0.15 + scoreJitter*0.10 + scoreStability*0.20
+	n.Score = scoreSpeed*0.35 + scoreMinSpeed*0.20 + scoreLatency*0.10 +
+		scoreJitter*0.10 + scoreStability*0.25
 
 	if n.Colo != "UNK" && n.Colo != "ERR" && n.Colo != "" {
 		n.Score += 5.0

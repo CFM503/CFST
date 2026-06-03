@@ -39,7 +39,7 @@ func DefaultConfig() Config {
 		Conc:           4,
 		DownloadNum:    10,
 		Duration:       15,
-		StopThreshold:  25.0,
+		StopThreshold:  15.0,
 		Unique:         false,
 		Output:         "result_colo.csv",
 		ScanConcurrent: 200,
@@ -245,6 +245,14 @@ func RunDownloadTest(ctx context.Context, candidates []NodeResult, cfg Config,
 		}
 
 		// 直接下载测试，由 DownloadTest 内部检测 429
+		// 1) Single-stream test FIRST (primary metric for streaming)
+		if !cfg.WebMode {
+			fmt.Printf("\r  --> %-50s", fmt.Sprintf("Single-stream test %s", candidates[i].IP))
+		}
+		sgSpeed, sgMinSpd := SingleStreamTest(ctx, candidates[i].IP, cfg.Port, testURL, cfg.Proxy)
+		candidates[i].SingleSpeed = sgSpeed
+
+		// 2) Multi-thread download test (stability and min-speed data)
 		speed, minSpd, stab, blocked := DownloadTest(ctx, candidates[i].IP, cfg.Port, cfg.Conc, cfg.Duration, testURL, cfg.Proxy, progressLive)
 
 		if blocked {
@@ -276,21 +284,10 @@ func RunDownloadTest(ctx context.Context, candidates []NodeResult, cfg Config,
 			candidates[i].DownloadSpeed = speed
 			candidates[i].MinSpeed = minSpd
 			candidates[i].Stability = stab
-
-			// Single-stream speed test (more realistic for YouTube streaming)
-			if !cfg.WebMode {
-				fmt.Printf("\r  --> %-50s", fmt.Sprintf("Single-stream test %s", candidates[i].IP))
+			// Use single-stream min speed if it's lower (more realistic)
+			if sgMinSpd > 0 && (sgMinSpd < minSpd || minSpd == 0) {
+				candidates[i].MinSpeed = sgMinSpd
 			}
-			sgSpeed, _ := SingleStreamTest(ctx, candidates[i].IP, cfg.Port, testURL, cfg.Proxy)
-			candidates[i].SingleSpeed = sgSpeed
-
-			// Latency under load test (catches bufferbloat)
-			if !cfg.WebMode {
-				fmt.Printf("\r  --> %-50s", fmt.Sprintf("Load-latency test %s", candidates[i].IP))
-			}
-			loadLat := MeasureLoadLatency(candidates[i].IP, cfg.Port, cfg.Proxy)
-			candidates[i].LoadLatency = loadLat
-
 			candidates[i].CalcScore()
 			results = append(results, candidates[i])
 
@@ -301,7 +298,7 @@ func RunDownloadTest(ctx context.Context, candidates []NodeResult, cfg Config,
 				progressRow(candidates[i])
 			}
 
-			if speed >= cfg.StopThreshold {
+			if candidates[i].SingleSpeed >= cfg.StopThreshold {
 				fastCount++
 				if fastCount >= 5 {
 					if fastExitHost != nil {
@@ -328,9 +325,9 @@ func RunDownloadTest(ctx context.Context, candidates []NodeResult, cfg Config,
 
 func RunCLI(cfg Config) {
 	if cfg.YouTubeMode {
-		fmt.Printf("YouTube CDN SpeedTest v1.4.0 (Go Edition)\n\n")
+		fmt.Printf("YouTube CDN SpeedTest v1.5.0 (Go Edition)\n\n")
 	} else {
-		fmt.Printf("Cloudflare SpeedTest v1.4.0 (Go Edition)\n\n")
+		fmt.Printf("Cloudflare SpeedTest v1.5.0 (Go Edition)\n\n")
 	}
 
 	var ips []string
