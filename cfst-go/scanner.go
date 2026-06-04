@@ -16,7 +16,8 @@ type Config struct {
 	IPFile         string
 	Port           int
 	MaxScan        int
-	Conc           int
+	TopN           int     // 从延迟排序候选中取前 N 个用于测速
+	DLConc         int     // 并行下载测试并发数
 	DownloadNum    int
 	Duration       int
 	StopThreshold  float64
@@ -34,8 +35,9 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		Port:           443,
-		MaxScan:        2000,
-		Conc:           4,
+		MaxScan:        5000,
+		TopN:           100,
+		DLConc:         3,
 		DownloadNum:    10,
 		Duration:       15,
 		StopThreshold:  15.0,
@@ -132,150 +134,207 @@ func ScanPing(ctx context.Context, ips []string, port int, concurrency int, prog
 	return validNodes
 }
 
-func RunDownloadTest(ctx context.Context, candidates []NodeResult, cfg Config,
-	progressRow func(res NodeResult),
-	progressStatus func(msg string),
-	progressLive func(LiveProgress),
-	progressCooldown func(remaining int),
-	fastExitHost func()) []NodeResult {
-
-	var results []NodeResult
-	var fastCount int
-	var skipped int
-	var consecutive429 int
-	cooldownMs := 500       // IP 间冷却时间，动态调整
-	maxConsecutive := 5     // 触发全局暂停的阈值
-	globalCooldownSec := 15 // 全局暂停时长
+// detectColoBatch 并发检测所有候选节点的 Colo，按 Colo 分组返回最优组
+func detectColoBatch(ctx context.Context, candidates []NodeResult, port int, concurrency int, proxyAddr string, progressCallback func(done, total int)) (bestColo string, coloGroups map[string][]NodeResult) {
+	var wg sync.WaitGroup
+	var done atomic.Int32
+	total := len(candidates)
+	sem := make(chan struct{}, concurrency)
 
 	for i := range candidates {
 		if ctx.Err() != nil {
 			break
 		}
+		wg.Add(1)
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			wg.Done()
+			continue
+		}
 
-		// === 动态节奏控制：连续 429 触发全局冷却 ===
-		if consecutive429 >= maxConsecutive {
-			if !cfg.WebMode {
-				fmt.Println()
+		go func(idx int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if ctx.Err() != nil {
+				return
 			}
-			for sec := globalCooldownSec; sec > 0; sec-- {
-				if ctx.Err() != nil {
-					return results
-				}
-				if !cfg.WebMode {
-					fmt.Printf("\r  ⏳ Rate limited, cooling down %ds... (Skipped: %d)   ", sec, skipped)
-				}
-				if progressCooldown != nil {
-					progressCooldown(sec)
-				}
+			candidates[idx].Colo = GetColo(candidates[idx].IP, port, proxyAddr)
+			d := done.Add(1)
+			if progressCallback != nil && (d%20 == 0 || d == int32(total)) {
+				progressCallback(int(d), total)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	// 按 Colo 分组，选择节点数最多的 Colo
+	coloGroups = make(map[string][]NodeResult)
+	for _, c := range candidates {
+		if c.Colo != "ERR" && c.Colo != "UNK" && c.Colo != "" {
+			coloGroups[c.Colo] = append(coloGroups[c.Colo], c)
+		}
+	}
+
+	bestColo = ""
+	bestCount := 0
+	for colo, nodes := range coloGroups {
+		if len(nodes) > bestCount {
+			bestCount = len(nodes)
+			bestColo = colo
+		}
+	}
+	return bestColo, coloGroups
+}
+
+// runParallelDownloadTest 并行下载测试，多个 worker 同时测速
+func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg Config,
+	progressRow func(res NodeResult),
+	progressStatus func(msg string),
+	progressLive func(LiveProgress),
+	fastExitHost func()) []NodeResult {
+
+	numWorkers := cfg.DLConc
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+	if numWorkers > len(candidates) {
+		numWorkers = len(candidates)
+	}
+
+	var results []NodeResult
+	var mu sync.Mutex
+	var fastCount atomic.Int32
+	var totalTested atomic.Int32
+	var totalSkipped atomic.Int32
+
+	resultCh := make(chan NodeResult, numWorkers*2)
+	doneCh := make(chan struct{})
+
+	// 收集结果的 goroutine
+	go func() {
+		for res := range resultCh {
+			mu.Lock()
+			results = append(results, res)
+			n := len(results)
+			mu.Unlock()
+
+			if progressRow != nil {
+				progressRow(res)
+			}
+			if n >= cfg.DownloadNum {
+				close(doneCh)
+				return
+			}
+		}
+		close(doneCh)
+	}()
+
+	// 启动 workers
+	var wg sync.WaitGroup
+	var nextIdx atomic.Int32
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			workerCooldownMs := 500
+			workerConsecutive429 := 0
+
+			for {
+				// 检查是否已收集够结果
 				select {
-				case <-time.After(1 * time.Second):
+				case <-doneCh:
+					return
 				case <-ctx.Done():
-					return results
+					return
+				default:
 				}
-			}
-			if !cfg.WebMode {
-				fmt.Print("\r                                                          \r")
-			}
-			consecutive429 = 0
-			cooldownMs = 500
-		}
 
-		// IP 间冷却
-		if i > 0 && cooldownMs > 0 {
-			select {
-			case <-time.After(time.Duration(cooldownMs) * time.Millisecond):
-			case <-ctx.Done():
-				return results
-			}
-		}
+				// 获取下一个候选 IP
+				idx := int(nextIdx.Add(1) - 1)
+				if idx >= len(candidates) {
+					return
+				}
+				cand := candidates[idx]
 
-		if ctx.Err() != nil {
-			break
-		}
-
-		// Determine test URL for this node
-		testURL := cfg.URL
-		if candidates[i].TestURL != "" {
-			testURL = candidates[i].TestURL
-		}
-
-		msg := fmt.Sprintf("Testing [%d/%d] %s (Skipped: %d)", i+1, len(candidates), candidates[i].IP, skipped)
-		if !cfg.WebMode {
-			fmt.Printf("\r  --> %-50s", msg)
-		}
-		if progressStatus != nil {
-			progressStatus(msg)
-		}
-
-		// 单线程下载测试（最贴近流媒体真实体验）
-		if !cfg.WebMode {
-			fmt.Printf("\r  --> %-50s", fmt.Sprintf("Download test %s", candidates[i].IP))
-		}
-		speed, minSpd, stab := SingleStreamTest(ctx, candidates[i].IP, cfg.Port, cfg.Duration, testURL, cfg.Proxy, progressLive)
-
-		if speed == 0 && minSpd == 0 && stab == 0 {
-			// 请求失败（可能是 429）
-			consecutive429++
-			skipped++
-			cooldownMs = min(cooldownMs*2, 5000) // 指数退避，上限 5 秒
-			if cfg.Skip429 {
-				continue
-			}
-			// Skip429=false: 记录 429 结果
-			candidates[i].DownloadSpeed = 0.0
-			candidates[i].Colo = "429"
-			candidates[i].Score = 0.0
-			if !cfg.WebMode {
-				fmt.Print("\r                                                               \r")
-			}
-			if progressRow != nil {
-				progressRow(candidates[i])
-			}
-			results = append(results, candidates[i])
-		} else {
-			// 成功，重置连续 429 计数和冷却时间
-			consecutive429 = 0
-			cooldownMs = 500
-
-			// Lazy Colo Detection: Only query Colo for successful downloads
-			candidates[i].Colo = GetColo(candidates[i].IP, cfg.Port, cfg.Proxy)
-
-			candidates[i].DownloadSpeed = speed
-			candidates[i].SingleSpeed = speed
-			candidates[i].MinSpeed = minSpd
-			candidates[i].Stability = stab
-
-			// Measure load latency (TCP latency under bandwidth saturation)
-			candidates[i].LoadLatency = MeasureLoadLatency(candidates[i].IP, cfg.Port, cfg.Proxy)
-
-			candidates[i].CalcScore()
-			results = append(results, candidates[i])
-
-			if !cfg.WebMode {
-				fmt.Print("\r                                                               \r")
-			}
-			if progressRow != nil {
-				progressRow(candidates[i])
-			}
-
-			if candidates[i].SingleSpeed >= cfg.StopThreshold {
-				fastCount++
-				if fastCount >= 5 {
-					if fastExitHost != nil {
-						fastExitHost()
+				// worker 间冷却
+				if workerCooldownMs > 0 && idx > 0 {
+					select {
+					case <-time.After(time.Duration(workerCooldownMs) * time.Millisecond):
+					case <-ctx.Done():
+						return
+					case <-doneCh:
+						return
 					}
-					break
+				}
+
+				// 检查 fast-exit
+				if fastCount.Load() >= 5 {
+					return
+				}
+
+				testURL := cfg.URL
+				if cand.TestURL != "" {
+					testURL = cand.TestURL
+				}
+
+				t := totalTested.Add(1)
+				msg := fmt.Sprintf("Testing [%d/%d] %s (Skipped: %d)", t, len(candidates), cand.IP, int(totalSkipped.Load()))
+				if progressStatus != nil {
+					progressStatus(msg)
+				}
+
+				speed, minSpd, stab := SingleStreamTest(ctx, cand.IP, cfg.Port, cfg.Duration, testURL, cfg.Proxy, progressLive)
+
+				if speed == 0 && minSpd == 0 && stab == 0 {
+					workerConsecutive429++
+					totalSkipped.Add(1)
+					workerCooldownMs = min(workerCooldownMs*2, 5000)
+					if cfg.Skip429 {
+						continue
+					}
+					cand.DownloadSpeed = 0
+					cand.Colo = "429"
+					cand.Score = 0
+					select {
+					case resultCh <- cand:
+					case <-doneCh:
+						return
+					}
+				} else {
+					workerConsecutive429 = 0
+					workerCooldownMs = 500
+
+					cand.Colo = GetColo(cand.IP, cfg.Port, cfg.Proxy)
+					cand.DownloadSpeed = speed
+					cand.SingleSpeed = speed
+					cand.MinSpeed = minSpd
+					cand.Stability = stab
+					cand.LoadLatency = MeasureLoadLatency(cand.IP, cfg.Port, cfg.Proxy)
+					cand.CalcScore()
+
+					select {
+					case resultCh <- cand:
+					case <-doneCh:
+						return
+					}
+
+					if speed >= cfg.StopThreshold {
+						if fastCount.Add(1) >= 5 {
+							if fastExitHost != nil {
+								fastExitHost()
+							}
+							return
+						}
+					}
 				}
 			}
-		}
+		}()
+	}
 
-		if len(results) >= cfg.DownloadNum {
-			break
-		}
-	}
-	if !cfg.WebMode {
-		fmt.Print("\r                                                               \r")
-	}
+	wg.Wait()
+	close(resultCh)
+	<-doneCh
 
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].Score > results[j].Score
@@ -285,9 +344,9 @@ func RunDownloadTest(ctx context.Context, candidates []NodeResult, cfg Config,
 
 func RunCLI(cfg Config) {
 	if cfg.YouTubeMode {
-		fmt.Printf("YouTube CDN SpeedTest v1.6.0 (Go Edition)\n\n")
+		fmt.Printf("YouTube CDN SpeedTest v1.7.0 (Go Edition)\n\n")
 	} else {
-		fmt.Printf("Cloudflare SpeedTest v1.6.0 (Go Edition)\n\n")
+		fmt.Printf("Cloudflare SpeedTest v1.7.0 (Go Edition)\n\n")
 	}
 
 	var ips []string
@@ -338,17 +397,59 @@ func RunCLI(cfg Config) {
 		}
 	}
 
-	fmt.Printf("\n🚀 Download Test (%ds duration)\n", cfg.Duration)
+	// 取延迟最低的 TopN 个候选
+	if len(candidates) > cfg.TopN {
+		candidates = candidates[:cfg.TopN]
+	}
+
+	// Step 2: 批量检测 Colo，筛选最优数据中心
+	fmt.Printf("\n🔍 Detecting Colo for %d candidates...\n", len(candidates))
+	bestColo, coloGroups := detectColoBatch(ctx, candidates, cfg.Port, cfg.ScanConcurrent, cfg.Proxy, func(done, total int) {
+		fmt.Printf("\r  Colo detection: %d/%d", done, total)
+	})
+	fmt.Println()
+
+	if bestColo != "" {
+		fmt.Printf("  Best Colo: %s (%d nodes)\n", bestColo, len(coloGroups[bestColo]))
+		// 打印各 Colo 统计
+		type coloStat struct {
+			name  string
+			count int
+			avgMs float64
+		}
+		var stats []coloStat
+		for colo, nodes := range coloGroups {
+			var sum float64
+			for _, n := range nodes {
+				sum += n.TCPLatency
+			}
+			stats = append(stats, coloStat{colo, len(nodes), sum / float64(len(nodes))})
+		}
+		sort.Slice(stats, func(i, j int) bool { return stats[i].count > stats[j].count })
+		for _, s := range stats {
+			marker := "  "
+			if s.name == bestColo {
+				marker = "★ "
+			}
+			fmt.Printf("  %s%-6s  %4d nodes  avg %.1fms\n", marker, s.name, s.count, s.avgMs)
+		}
+		candidates = coloGroups[bestColo]
+	} else {
+		fmt.Println("  [!] No valid Colo detected, testing all candidates")
+	}
+
+	// Step 3: 并行下载测试
+	fmt.Printf("\n🚀 Download Test (%ds duration, %d parallel)\n", cfg.Duration, cfg.DLConc)
 	fmt.Printf("%-16s %-6s %-8s %-8s %-10s %-8s %-8s %-8s %-6s\n", "IP", "Colo", "Latency", "Jitter", "Speed", "MinSpd", "LoadLat", "Stable", "Score")
 	fmt.Println("---------------------------------------------------------------------------------")
 
-	results := RunDownloadTest(ctx, candidates, cfg, func(res NodeResult) {
+	results := runParallelDownloadTest(ctx, candidates, cfg, func(res NodeResult) {
 		if res.Colo != "429" || !cfg.Skip429 {
 			fmt.Printf("%-16s %-6s %5.1fms  %5.1fms  %7.2f    %5.2f  %5.1fms  %4.0f%%   %5.1f\n", res.IP, res.Colo, res.TCPLatency, res.Jitter, res.DownloadSpeed, res.MinSpeed, res.LoadLatency, res.Stability, res.Score)
 		}
 	}, nil, func(p LiveProgress) {
 		fmt.Printf("\r  📥 %-16s %6.1f MB  %6.2f MB/s  %4.0f/%ds    ", p.IP, float64(p.Bytes)/1024.0/1024.0, p.Speed, p.Elapsed, int(p.Duration))
-	}, nil, func() {
+	}, func() {
 		fmt.Println("\n⚡ Fast-exit triggered.")
 	})
 

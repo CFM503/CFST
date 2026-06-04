@@ -1,6 +1,6 @@
 # CFST - Cloudflare & YouTube CDN SpeedTest
 
-> v1.6.0 | Go Edition
+> v1.7.0 | Go Edition
 
 从 Cloudflare 或 YouTube CDN 节点中筛选出**高速、低延迟、高稳定性**的 IP，专为流媒体场景优化。
 
@@ -8,6 +8,8 @@
 
 - **Cloudflare 测速** — 扫描 Cloudflare IP 段，筛选最优节点
 - **YouTube CDN 测速** — 解析 googlevideo.com 节点，直测 YouTube CDN
+- **Colo 优先策略** — 批量检测数据中心，自动筛选最优 Colo 节点组
+- **并行测速** — 多个 IP 同时测速，大幅提高筛选效率
 - **代理支持** — SOCKS5 / HTTP 代理，解决 DNS 劫持和网络限制
 - **抖动检测** — 3 次 ping 测量延迟标准差，评估连接稳定性
 - **多点采样测速** — 每 2 秒记录瞬时速度，计算速度稳定性
@@ -20,11 +22,14 @@
 ### 基本用法（Cloudflare）
 
 ```bash
-# 默认扫描 2000 个 Cloudflare IP
+# 默认扫描 5000 个 IP，Colo 筛选后并行测速
 cfst.exe
 
 # 自定义参数
-cfst.exe -max 500 -c 8 -dt 15
+cfst.exe -max 10000 -topn 200 -dlc 5 -dn 20
+
+# 快速模式（少量 IP，快速出结果）
+cfst.exe -max 1000 -topn 30 -dlc 3 -dt 10
 ```
 
 ### YouTube CDN 测速
@@ -52,11 +57,12 @@ cfst.exe -web
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `-p` | 443 | 目标端口 |
-| `-max` | 2000 | 最大扫描 IP 数 |
-| `-c` | 4 | 每 IP 下载线程数 |
+| `-max` | 5000 | 最大扫描 IP 数 |
+| `-topn` | 100 | 延迟最低的前 N 个候选进入测速 |
+| `-dlc` | 3 | 并行下载测试并发数 |
 | `-dn` | 10 | 下载测试数量 |
 | `-dt` | 15 | 下载测试时长（秒） |
-| `-st` | 25.0 | 停止阈值（MB/s） |
+| `-st` | 15.0 | 停止阈值（MB/s） |
 | `-u` | false | C 段去重 |
 | `-f` | - | 自定义 IP 文件 |
 | `-o` | result_colo.csv | 输出文件 |

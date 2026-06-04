@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CFST v1.6.0</title>
+    <title>CFST v1.7.0</title>
     <!-- Google Fonts for modern typography -->
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
@@ -281,7 +281,7 @@
             <div class="header">
                 <div style="display: flex; align-items: baseline; gap: 12px;">
                     <h1>✨ CFST Ultimate</h1>
-                    <span style="color: var(--text-dim); font-size: 1.1rem; font-weight: 600;">v1.6.0</span>
+                    <span style="color: var(--text-dim); font-size: 1.1rem; font-weight: 600;">v1.7.0</span>
                 </div>
                 <button id="startBtn">
                     <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -301,7 +301,7 @@
                     <label
                         style="display: block; font-size: 0.85rem; color: var(--text-dim); margin-bottom: 0.4rem;">Max
                         Scan IPs</label>
-                    <input type="number" id="inpMax" value="2000"
+                    <input type="number" id="inpMax" value="5000"
                         style="width: 100%; padding: 0.6rem; border-radius: 8px; border: 1px solid var(--border); background: rgba(0,0,0,0.2); color: white; box-sizing: border-box; font-family: inherit;">
                 </div>
                 <div>
@@ -313,16 +313,23 @@
                 </div>
                 <div>
                     <label
-                        style="display: block; font-size: 0.85rem; color: var(--text-dim); margin-bottom: 0.4rem;">Download
-                        Count</label>
-                    <input type="number" id="inpDn" value="10"
+                        style="display: block; font-size: 0.85rem; color: var(--text-dim); margin-bottom: 0.4rem;">TopN
+                        Candidates</label>
+                    <input type="number" id="inpTopN" value="100"
                         style="width: 100%; padding: 0.6rem; border-radius: 8px; border: 1px solid var(--border); background: rgba(0,0,0,0.2); color: white; box-sizing: border-box; font-family: inherit;">
                 </div>
                 <div>
                     <label
-                        style="display: block; font-size: 0.85rem; color: var(--text-dim); margin-bottom: 0.4rem;">Threads
-                        per IP</label>
-                    <input type="number" id="inpC" value="4"
+                        style="display: block; font-size: 0.85rem; color: var(--text-dim); margin-bottom: 0.4rem;">Parallel
+                        Tests</label>
+                    <input type="number" id="inpDLC" value="3"
+                        style="width: 100%; padding: 0.6rem; border-radius: 8px; border: 1px solid var(--border); background: rgba(0,0,0,0.2); color: white; box-sizing: border-box; font-family: inherit;">
+                </div>
+                <div>
+                    <label
+                        style="display: block; font-size: 0.85rem; color: var(--text-dim); margin-bottom: 0.4rem;">Download
+                        Count</label>
+                    <input type="number" id="inpDn" value="10"
                         style="width: 100%; padding: 0.6rem; border-radius: 8px; border: 1px solid var(--border); background: rgba(0,0,0,0.2); color: white; box-sizing: border-box; font-family: inherit;">
                 </div>
                 <div>
@@ -447,7 +454,8 @@
                 max: document.getElementById('inpMax').value,
                 port: document.getElementById('inpPort').value,
                 dn: document.getElementById('inpDn').value,
-                c: document.getElementById('inpC').value,
+                topn: document.getElementById('inpTopN').value,
+                dlc: document.getElementById('inpDLC').value,
                 dt: document.getElementById('inpDt').value,
                 url: document.getElementById('inpUrl').value,
                 skip429: document.getElementById('inpSkip429').checked ? 'true' : 'false',

@@ -49,8 +49,11 @@ func RunWeb(cfg Config) {
 		if dn := q.Get("dn"); dn != "" {
 			reqCfg.DownloadNum, _ = strconv.Atoi(dn)
 		}
-		if c := q.Get("c"); c != "" {
-			reqCfg.Conc, _ = strconv.Atoi(c)
+		if t := q.Get("topn"); t != "" {
+			reqCfg.TopN, _ = strconv.Atoi(t)
+		}
+		if d := q.Get("dlc"); d != "" {
+			reqCfg.DLConc, _ = strconv.Atoi(d)
 		}
 		if dt := q.Get("dt"); dt != "" {
 			reqCfg.Duration, _ = strconv.Atoi(dt)
@@ -127,8 +130,25 @@ func RunWeb(cfg Config) {
 			}
 		}
 
+		// 取延迟最低的 TopN
+		if len(candidates) > reqCfg.TopN {
+			candidates = candidates[:reqCfg.TopN]
+		}
+
+		// Colo 检测 + 筛选最优数据中心
+		sendEvent("status", fmt.Sprintf("Detecting Colo for %d candidates...", len(candidates)))
+		bestColo, coloGroups := detectColoBatch(r.Context(), candidates, reqCfg.Port, reqCfg.ScanConcurrent, reqCfg.Proxy, func(done, total int) {
+			sendEvent("progress_colo", map[string]int{"done": done, "total": total})
+		})
+		if bestColo != "" {
+			sendEvent("status", fmt.Sprintf("Best Colo: %s (%d nodes), testing...", bestColo, len(coloGroups[bestColo])))
+			candidates = coloGroups[bestColo]
+		} else {
+			sendEvent("status", "No valid Colo detected, testing all candidates...")
+		}
+
 		sendEvent("status", "Running Download Speed Tests...")
-		results := RunDownloadTest(r.Context(), candidates, reqCfg, func(res NodeResult) {
+		results := runParallelDownloadTest(r.Context(), candidates, reqCfg, func(res NodeResult) {
 			if res.Colo != "429" || !reqCfg.Skip429 {
 				sendEvent("progress_download", res)
 			}
@@ -136,8 +156,6 @@ func RunWeb(cfg Config) {
 			sendEvent("status", msg)
 		}, func(p LiveProgress) {
 			sendEvent("progress_live", p)
-		}, func(remaining int) {
-			sendEvent("cooldown", map[string]int{"remaining": remaining, "skipped": 0})
 		}, func() {
 			sendEvent("fast_exit", "Target speed threshold reached, stopping early.")
 		})

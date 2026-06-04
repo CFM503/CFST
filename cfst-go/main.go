@@ -11,7 +11,8 @@ func main() {
 
 	flag.IntVar(&cfg.Port, "p", cfg.Port, "Target port")
 	flag.IntVar(&cfg.MaxScan, "max", cfg.MaxScan, "Max IPs to scan")
-	flag.IntVar(&cfg.Conc, "c", cfg.Conc, "Download threads per IP")
+	flag.IntVar(&cfg.TopN, "topn", cfg.TopN, "Top N candidates by latency for speed test")
+	flag.IntVar(&cfg.DLConc, "dlc", cfg.DLConc, "Parallel download test concurrency")
 	flag.IntVar(&cfg.DownloadNum, "dn", cfg.DownloadNum, "Download test count")
 	flag.IntVar(&cfg.Duration, "dt", cfg.Duration, "Download duration (seconds)")
 	flag.Float64Var(&cfg.StopThreshold, "st", cfg.StopThreshold, "Stop threshold MB/s")
