@@ -79,14 +79,14 @@ func ScanPing(ctx context.Context, ips []string, port int, concurrency int, prog
 				return
 			}
 
-			// 3 次 ping 测量延迟和抖动
-			pingCount := 3
-			lats := make([]float64, 0, 3)
+			// 5 次 ping 测量延迟和抖动，网络不稳时更客观
+			pingCount := 5
+			lats := make([]float64, 0, 5)
 			for i := 0; i < pingCount; i++ {
 				if ctx.Err() != nil {
 					return
 				}
-				lat := TCPPing(ip, port, 1000*time.Millisecond)
+				lat := TCPPing(ip, port, 1500*time.Millisecond)
 				if lat > 0 {
 					lats = append(lats, lat)
 				}
@@ -344,9 +344,9 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 
 func RunCLI(cfg Config) {
 	if cfg.YouTubeMode {
-		fmt.Printf("YouTube CDN SpeedTest v1.7.0 (Go Edition)\n\n")
+		fmt.Printf("YouTube CDN SpeedTest v1.7.1 (Go Edition)\n\n")
 	} else {
-		fmt.Printf("Cloudflare SpeedTest v1.7.0 (Go Edition)\n\n")
+		fmt.Printf("Cloudflare SpeedTest v1.7.1 (Go Edition)\n\n")
 	}
 
 	var ips []string
