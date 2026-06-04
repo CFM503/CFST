@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 import (
 	"context"
@@ -71,6 +71,7 @@ type NodeResult struct {
 	MinSpeed      float64 `json:"min_speed"`
 	TestURL       string  `json:"test_url,omitempty"`
 	Domain        string  `json:"domain,omitempty"`
+	PacketLoss    float64 `json:"packet_loss"` // 丢包率 0.0~1.0
 }
 
 func (n *NodeResult) CalcScore() {

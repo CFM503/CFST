@@ -100,7 +100,9 @@ func ScanPing(ctx context.Context, ips []string, port int, concurrency int, prog
 			}
 
 			d := done.Add(1)
-			if len(lats) > 0 {
+			// 丢包率过滤：5 次 ping 中至少 4 次成功才保留
+			minSuccess := pingCount - 1 // 允许丢 1 包
+			if len(lats) >= minSuccess {
 				// 平均延迟
 				var sum float64
 				for _, l := range lats {
@@ -120,8 +122,9 @@ func ScanPing(ctx context.Context, ips []string, port int, concurrency int, prog
 					jitter = math.Sqrt(variance)
 				}
 
+				loss := float64(pingCount-len(lats)) / float64(pingCount)
 				mu.Lock()
-				validNodes = append(validNodes, NodeResult{IP: ip, Port: port, TCPLatency: avgLat, Jitter: jitter})
+				validNodes = append(validNodes, NodeResult{IP: ip, Port: port, TCPLatency: avgLat, Jitter: jitter, PacketLoss: loss})
 				mu.Unlock()
 				validCount.Add(1)
 			}
@@ -344,9 +347,9 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 
 func RunCLI(cfg Config) {
 	if cfg.YouTubeMode {
-		fmt.Printf("YouTube CDN SpeedTest v1.7.1 (Go Edition)\n\n")
+		fmt.Printf("YouTube CDN SpeedTest v1.7.2 (Go Edition)\n\n")
 	} else {
-		fmt.Printf("Cloudflare SpeedTest v1.7.1 (Go Edition)\n\n")
+		fmt.Printf("Cloudflare SpeedTest v1.7.2 (Go Edition)\n\n")
 	}
 
 	var ips []string
