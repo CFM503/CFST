@@ -127,9 +127,6 @@ func RunWeb(cfg Config) {
 			}
 		}
 
-		// Instant transition to satisfy the Web UI frontend state
-		sendEvent("progress_colo", map[string]int{"done": 100, "total": 100})
-
 		sendEvent("status", "Running Download Speed Tests...")
 		results := RunDownloadTest(r.Context(), candidates, reqCfg, func(res NodeResult) {
 			if res.Colo != "429" || !reqCfg.Skip429 {
@@ -151,7 +148,7 @@ func RunWeb(cfg Config) {
 		}
 
 		sendEvent("status", "Test Complete")
-		sendEvent("complete", "done")
+		sendEvent("complete", results)
 	})
 
 	fmt.Printf("🚀 Web UI started. Open http://localhost%s in your browser\n", cfg.WebPort)

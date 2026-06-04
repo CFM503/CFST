@@ -23,7 +23,6 @@ type Config struct {
 	Unique         bool
 	Output         string
 	ScanConcurrent int
-	ColoConcurrent int
 	WebPort        string
 	WebMode        bool
 	URL            string
@@ -43,7 +42,6 @@ func DefaultConfig() Config {
 		Unique:         false,
 		Output:         "result_colo.csv",
 		ScanConcurrent: 200,
-		ColoConcurrent: 20,
 		WebPort:        "9876",
 		URL:            "https://speed.cloudflare.com/__down?bytes=50000000",
 		Skip429:        true,
@@ -68,7 +66,7 @@ func ScanPing(ctx context.Context, ips []string, port int, concurrency int, prog
 		case sem <- struct{}{}:
 		case <-ctx.Done():
 			wg.Done()
-			break
+			continue
 		}
 
 		go func(ip string) {
@@ -132,41 +130,6 @@ func ScanPing(ctx context.Context, ips []string, port int, concurrency int, prog
 	}
 	wg.Wait()
 	return validNodes
-}
-
-func DetectColo(ctx context.Context, candidates []NodeResult, port int, concurrency int, proxyAddr string, progressCallback func(done, total int)) {
-	var wg sync.WaitGroup
-	var done atomic.Int32
-	total := len(candidates)
-	sem := make(chan struct{}, concurrency)
-
-	for i := range candidates {
-		if ctx.Err() != nil {
-			break
-		}
-		wg.Add(1)
-		select {
-		case sem <- struct{}{}:
-		case <-ctx.Done():
-			wg.Done()
-			break
-		}
-
-		go func(idx int) {
-			defer wg.Done()
-			defer func() { <-sem }()
-
-			if ctx.Err() != nil {
-				return
-			}
-			candidates[idx].Colo = GetColo(candidates[idx].IP, port, proxyAddr)
-			d := done.Add(1)
-			if progressCallback != nil {
-				progressCallback(int(d), total)
-			}
-		}(i)
-	}
-	wg.Wait()
 }
 
 func RunDownloadTest(ctx context.Context, candidates []NodeResult, cfg Config,
@@ -244,18 +207,14 @@ func RunDownloadTest(ctx context.Context, candidates []NodeResult, cfg Config,
 			progressStatus(msg)
 		}
 
-		// 直接下载测试，由 DownloadTest 内部检测 429
-		// 1) Single-stream test FIRST (primary metric for streaming)
+		// 单线程下载测试（最贴近流媒体真实体验）
 		if !cfg.WebMode {
-			fmt.Printf("\r  --> %-50s", fmt.Sprintf("Single-stream test %s", candidates[i].IP))
+			fmt.Printf("\r  --> %-50s", fmt.Sprintf("Download test %s", candidates[i].IP))
 		}
-		sgSpeed, sgMinSpd := SingleStreamTest(ctx, candidates[i].IP, cfg.Port, testURL, cfg.Proxy)
-		candidates[i].SingleSpeed = sgSpeed
+		speed, minSpd, stab := SingleStreamTest(ctx, candidates[i].IP, cfg.Port, cfg.Duration, testURL, cfg.Proxy, progressLive)
 
-		// 2) Multi-thread download test (stability and min-speed data)
-		speed, minSpd, stab, blocked := DownloadTest(ctx, candidates[i].IP, cfg.Port, cfg.Conc, cfg.Duration, testURL, cfg.Proxy, progressLive)
-
-		if blocked {
+		if speed == 0 && minSpd == 0 && stab == 0 {
+			// 请求失败（可能是 429）
 			consecutive429++
 			skipped++
 			cooldownMs = min(cooldownMs*2, 5000) // 指数退避，上限 5 秒
@@ -278,16 +237,17 @@ func RunDownloadTest(ctx context.Context, candidates []NodeResult, cfg Config,
 			consecutive429 = 0
 			cooldownMs = 500
 
-			// Lazy Colo Detection: Only query Colo for successful downloads (Item 2)
+			// Lazy Colo Detection: Only query Colo for successful downloads
 			candidates[i].Colo = GetColo(candidates[i].IP, cfg.Port, cfg.Proxy)
 
 			candidates[i].DownloadSpeed = speed
+			candidates[i].SingleSpeed = speed
 			candidates[i].MinSpeed = minSpd
 			candidates[i].Stability = stab
-			// Use single-stream min speed if it's lower (more realistic)
-			if sgMinSpd > 0 && (sgMinSpd < minSpd || minSpd == 0) {
-				candidates[i].MinSpeed = sgMinSpd
-			}
+
+			// Measure load latency (TCP latency under bandwidth saturation)
+			candidates[i].LoadLatency = MeasureLoadLatency(candidates[i].IP, cfg.Port, cfg.Proxy)
+
 			candidates[i].CalcScore()
 			results = append(results, candidates[i])
 
@@ -325,9 +285,9 @@ func RunDownloadTest(ctx context.Context, candidates []NodeResult, cfg Config,
 
 func RunCLI(cfg Config) {
 	if cfg.YouTubeMode {
-		fmt.Printf("YouTube CDN SpeedTest v1.5.0 (Go Edition)\n\n")
+		fmt.Printf("YouTube CDN SpeedTest v1.6.0 (Go Edition)\n\n")
 	} else {
-		fmt.Printf("Cloudflare SpeedTest v1.5.0 (Go Edition)\n\n")
+		fmt.Printf("Cloudflare SpeedTest v1.6.0 (Go Edition)\n\n")
 	}
 
 	var ips []string
@@ -378,13 +338,13 @@ func RunCLI(cfg Config) {
 		}
 	}
 
-	fmt.Printf("\n🚀 Test Download (%d threads, %ds duration)\n", cfg.Conc, cfg.Duration)
-	fmt.Printf("%-16s %-6s %-8s %-8s %-10s %-10s %-8s %-8s %-6s\n", "IP", "Colo", "Latency", "Jitter", "SgSpeed", "Speed", "MinSpd", "Stable", "Score")
+	fmt.Printf("\n🚀 Download Test (%ds duration)\n", cfg.Duration)
+	fmt.Printf("%-16s %-6s %-8s %-8s %-10s %-8s %-8s %-8s %-6s\n", "IP", "Colo", "Latency", "Jitter", "Speed", "MinSpd", "LoadLat", "Stable", "Score")
 	fmt.Println("---------------------------------------------------------------------------------")
 
 	results := RunDownloadTest(ctx, candidates, cfg, func(res NodeResult) {
 		if res.Colo != "429" || !cfg.Skip429 {
-			fmt.Printf("%-16s %-6s %5.1fms  %5.1fms  %5.2f     %5.2f     %5.2f  %4.0f%%   %5.1f\n", res.IP, res.Colo, res.TCPLatency, res.Jitter, res.SingleSpeed, res.DownloadSpeed, res.MinSpeed, res.Stability, res.Score)
+			fmt.Printf("%-16s %-6s %5.1fms  %5.1fms  %7.2f    %5.2f  %5.1fms  %4.0f%%   %5.1f\n", res.IP, res.Colo, res.TCPLatency, res.Jitter, res.DownloadSpeed, res.MinSpeed, res.LoadLatency, res.Stability, res.Score)
 		}
 	}, nil, func(p LiveProgress) {
 		fmt.Printf("\r  📥 %-16s %6.1f MB  %6.2f MB/s  %4.0f/%ds    ", p.IP, float64(p.Bytes)/1024.0/1024.0, p.Speed, p.Elapsed, int(p.Duration))

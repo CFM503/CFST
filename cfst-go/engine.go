@@ -164,7 +164,7 @@ func ResolveYouTubeCDNIPs(maxIPs int, proxyAddr string) []NodeResult {
 	return nodes
 }
 
-// discoverYouTubeCDNDomains 抓取 YouTube 页面提取 googlevideo.com CDN 域名及可用的测试 URL
+// discoverYouTubeCDNDomains 并发抓取 YouTube 页面，单次请求同时提取域名和 videoplayback URL
 func discoverYouTubeCDNDomains(proxyAddr string) map[string]string {
 	videoIDs := []string{
 		"dQw4w9WgXcQ", "jNQXAC9IVRw", "9bZkp7q19f0",
@@ -173,77 +173,51 @@ func discoverYouTubeCDNDomains(proxyAddr string) map[string]string {
 
 	client := makeHTTPClient("", 0, 10*time.Second, proxyAddr)
 	domainRe := regexp.MustCompile(`([a-z0-9]+---sn-[a-z0-9]+\.googlevideo\.com)`)
-	seen := make(map[string]bool)
-	domainURLs := make(map[string]string) // domain -> videoplayback URL
-
-	for _, vid := range videoIDs {
-		reqURL := fmt.Sprintf("https://www.youtube.com/watch?v=%s", vid)
-		req, err := newCFRequest("GET", reqURL)
-		if err != nil {
-			continue
-		}
-		resp, err := client.Do(req)
-		if err != nil {
-			continue
-		}
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			continue
-		}
-
-		bodyStr := string(body)
-		matches := domainRe.FindAllString(bodyStr, -1)
-		for _, m := range matches {
-			if !seen[m] {
-				seen[m] = true
-				domainURLs[m] = "" // placeholder, will be filled
-			}
-		}
-		if len(domainURLs) > 50 {
-			break
-		}
-	}
-
-	// 提取可用的 videoplayback URL 作为测试 URL
 	playbackRe := regexp.MustCompile(`https://([a-z0-9]+---sn-[a-z0-9]+\.googlevideo\.com)/videoplayback[^"'\s]*`)
+
+	domainURLs := make(map[string]string)
+	var mu sync.Mutex
+
+	// 并发抓取所有页面，单次请求同时提取域名和 playback URL
+	var wg sync.WaitGroup
 	for _, vid := range videoIDs {
-		reqURL := fmt.Sprintf("https://www.youtube.com/watch?v=%s", vid)
-		req, err := newCFRequest("GET", reqURL)
-		if err != nil {
-			continue
-		}
-		resp, err := client.Do(req)
-		if err != nil {
-			continue
-		}
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			continue
-		}
-
-		bodyStr := string(body)
-		playbackMatches := playbackRe.FindAllString(bodyStr, -1)
-		for _, m := range playbackMatches {
-			domain := domainRe.FindString(m)
-			if domain != "" {
-				domainURLs[domain] = m
+		wg.Add(1)
+		go func(vid string) {
+			defer wg.Done()
+			reqURL := fmt.Sprintf("https://www.youtube.com/watch?v=%s", vid)
+			req, err := newCFRequest("GET", reqURL)
+			if err != nil {
+				return
 			}
-		}
-
-		// 如果所有域名都有了测试 URL，提前退出
-		allHave := true
-		for _, u := range domainURLs {
-			if u == "" {
-				allHave = false
-				break
+			resp, err := client.Do(req)
+			if err != nil {
+				return
 			}
-		}
-		if allHave {
-			break
-		}
+			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				return
+			}
+
+			bodyStr := string(body)
+			mu.Lock()
+			// 提取所有域名
+			for _, m := range domainRe.FindAllString(bodyStr, -1) {
+				if _, exists := domainURLs[m]; !exists {
+					domainURLs[m] = ""
+				}
+			}
+			// 提取 playback URL 并关联到域名
+			for _, m := range playbackRe.FindAllString(bodyStr, -1) {
+				domain := domainRe.FindString(m)
+				if domain != "" {
+					domainURLs[domain] = m
+				}
+			}
+			mu.Unlock()
+		}(vid)
 	}
+	wg.Wait()
 
 	// 对于没有找到 videoplayback URL 的域名，使用域名本身构造测试 URL
 	for domain, u := range domainURLs {
@@ -293,8 +267,10 @@ func dohResolve(host string, proxyAddr string) []string {
 }
 
 
-// SingleStreamTest measures single-connection download speed (more realistic for streaming)
-func SingleStreamTest(ctx context.Context, ip string, port int, testURL string, proxyAddr string) (avgSpeed, minSpeed float64) {
+// SingleStreamTest measures single-connection download speed with configurable duration (most realistic for streaming).
+// Returns avgSpeed (MB/s), minSpeed (MB/s), and stability (0-100).
+func SingleStreamTest(ctx context.Context, ip string, port int, duration int, testURL string, proxyAddr string,
+	progressCallback func(LiveProgress)) (avgSpeed, minSpeed, stability float64) {
 	client := makeHTTPClient(ip, port, 0, proxyAddr)
 	if tr, ok := client.Transport.(*http.Transport); ok {
 		defer tr.CloseIdleConnections()
@@ -302,28 +278,29 @@ func SingleStreamTest(ctx context.Context, ip string, port int, testURL string, 
 
 	parsedURL, err := url.Parse(testURL)
 	if err != nil {
-		return 0, 0
+		return 0, 0, 0
 	}
 	host := parsedURL.Hostname()
 
-	downloadCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	dur := time.Duration(duration) * time.Second
+	downloadCtx, cancel := context.WithTimeout(ctx, dur)
 	defer cancel()
 
 	req, err := newCFRequestWithContext(downloadCtx, "GET", testURL)
 	if err != nil {
-		return 0, 0
+		return 0, 0, 0
 	}
 	req.Host = host
 	req.Header.Set("Connection", "keep-alive")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, 0
+		return 0, 0, 0
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return 0, 0
+		return 0, 0, 0
 	}
 
 	startGlobal := time.Now()
@@ -344,6 +321,16 @@ func SingleStreamTest(ctx context.Context, ip string, port int, testURL string, 
 				sampleMu.Lock()
 				samples = append(samples, mb)
 				sampleMu.Unlock()
+				elapsed := time.Since(startGlobal).Seconds()
+				if progressCallback != nil {
+					progressCallback(LiveProgress{
+						IP:       ip,
+						Bytes:    b,
+						Speed:    mb / elapsed,
+						Elapsed:  elapsed,
+						Duration: float64(duration),
+					})
+				}
 			case <-downloadCtx.Done():
 				return
 			case <-done:
@@ -373,13 +360,13 @@ func SingleStreamTest(ctx context.Context, ip string, port int, testURL string, 
 
 	realTime := time.Since(startGlobal).Seconds()
 	if realTime < 0.1 {
-		return 0, 0
+		return 0, 0, 0
 	}
 
 	avgSpeed = finalMB / realTime
 
 	if len(samples) < 2 {
-		return avgSpeed, avgSpeed
+		return avgSpeed, avgSpeed, 100.0
 	}
 
 	var intervalSpeeds []float64
@@ -398,28 +385,62 @@ func SingleStreamTest(ctx context.Context, ip string, port int, testURL string, 
 	}
 
 	if len(intervalSpeeds) == 0 {
-		return avgSpeed, avgSpeed
+		return avgSpeed, avgSpeed, 100.0
 	}
 
 	minSpeed = intervalSpeeds[0]
+	var sum float64
 	for _, s := range intervalSpeeds {
 		if s < minSpeed {
 			minSpeed = s
 		}
+		sum += s
 	}
 
-	return avgSpeed, minSpeed
+	// Stability = 100 - CV*100 (coefficient of variation = stddev/mean)
+	mean := sum / float64(len(intervalSpeeds))
+	if mean < 0.01 {
+		return avgSpeed, minSpeed, 0.0
+	}
+	var variance float64
+	for _, s := range intervalSpeeds {
+		diff := s - mean
+		variance += diff * diff
+	}
+	variance /= float64(len(intervalSpeeds))
+	stddev := math.Sqrt(variance)
+	cv := stddev / mean
+	stability = 100.0 - cv*100.0
+	if stability < 0 {
+		stability = 0
+	}
+	if stability > 100 {
+		stability = 100
+	}
+
+	return avgSpeed, minSpeed, stability
 }
 
 // MeasureLoadLatency measures TCP latency while download is in progress (catches bufferbloat)
 func MeasureLoadLatency(ip string, port int, proxyAddr string) float64 {
-	client := makeHTTPClient(ip, port, 0, proxyAddr)
 	testURL := "https://speed.cloudflare.com/__down?bytes=10000000"
 	parsedURL, _ := url.Parse(testURL)
 	host := parsedURL.Hostname()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
+
+	// Create a dedicated client and transport for the background download
+	tr := &http.Transport{
+		TLSClientConfig:    sharedTLSConfig,
+		MaxIdleConnsPerHost: 10,
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			addr := net.JoinHostPort(ip, strconv.Itoa(port))
+			return net.DialTimeout("tcp", addr, 2*time.Second)
+		},
+	}
+	client := &http.Client{Transport: tr}
+	defer tr.CloseIdleConnections()
 
 	req, err := newCFRequestWithContext(ctx, "GET", testURL)
 	if err != nil {
@@ -579,8 +600,12 @@ func makeHTTPClient(ip string, port int, timeout time.Duration, proxyAddr string
 	}
 
 	tr := &http.Transport{
-		TLSClientConfig:    sharedTLSConfig,
 		MaxIdleConnsPerHost: 10,
+	}
+	// Only skip TLS verification for direct Cloudflare IP connections (no valid cert for raw IP).
+	// YouTube/DoH requests use standard TLS verification.
+	if ip != "" {
+		tr.TLSClientConfig = sharedTLSConfig
 	}
 
 	var localProxyDialer proxy.Dialer
@@ -641,11 +666,7 @@ func makeHTTPClient(ip string, port int, timeout time.Duration, proxyAddr string
 	return client
 }
 
-func newCFRequest(method, url string) (*http.Request, error) {
-	req, err := http.NewRequest(method, url, nil)
-	if err != nil {
-		return nil, err
-	}
+func setCFHeaders(req *http.Request) {
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
@@ -657,6 +678,14 @@ func newCFRequest(method, url string) (*http.Request, error) {
 	req.Header.Set("Sec-Fetch-Dest", "empty")
 	req.Header.Set("Sec-Fetch-Mode", "cors")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
+}
+
+func newCFRequest(method, url string) (*http.Request, error) {
+	req, err := http.NewRequest(method, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	setCFHeaders(req)
 	return req, nil
 }
 
@@ -665,17 +694,7 @@ func newCFRequestWithContext(ctx context.Context, method, url string) (*http.Req
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-	req.Header.Set("Referer", "https://speed.cloudflare.com/")
-	req.Header.Set("Origin", "https://speed.cloudflare.com")
-	req.Header.Set("Sec-Ch-Ua", `"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"`)
-	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
-	req.Header.Set("Sec-Ch-Ua-Platform", `"Windows"`)
-	req.Header.Set("Sec-Fetch-Dest", "empty")
-	req.Header.Set("Sec-Fetch-Mode", "cors")
-	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	setCFHeaders(req)
 	return req, nil
 }
 
@@ -715,195 +734,3 @@ type LiveProgress struct {
 	Duration float64 `json:"duration"`
 }
 
-func DownloadTest(ctx context.Context, ip string, port int, threads int, duration int, testURL string, proxyAddr string,
-	progressCallback func(LiveProgress)) (avgSpeed, minSpeed, stability float64, blocked bool) {
-	parsedURL, err := url.Parse(testURL)
-	if err != nil {
-		return 0, 0, 0, true
-	}
-	host := parsedURL.Hostname()
-
-	var totalBytes int64
-	var wg sync.WaitGroup
-	var blockedCount atomic.Int32
-	var successCount atomic.Int32
-
-	client := makeHTTPClient(ip, port, 0, proxyAddr)
-	if tr, ok := client.Transport.(*http.Transport); ok {
-		defer tr.CloseIdleConnections()
-	}
-
-	dur := time.Duration(duration) * time.Second
-	downloadCtx, cancel := context.WithTimeout(ctx, dur)
-	defer cancel()
-
-	sampleInterval := 2 * time.Second
-	startGlobal := time.Now()
-
-	// 启动采样协定：每 2 秒记录累计字节数，并触发进度回调
-	var samples []float64 // 每个采样点的累计 MB
-	var sampleMu sync.Mutex
-	done := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(sampleInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				b := atomic.LoadInt64(&totalBytes)
-				mb := float64(b) / 1024.0 / 1024.0
-				sampleMu.Lock()
-				samples = append(samples, mb)
-				sampleMu.Unlock()
-				elapsed := time.Since(startGlobal).Seconds()
-				if progressCallback != nil {
-					progressCallback(LiveProgress{
-						IP:       ip,
-						Bytes:    b,
-						Speed:    mb / elapsed,
-						Elapsed:  elapsed,
-						Duration: float64(duration),
-					})
-				}
-			case <-downloadCtx.Done():
-				return
-			case <-done:
-				return
-			}
-		}
-	}()
-
-	// 所有线程启动完成的信号，用于快速中止
-	allStarted := make(chan struct{})
-	var startedCount atomic.Int32
-
-	for i := 0; i < threads; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer func() {
-				if startedCount.Add(1) == int32(threads) {
-					close(allStarted)
-				}
-			}()
-
-			req, err := newCFRequestWithContext(downloadCtx, "GET", testURL)
-			if err != nil {
-				blockedCount.Add(1)
-				return
-			}
-			req.Host = host
-			req.Header.Set("Connection", "keep-alive")
-
-			resp, err := client.Do(req)
-			if err != nil {
-				blockedCount.Add(1)
-				return
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode >= 400 {
-				blockedCount.Add(1)
-				return
-			}
-			successCount.Add(1)
-
-			bufPtr := downloadBufPool.Get().(*[]byte)
-			buf := *bufPtr
-			defer downloadBufPool.Put(bufPtr)
-
-			for {
-				n, err := resp.Body.Read(buf)
-				if n > 0 {
-					atomic.AddInt64(&totalBytes, int64(n))
-				}
-				if err != nil {
-					break
-				}
-			}
-		}()
-	}
-
-	// 等待所有线程启动，如果全部 blocked 则快速中止
-	<-allStarted
-	if int(blockedCount.Load()) == threads {
-		// 所有线程都返回 429，快速中止
-		wg.Wait()
-		close(done)
-		return 0, 0, 0, true
-	}
-
-	wg.Wait()
-	close(done)
-
-	// 最终采样
-	finalMB := float64(atomic.LoadInt64(&totalBytes)) / 1024.0 / 1024.0
-	sampleMu.Lock()
-	samples = append(samples, finalMB)
-	sampleMu.Unlock()
-
-	realTime := time.Since(startGlobal).Seconds()
-	if realTime < 0.1 {
-		realTime = 0.1
-	}
-
-	avgSpeed = finalMB / realTime
-
-	// 计算每个区间的瞬时速度
-	if len(samples) < 2 {
-		return avgSpeed, avgSpeed, 0.0, false
-	}
-
-	var intervalSpeeds []float64
-	for i := 1; i < len(samples); i++ {
-		dt := sampleInterval.Seconds()
-		if i == len(samples)-1 {
-			// 最后一个区间可能不足 2 秒
-			elapsed := realTime - float64(i-1)*sampleInterval.Seconds()
-			if elapsed > 0.1 {
-				dt = elapsed
-			}
-		}
-		speed := (samples[i] - samples[i-1]) / dt
-		if speed > 0 {
-			intervalSpeeds = append(intervalSpeeds, speed)
-		}
-	}
-
-	if len(intervalSpeeds) == 0 {
-		return avgSpeed, avgSpeed, 0.0, false
-	}
-
-	// 最低速度
-	minSpeed = intervalSpeeds[0]
-	var sum float64
-	for _, s := range intervalSpeeds {
-		if s < minSpeed {
-			minSpeed = s
-		}
-		sum += s
-	}
-
-	// 稳定性 = 100 - 变异系数*100 (变异系数 = 标准差/均值)
-	mean := sum / float64(len(intervalSpeeds))
-	if mean < 0.01 {
-		return avgSpeed, minSpeed, 0.0, false
-	}
-	var variance float64
-	for _, s := range intervalSpeeds {
-		diff := s - mean
-		variance += diff * diff
-	}
-	variance /= float64(len(intervalSpeeds))
-	stddev := math.Sqrt(variance)
-	cv := stddev / mean // 变异系数
-	stability = 100.0 - cv*100.0
-	if stability < 0 {
-		stability = 0
-	}
-	if stability > 100 {
-		stability = 100
-	}
-
-	return avgSpeed, minSpeed, stability, false
-}

@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CFST v1.5.0</title>
+    <title>CFST v1.6.0</title>
     <!-- Google Fonts for modern typography -->
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
@@ -281,7 +281,7 @@
             <div class="header">
                 <div style="display: flex; align-items: baseline; gap: 12px;">
                     <h1>✨ CFST Ultimate</h1>
-                    <span style="color: var(--text-dim); font-size: 1.1rem; font-weight: 600;">v1.5.0</span>
+                    <span style="color: var(--text-dim); font-size: 1.1rem; font-weight: 600;">v1.6.0</span>
                 </div>
                 <button id="startBtn">
                     <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -397,8 +397,7 @@
                         <th>Colo</th>
                         <th>Latency</th>
                         <th>Jitter</th>
-                        <th>SgSpeed</th>
-                        <th>Download Speed</th>
+                        <th>Speed</th>
                         <th>MinSpeed</th>
                         <th>LoadLat</th>
                         <th>Stability</th>
@@ -491,34 +490,71 @@
                 progValid.innerText = `...`;
             });
 
-            function renderResults() {
+            function renderResults(finalResults) {
+                const list = finalResults || scannedResults;
                 // Sort by score descending
-                scannedResults.sort((a, b) => b.score - a.score);
+                list.sort((a, b) => b.score - a.score);
                 resultsBody.innerHTML = '';
-                scannedResults.forEach((res, idx) => {
+                list.forEach((res, idx) => {
                     let speedClass = 'val-speed-bad';
                     if (res.download_speed >= 20) speedClass = 'val-speed-good';
                     else if (res.download_speed >= 5) speedClass = 'val-speed-ok';
 
                     const tr = document.createElement('tr');
-                    // Only apply slide-up animation to the most recently added item
-                    if (res.ip === scannedResults[scannedResults.length - 1].ip) {
+                    if (!finalResults && res.ip === list[list.length - 1].ip) {
                         tr.className = 'row-anim';
                     }
-                    tr.innerHTML = `
-                        <td style="font-family: monospace; font-size: 0.95rem; display: flex; align-items: center;">
-                            <button class="btn-copy" onclick="copyIP(this, '${res.ip}')" title="Copy IP">
-                                <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
-                            </button>
-                            ${res.ip}
-                        </td>
-                        <td class="val-colo">${res.colo}</td>
-                        <td>${res.tcp_latency.toFixed(1)} ms</td>
-                        <td>${(res.jitter || 0).toFixed(1)} ms</td>
-                        <td class="${speedClass}">${res.download_speed.toFixed(2)} MB/s</td>
-                        <td>${(res.stability || 0).toFixed(0)}%</td>
-                        <td><strong>${res.score.toFixed(1)}</strong></td>
-                    `;
+
+                    // IP cell with copy button (use textContent for XSS safety)
+                    const tdIp = document.createElement('td');
+                    tdIp.style.cssText = 'font-family: monospace; font-size: 0.95rem; display: flex; align-items: center;';
+                    const copyBtn = document.createElement('button');
+                    copyBtn.className = 'btn-copy';
+                    copyBtn.title = 'Copy IP';
+                    copyBtn.innerHTML = '<svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>';
+                    copyBtn.onclick = function() { copyIP(this, res.ip); };
+                    tdIp.appendChild(copyBtn);
+                    const ipSpan = document.createElement('span');
+                    ipSpan.textContent = res.ip;
+                    tdIp.appendChild(ipSpan);
+
+                    const tdColo = document.createElement('td');
+                    tdColo.className = 'val-colo';
+                    tdColo.textContent = res.colo;
+
+                    const tdLat = document.createElement('td');
+                    tdLat.textContent = res.tcp_latency.toFixed(1) + ' ms';
+
+                    const tdJitter = document.createElement('td');
+                    tdJitter.textContent = (res.jitter || 0).toFixed(1) + ' ms';
+
+                    const tdSpeed = document.createElement('td');
+                    tdSpeed.className = speedClass;
+                    tdSpeed.textContent = res.download_speed.toFixed(2) + ' MB/s';
+
+                    const tdMin = document.createElement('td');
+                    tdMin.textContent = (res.min_speed || 0).toFixed(2) + ' MB/s';
+
+                    const tdLoad = document.createElement('td');
+                    tdLoad.textContent = (res.load_latency || 0).toFixed(1) + ' ms';
+
+                    const tdStab = document.createElement('td');
+                    tdStab.textContent = (res.stability || 0).toFixed(0) + '%';
+
+                    const tdScore = document.createElement('td');
+                    const strong = document.createElement('strong');
+                    strong.textContent = res.score.toFixed(1);
+                    tdScore.appendChild(strong);
+
+                    tr.appendChild(tdIp);
+                    tr.appendChild(tdColo);
+                    tr.appendChild(tdLat);
+                    tr.appendChild(tdJitter);
+                    tr.appendChild(tdSpeed);
+                    tr.appendChild(tdMin);
+                    tr.appendChild(tdLoad);
+                    tr.appendChild(tdStab);
+                    tr.appendChild(tdScore);
                     resultsBody.appendChild(tr);
                 });
             }
@@ -531,16 +567,20 @@
             });
 
             evtSource.addEventListener('error', (e) => {
-                const msg = JSON.parse(e.data);
+                let msg;
+                try { msg = JSON.parse(e.data); } catch(err) { msg = e.data; }
                 updateStatus('Error: ' + msg, 'red');
                 evtSource.close();
                 resetButton();
             });
 
             evtSource.addEventListener('complete', (e) => {
+                const finalResults = JSON.parse(e.data);
+                scannedResults = finalResults;
+                renderResults(finalResults);
                 progWrap.style.display = 'none';
                 progStats.style.display = 'none';
-                updateStatus('Test completed effectively.', 'green');
+                updateStatus('Test completed.', 'green');
                 evtSource.close();
                 resetButton();
             });
@@ -581,11 +621,11 @@
 
         btnExport.addEventListener('click', () => {
             if (scannedResults.length === 0) return;
-            // Build CSV matching CLI output format: IP,Colo,Latency,Speed_MB,Score
+            // Build CSV matching CLI output format
             const bom = '\uFEFF';
-            const header = 'IP,Colo,Latency,Jitter,Speed_MB,Stability,Score';
+            const header = 'IP,Colo,Latency,Jitter,Speed_MB,MinSpeed_MB,LoadLatency,Stability,Score';
             const rows = scannedResults.map(r =>
-                `${r.ip},${r.colo},${r.tcp_latency.toFixed(1)},${(r.jitter||0).toFixed(1)},${r.download_speed.toFixed(2)},${(r.stability||0).toFixed(0)},${r.score.toFixed(1)}`
+                `${r.ip},${r.colo},${r.tcp_latency.toFixed(1)},${(r.jitter||0).toFixed(1)},${r.download_speed.toFixed(2)},${(r.min_speed||0).toFixed(2)},${(r.load_latency||0).toFixed(1)},${(r.stability||0).toFixed(0)},${r.score.toFixed(1)}`
             );
             const csvContent = bom + header + '\n' + rows.join('\n') + '\n';
             const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8' });
