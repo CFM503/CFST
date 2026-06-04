@@ -135,16 +135,20 @@ func RunWeb(cfg Config) {
 			candidates = candidates[:reqCfg.TopN]
 		}
 
-		// Colo 检测 + 筛选最优数据中心
-		sendEvent("status", fmt.Sprintf("Detecting Colo for %d candidates...", len(candidates)))
-		bestColo, coloGroups := detectColoBatch(r.Context(), candidates, reqCfg.Port, reqCfg.ScanConcurrent, reqCfg.Proxy, func(done, total int) {
-			sendEvent("progress_colo", map[string]int{"done": done, "total": total})
-		})
-		if bestColo != "" {
-			sendEvent("status", fmt.Sprintf("Best Colo: %s (%d nodes), testing...", bestColo, len(coloGroups[bestColo])))
-			candidates = coloGroups[bestColo]
+		// Colo 检测（YouTube 模式跳过）
+		if !reqCfg.YouTubeMode {
+			sendEvent("status", fmt.Sprintf("Detecting Colo for %d candidates...", len(candidates)))
+			bestColo, coloGroups := detectColoBatch(r.Context(), candidates, reqCfg.Port, reqCfg.ScanConcurrent, reqCfg.Proxy, func(done, total int) {
+				sendEvent("progress_colo", map[string]int{"done": done, "total": total})
+			})
+			if bestColo != "" {
+				sendEvent("status", fmt.Sprintf("Best Colo: %s (%d nodes), testing...", bestColo, len(coloGroups[bestColo])))
+				candidates = coloGroups[bestColo]
+			} else {
+				sendEvent("status", "No valid Colo detected, testing all candidates...")
+			}
 		} else {
-			sendEvent("status", "No valid Colo detected, testing all candidates...")
+			sendEvent("status", fmt.Sprintf("[YouTube Mode] Testing %d candidates directly...", len(candidates)))
 		}
 
 		sendEvent("status", "Running Download Speed Tests...")

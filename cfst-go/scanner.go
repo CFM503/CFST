@@ -213,6 +213,8 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 
 	resultCh := make(chan NodeResult, numWorkers*2)
 	doneCh := make(chan struct{})
+	var doneOnce sync.Once
+	closeDone := func() { doneOnce.Do(func() { close(doneCh) }) }
 
 	// 收集结果的 goroutine
 	go func() {
@@ -226,11 +228,11 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 				progressRow(res)
 			}
 			if n >= cfg.DownloadNum {
-				close(doneCh)
+				closeDone()
 				return
 			}
 		}
-		close(doneCh)
+		closeDone()
 	}()
 
 	// 启动 workers
@@ -241,7 +243,6 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 		go func() {
 			defer wg.Done()
 			workerCooldownMs := 500
-			workerConsecutive429 := 0
 
 			for {
 				// 检查是否已收集够结果
@@ -290,7 +291,6 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 				speed, minSpd, stab := SingleStreamTest(ctx, cand.IP, cfg.Port, cfg.Duration, testURL, cfg.Proxy, progressLive)
 
 				if speed == 0 && minSpd == 0 && stab == 0 {
-					workerConsecutive429++
 					totalSkipped.Add(1)
 					workerCooldownMs = min(workerCooldownMs*2, 5000)
 					if cfg.Skip429 {
@@ -305,15 +305,19 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 						return
 					}
 				} else {
-					workerConsecutive429 = 0
 					workerCooldownMs = 500
 
-					cand.Colo = GetColo(cand.IP, cfg.Port, cfg.Proxy)
+					// YouTube 节点不走 Cloudflare，跳过 Colo 和 LoadLatency 检测
+					if cand.Domain != "" {
+						cand.Colo = "YT"
+					} else {
+						cand.Colo = GetColo(cand.IP, cfg.Port, cfg.Proxy)
+						cand.LoadLatency = MeasureLoadLatency(cand.IP, cfg.Port, cfg.Proxy)
+					}
 					cand.DownloadSpeed = speed
 					cand.SingleSpeed = speed
 					cand.MinSpeed = minSpd
 					cand.Stability = stab
-					cand.LoadLatency = MeasureLoadLatency(cand.IP, cfg.Port, cfg.Proxy)
 					cand.CalcScore()
 
 					select {
@@ -347,9 +351,9 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 
 func RunCLI(cfg Config) {
 	if cfg.YouTubeMode {
-		fmt.Printf("YouTube CDN SpeedTest v1.7.2 (Go Edition)\n\n")
+		fmt.Printf("YouTube CDN SpeedTest v1.7.3 (Go Edition)\n\n")
 	} else {
-		fmt.Printf("Cloudflare SpeedTest v1.7.2 (Go Edition)\n\n")
+		fmt.Printf("Cloudflare SpeedTest v1.7.3 (Go Edition)\n\n")
 	}
 
 	var ips []string
@@ -405,40 +409,43 @@ func RunCLI(cfg Config) {
 		candidates = candidates[:cfg.TopN]
 	}
 
-	// Step 2: 批量检测 Colo，筛选最优数据中心
-	fmt.Printf("\n🔍 Detecting Colo for %d candidates...\n", len(candidates))
-	bestColo, coloGroups := detectColoBatch(ctx, candidates, cfg.Port, cfg.ScanConcurrent, cfg.Proxy, func(done, total int) {
-		fmt.Printf("\r  Colo detection: %d/%d", done, total)
-	})
-	fmt.Println()
+	// Step 2: Colo 检测（YouTube 模式跳过，googlevideo.com 不是 Cloudflare）
+	if !cfg.YouTubeMode {
+		fmt.Printf("\n🔍 Detecting Colo for %d candidates...\n", len(candidates))
+		bestColo, coloGroups := detectColoBatch(ctx, candidates, cfg.Port, cfg.ScanConcurrent, cfg.Proxy, func(done, total int) {
+			fmt.Printf("\r  Colo detection: %d/%d", done, total)
+		})
+		fmt.Println()
 
-	if bestColo != "" {
-		fmt.Printf("  Best Colo: %s (%d nodes)\n", bestColo, len(coloGroups[bestColo]))
-		// 打印各 Colo 统计
-		type coloStat struct {
-			name  string
-			count int
-			avgMs float64
-		}
-		var stats []coloStat
-		for colo, nodes := range coloGroups {
-			var sum float64
-			for _, n := range nodes {
-				sum += n.TCPLatency
+		if bestColo != "" {
+			fmt.Printf("  Best Colo: %s (%d nodes)\n", bestColo, len(coloGroups[bestColo]))
+			type coloStat struct {
+				name  string
+				count int
+				avgMs float64
 			}
-			stats = append(stats, coloStat{colo, len(nodes), sum / float64(len(nodes))})
-		}
-		sort.Slice(stats, func(i, j int) bool { return stats[i].count > stats[j].count })
-		for _, s := range stats {
-			marker := "  "
-			if s.name == bestColo {
-				marker = "★ "
+			var stats []coloStat
+			for colo, nodes := range coloGroups {
+				var sum float64
+				for _, n := range nodes {
+					sum += n.TCPLatency
+				}
+				stats = append(stats, coloStat{colo, len(nodes), sum / float64(len(nodes))})
 			}
-			fmt.Printf("  %s%-6s  %4d nodes  avg %.1fms\n", marker, s.name, s.count, s.avgMs)
+			sort.Slice(stats, func(i, j int) bool { return stats[i].count > stats[j].count })
+			for _, s := range stats {
+				marker := "  "
+				if s.name == bestColo {
+					marker = "★ "
+				}
+				fmt.Printf("  %s%-6s  %4d nodes  avg %.1fms\n", marker, s.name, s.count, s.avgMs)
+			}
+			candidates = coloGroups[bestColo]
+		} else {
+			fmt.Println("  [!] No valid Colo detected, testing all candidates")
 		}
-		candidates = coloGroups[bestColo]
 	} else {
-		fmt.Println("  [!] No valid Colo detected, testing all candidates")
+		fmt.Printf("\n[YouTube Mode] Skipping Colo detection, testing %d candidates directly...\n", len(candidates))
 	}
 
 	// Step 3: 并行下载测试
