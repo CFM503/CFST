@@ -474,19 +474,10 @@ func RunCLI(cfg Config) {
 		}
 	}
 
-	// 自定义 URL 时：用快速下载测试筛选（延迟不等于到 VPS 的下载速度）
+	// 自定义 URL 时：跳过 TopN，全部测试（延迟不等于到 VPS 的下载速度）
 	// 默认 speed.cloudflare.com 时：用延迟 TopN 筛选（延迟是好的代理指标）
 	if isCustomURL(cfg.URL) && !cfg.YouTubeMode {
-		fmt.Printf("\n⚡ Quick filter: %ds download test for %d candidates (concurrency: %d)...\n", cfg.QuickDuration, len(candidates), cfg.DLConc)
-		candidates = runQuickFilter(ctx, candidates, cfg, cfg.TopN, func(done, total int) {
-			fmt.Printf("\r  Quick filter: %d/%d", done, total)
-		})
-		fmt.Println()
-		if len(candidates) == 0 {
-			fmt.Println("[!] No IPs with measurable download speed. Check your URL or network.")
-			return
-		}
-		fmt.Printf("  ✓ %d candidates passed quick filter\n", len(candidates))
+		fmt.Printf("\n⚡ Custom URL mode: testing all %d candidates (no latency filter)\n", len(candidates))
 	} else {
 		// 取延迟最低的 TopN 个候选
 		if len(candidates) > cfg.TopN {

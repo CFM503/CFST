@@ -133,17 +133,9 @@ func RunWeb(cfg Config) {
 			}
 		}
 
-		// 自定义 URL 时用快速下载筛选，否则用延迟 TopN
+		// 自定义 URL 时全部测试，否则用延迟 TopN
 		if isCustomURL(reqCfg.URL) && !reqCfg.YouTubeMode {
-			sendEvent("status", fmt.Sprintf("Quick filter: %ds download test for %d candidates...", reqCfg.QuickDuration, len(candidates)))
-			candidates = runQuickFilter(r.Context(), candidates, reqCfg, reqCfg.TopN, func(done, total int) {
-				sendEvent("progress_quick", map[string]int{"done": done, "total": total})
-			})
-			if len(candidates) == 0 {
-				sendEvent("error", "No IPs with measurable download speed. Check your URL or network.")
-				return
-			}
-			sendEvent("status", fmt.Sprintf("✓ %d candidates passed quick filter", len(candidates)))
+			sendEvent("status", fmt.Sprintf("Custom URL mode: testing all %d candidates", len(candidates)))
 		} else {
 			if len(candidates) > reqCfg.TopN {
 				candidates = candidates[:reqCfg.TopN]
