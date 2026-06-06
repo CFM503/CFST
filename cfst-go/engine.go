@@ -148,6 +148,19 @@ func SingleStreamTest(ctx context.Context, ip string, port int, duration int, te
 	req.Host = host
 	req.Header.Set("Connection", "keep-alive")
 
+	// 自定义 URL 时，用正确的域名构造 Referer/Origin，避免触发 Cloudflare bot 检测
+	if !strings.Contains(testURL, "speed.cloudflare.com") {
+		scheme := parsedURL.Scheme
+		if scheme == "" {
+			scheme = "https"
+		}
+		baseURL := scheme + "://" + host
+		if parsedURL.Port() != "" {
+			baseURL += ":" + parsedURL.Port()
+		}
+		setCFHeadersForURL(req, baseURL)
+	}
+
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0, 0, 0
@@ -521,11 +534,15 @@ func makeHTTPClient(ip string, port int, timeout time.Duration, proxyAddr string
 }
 
 func setCFHeaders(req *http.Request) {
+	setCFHeadersForURL(req, "https://speed.cloudflare.com")
+}
+
+func setCFHeadersForURL(req *http.Request, baseURL string) {
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-	req.Header.Set("Referer", "https://speed.cloudflare.com/")
-	req.Header.Set("Origin", "https://speed.cloudflare.com")
+	req.Header.Set("Referer", baseURL+"/")
+	req.Header.Set("Origin", baseURL)
 	req.Header.Set("Sec-Ch-Ua", `"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"`)
 	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
 	req.Header.Set("Sec-Ch-Ua-Platform", `"Windows"`)
