@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,6 +31,7 @@ type Config struct {
 	Skip429        bool
 	YouTubeMode    bool
 	Proxy          string
+	QuickDuration  int     // 自定义 URL 时快速筛选测试时长（秒）
 }
 
 func DefaultConfig() Config {
@@ -47,7 +49,13 @@ func DefaultConfig() Config {
 		WebPort:        "9876",
 		URL:            "https://speed.cloudflare.com/__down?bytes=500000000",
 		Skip429:        true,
+		QuickDuration:  3,
 	}
+}
+
+// isCustomURL returns true if the URL is not the default speed.cloudflare.com endpoint.
+func isCustomURL(urlStr string) bool {
+	return !strings.Contains(urlStr, "speed.cloudflare.com/__down")
 }
 
 func ScanPing(ctx context.Context, ips []string, port int, concurrency int, progressCallback func(done, total, valid int)) []NodeResult {
@@ -188,6 +196,68 @@ func detectColoBatch(ctx context.Context, candidates []NodeResult, port int, con
 		}
 	}
 	return bestColo, coloGroups
+}
+
+// runQuickFilter 快速下载筛选：对所有候选 IP 做短时下载测试，按速度排序取 TopN
+// 用于自定义 URL 场景，替代延迟 TopN 筛选
+func runQuickFilter(ctx context.Context, candidates []NodeResult, cfg Config, topN int,
+	progressCallback func(done, total int)) []NodeResult {
+
+	numWorkers := cfg.DLConc
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+
+	type quickResult struct {
+		idx   int
+		speed float64
+	}
+
+	results := make([]quickResult, len(candidates))
+	var doneCount atomic.Int32
+
+	sem := make(chan struct{}, numWorkers)
+	var wg sync.WaitGroup
+
+	for i, cand := range candidates {
+		if ctx.Err() != nil {
+			break
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(idx int, ip string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			speed, _, _ := SingleStreamTest(ctx, ip, cfg.Port, cfg.QuickDuration, cfg.URL, cfg.Proxy, nil)
+			results[idx] = quickResult{idx: idx, speed: speed}
+
+			d := doneCount.Add(1)
+			if progressCallback != nil {
+				progressCallback(int(d), len(candidates))
+			}
+		}(i, cand.IP)
+	}
+
+	wg.Wait()
+
+	// 按速度降序排序
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].speed > results[j].speed
+	})
+
+	// 取 TopN 有速度的候选
+	var filtered []NodeResult
+	for _, r := range results {
+		if r.speed <= 0 {
+			continue
+		}
+		filtered = append(filtered, candidates[r.idx])
+		if len(filtered) >= topN {
+			break
+		}
+	}
+	return filtered
 }
 
 // runParallelDownloadTest 并行下载测试，多个 worker 同时测速
@@ -404,9 +474,24 @@ func RunCLI(cfg Config) {
 		}
 	}
 
-	// 取延迟最低的 TopN 个候选
-	if len(candidates) > cfg.TopN {
-		candidates = candidates[:cfg.TopN]
+	// 自定义 URL 时：用快速下载测试筛选（延迟不等于到 VPS 的下载速度）
+	// 默认 speed.cloudflare.com 时：用延迟 TopN 筛选（延迟是好的代理指标）
+	if isCustomURL(cfg.URL) && !cfg.YouTubeMode {
+		fmt.Printf("\n⚡ Quick filter: %ds download test for %d candidates (concurrency: %d)...\n", cfg.QuickDuration, len(candidates), cfg.DLConc)
+		candidates = runQuickFilter(ctx, candidates, cfg, cfg.TopN, func(done, total int) {
+			fmt.Printf("\r  Quick filter: %d/%d", done, total)
+		})
+		fmt.Println()
+		if len(candidates) == 0 {
+			fmt.Println("[!] No IPs with measurable download speed. Check your URL or network.")
+			return
+		}
+		fmt.Printf("  ✓ %d candidates passed quick filter\n", len(candidates))
+	} else {
+		// 取延迟最低的 TopN 个候选
+		if len(candidates) > cfg.TopN {
+			candidates = candidates[:cfg.TopN]
+		}
 	}
 
 	// Step 2: Colo 检测（YouTube 模式跳过，googlevideo.com 不是 Cloudflare）

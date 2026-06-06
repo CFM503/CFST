@@ -61,6 +61,9 @@ func RunWeb(cfg Config) {
 		if u := q.Get("url"); u != "" {
 			reqCfg.URL = u
 		}
+		if qd := q.Get("qd"); qd != "" {
+			reqCfg.QuickDuration, _ = strconv.Atoi(qd)
+		}
 		if s := q.Get("skip429"); s != "" {
 			reqCfg.Skip429 = (s == "true")
 		}
@@ -130,9 +133,21 @@ func RunWeb(cfg Config) {
 			}
 		}
 
-		// 取延迟最低的 TopN
-		if len(candidates) > reqCfg.TopN {
-			candidates = candidates[:reqCfg.TopN]
+		// 自定义 URL 时用快速下载筛选，否则用延迟 TopN
+		if isCustomURL(reqCfg.URL) && !reqCfg.YouTubeMode {
+			sendEvent("status", fmt.Sprintf("Quick filter: %ds download test for %d candidates...", reqCfg.QuickDuration, len(candidates)))
+			candidates = runQuickFilter(r.Context(), candidates, reqCfg, reqCfg.TopN, func(done, total int) {
+				sendEvent("progress_quick", map[string]int{"done": done, "total": total})
+			})
+			if len(candidates) == 0 {
+				sendEvent("error", "No IPs with measurable download speed. Check your URL or network.")
+				return
+			}
+			sendEvent("status", fmt.Sprintf("✓ %d candidates passed quick filter", len(candidates)))
+		} else {
+			if len(candidates) > reqCfg.TopN {
+				candidates = candidates[:reqCfg.TopN]
+			}
 		}
 
 		// Colo 检测（YouTube 模式跳过）
