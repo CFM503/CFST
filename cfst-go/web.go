@@ -67,9 +67,6 @@ func RunWeb(cfg Config) {
 		if s := q.Get("skip429"); s != "" {
 			reqCfg.Skip429 = (s == "true")
 		}
-		if s := q.Get("yt"); s == "true" {
-			reqCfg.YouTubeMode = true
-		}
 		if p := q.Get("proxy"); p != "" {
 			reqCfg.Proxy = p
 		}
@@ -85,25 +82,8 @@ func RunWeb(cfg Config) {
 			flusher.Flush()
 		}
 
-		var ips []string
-		var ytNodeMap map[string]NodeResult
-		if reqCfg.YouTubeMode {
-			sendEvent("status", "Resolving YouTube CDN nodes...")
-			ytNodes := ResolveYouTubeCDNIPs(reqCfg.MaxScan, reqCfg.Proxy)
-			if len(ytNodes) == 0 {
-				sendEvent("error", "No YouTube CDN IPs found. Check network/DNS (YouTube requires proxy in some regions).")
-				return
-			}
-			ytNodeMap = make(map[string]NodeResult, len(ytNodes))
-			for _, n := range ytNodes {
-				ips = append(ips, n.IP)
-				ytNodeMap[n.IP] = n
-			}
-			sendEvent("status", fmt.Sprintf("Found %d YouTube CDN IPs", len(ips)))
-		} else {
-			sendEvent("status", "Generating IP Ranges...")
-			ips = GenerateIPs(reqCfg.MaxScan, reqCfg.Unique, reqCfg.IPFile)
-		}
+		sendEvent("status", "Generating IP Ranges...")
+		ips := GenerateIPs(reqCfg.MaxScan, reqCfg.Unique, reqCfg.IPFile)
 
 		sendEvent("status", fmt.Sprintf("Ping Scanning %d IPs...", len(ips)))
 		validNodes := ScanPing(r.Context(), ips, reqCfg.Port, reqCfg.ScanConcurrent, func(done, total, valid int) {
@@ -123,18 +103,8 @@ func RunWeb(cfg Config) {
 
 		candidates := validNodes
 
-		// For YouTube mode, inject TestURL/Domain into candidates
-		if ytNodeMap != nil {
-			for i := range candidates {
-				if yt, ok := ytNodeMap[candidates[i].IP]; ok {
-					candidates[i].TestURL = yt.TestURL
-					candidates[i].Domain = yt.Domain
-				}
-			}
-		}
-
 		// 自定义 URL 时全部测试，否则用延迟 TopN
-		if isCustomURL(reqCfg.URL) && !reqCfg.YouTubeMode {
+		if isCustomURL(reqCfg.URL) {
 			sendEvent("status", fmt.Sprintf("Custom URL mode: testing all %d candidates", len(candidates)))
 		} else {
 			if len(candidates) > reqCfg.TopN {
@@ -142,20 +112,16 @@ func RunWeb(cfg Config) {
 			}
 		}
 
-		// Colo 检测（YouTube 模式跳过）
-		if !reqCfg.YouTubeMode {
-			sendEvent("status", fmt.Sprintf("Detecting Colo for %d candidates...", len(candidates)))
-			bestColo, coloGroups := detectColoBatch(r.Context(), candidates, reqCfg.Port, reqCfg.ScanConcurrent, reqCfg.Proxy, func(done, total int) {
-				sendEvent("progress_colo", map[string]int{"done": done, "total": total})
-			})
-			if bestColo != "" {
-				sendEvent("status", fmt.Sprintf("Best Colo: %s (%d nodes), testing...", bestColo, len(coloGroups[bestColo])))
-				candidates = coloGroups[bestColo]
-			} else {
-				sendEvent("status", "No valid Colo detected, testing all candidates...")
-			}
+		// Colo 检测
+		sendEvent("status", fmt.Sprintf("Detecting Colo for %d candidates...", len(candidates)))
+		bestColo, coloGroups := detectColoBatch(r.Context(), candidates, reqCfg.Port, reqCfg.ScanConcurrent, reqCfg.Proxy, func(done, total int) {
+			sendEvent("progress_colo", map[string]int{"done": done, "total": total})
+		})
+		if bestColo != "" {
+			sendEvent("status", fmt.Sprintf("Best Colo: %s (%d nodes), testing...", bestColo, len(coloGroups[bestColo])))
+			candidates = coloGroups[bestColo]
 		} else {
-			sendEvent("status", fmt.Sprintf("[YouTube Mode] Testing %d candidates directly...", len(candidates)))
+			sendEvent("status", "No valid Colo detected, testing all candidates...")
 		}
 
 		sendEvent("status", "Running Download Speed Tests...")

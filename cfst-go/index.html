@@ -345,7 +345,7 @@
                         <label
                             style="display: block; font-size: 0.85rem; color: var(--text-dim); margin-bottom: 0.4rem;">Custom
                             Download URL</label>
-                        <input type="text" id="inpUrl" value="https://speed.cloudflare.com/__down?bytes=50000000"
+                        <input type="text" id="inpUrl" value="https://speed.cloudflare.com/__down?bytes=500000000"
                             style="width: 100%; padding: 0.6rem; border-radius: 8px; border: 1px solid var(--border); background: rgba(0,0,0,0.2); color: white; box-sizing: border-box; font-family: inherit;">
                     </div>
                     <div>
@@ -362,12 +362,6 @@
                         <input type="checkbox" id="inpSkip429" checked
                             style="width: 1.2rem; height: 1.2rem; accent-color: var(--primary);">
                         Skip 429 Nodes
-                    </label>
-                    <label
-                        style="display: flex; align-items: center; gap: 8px; font-size: 0.9rem; color: var(--text-dim); cursor: pointer;">
-                        <input type="checkbox" id="inpYT"
-                            style="width: 1.2rem; height: 1.2rem; accent-color: #ff0000;">
-                        YouTube CDN Mode
                     </label>
                 </div>
             </div>
@@ -459,8 +453,7 @@
                 dt: document.getElementById('inpDt').value,
                 url: document.getElementById('inpUrl').value,
                 skip429: document.getElementById('inpSkip429').checked ? 'true' : 'false',
-                proxy: document.getElementById('inpProxy').value,
-                yt: document.getElementById('inpYT').checked ? 'true' : 'false'
+                proxy: document.getElementById('inpProxy').value
             });
 
             const evtSource = new EventSource('/api/test?' + params.toString());

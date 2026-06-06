@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -69,8 +68,6 @@ type NodeResult struct {
 	Jitter        float64 `json:"jitter"`
 	Stability     float64 `json:"stability"`
 	MinSpeed      float64 `json:"min_speed"`
-	TestURL       string  `json:"test_url,omitempty"`
-	Domain        string  `json:"domain,omitempty"`
 	PacketLoss    float64 `json:"packet_loss"` // 丢包率 0.0~1.0
 }
 
@@ -124,149 +121,6 @@ func randIPFromCIDR(cidr string) string {
 	binary.BigEndian.PutUint32(buf[:], ip)
 	return net.IP(buf[:]).String()
 }
-
-// ResolveYouTubeCDNIPs 发现 YouTube CDN 节点 IP，返回含 TestURL 的 NodeResult
-func ResolveYouTubeCDNIPs(maxIPs int, proxyAddr string) []NodeResult {
-	if maxIPs <= 0 {
-		return nil
-	}
-	seen := make(map[string]bool)
-	var nodes []NodeResult
-
-	// Step 1: 解析 redirector.googlevideo.com（通用重定向节点）
-	redirectorIPs := dohResolve("redirector.googlevideo.com", proxyAddr)
-	for _, ip := range redirectorIPs {
-		if !seen[ip] {
-			seen[ip] = true
-			nodes = append(nodes, NodeResult{IP: ip, Port: 443, Domain: "redirector.googlevideo.com", TestURL: "https://redirector.googlevideo.com/videoplayback"})
-		}
-	}
-
-	// Step 2: 抓取 YouTube 页面，提取真实 CDN 域名和 videoplayback URL
-	domainURLs := discoverYouTubeCDNDomains(proxyAddr)
-	fmt.Printf("  Discovered %d CDN domains\n", len(domainURLs))
-
-	// Step 3: DoH 解析所有域名
-	for domain, testURL := range domainURLs {
-		if len(nodes) >= maxIPs {
-			break
-		}
-		for _, ip := range dohResolve(domain, proxyAddr) {
-			if !seen[ip] {
-				seen[ip] = true
-				nodes = append(nodes, NodeResult{IP: ip, Port: 443, Domain: domain, TestURL: testURL})
-			}
-		}
-	}
-
-	if len(nodes) > maxIPs {
-		nodes = nodes[:maxIPs]
-	}
-	return nodes
-}
-
-// discoverYouTubeCDNDomains 并发抓取 YouTube 页面，单次请求同时提取域名和 videoplayback URL
-func discoverYouTubeCDNDomains(proxyAddr string) map[string]string {
-	videoIDs := []string{
-		"dQw4w9WgXcQ", "jNQXAC9IVRw", "9bZkp7q19f0",
-		"kJQP7kiw5Fk", "RgKAFK5djSk", "fJ9rUzIMcZQ",
-	}
-
-	client := makeHTTPClient("", 0, 10*time.Second, proxyAddr)
-	domainRe := regexp.MustCompile(`([a-z0-9]+---sn-[a-z0-9]+\.googlevideo\.com)`)
-	playbackRe := regexp.MustCompile(`https://([a-z0-9]+---sn-[a-z0-9]+\.googlevideo\.com)/videoplayback[^"'\s]*`)
-
-	domainURLs := make(map[string]string)
-	var mu sync.Mutex
-
-	// 并发抓取所有页面，单次请求同时提取域名和 playback URL
-	var wg sync.WaitGroup
-	for _, vid := range videoIDs {
-		wg.Add(1)
-		go func(vid string) {
-			defer wg.Done()
-			reqURL := fmt.Sprintf("https://www.youtube.com/watch?v=%s", vid)
-			req, err := newCFRequest("GET", reqURL)
-			if err != nil {
-				return
-			}
-			resp, err := client.Do(req)
-			if err != nil {
-				return
-			}
-			body, err := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if err != nil {
-				return
-			}
-
-			bodyStr := string(body)
-			mu.Lock()
-			// 提取所有域名
-			for _, m := range domainRe.FindAllString(bodyStr, -1) {
-				if _, exists := domainURLs[m]; !exists {
-					domainURLs[m] = ""
-				}
-			}
-			// 提取 playback URL 并关联到域名
-			for _, m := range playbackRe.FindAllString(bodyStr, -1) {
-				domain := domainRe.FindString(m)
-				if domain != "" {
-					domainURLs[domain] = m
-				}
-			}
-			mu.Unlock()
-		}(vid)
-	}
-	wg.Wait()
-
-	// 对于没有找到 videoplayback URL 的域名，使用域名本身构造测试 URL
-	for domain, u := range domainURLs {
-		if u == "" {
-			domainURLs[domain] = fmt.Sprintf("https://%s/videoplayback", domain)
-		}
-	}
-
-	return domainURLs
-}
-
-// dohResolve 通过 DNS-over-HTTPS 解析域名（HTTP 请求走代理）
-func dohResolve(host string, proxyAddr string) []string {
-	client := makeHTTPClient("", 0, 5*time.Second, proxyAddr)
-	reqURL := fmt.Sprintf("https://cloudflare-dns.com/dns-query?name=%s&type=A", host)
-	req, err := http.NewRequest("GET", reqURL, nil)
-	if err != nil {
-		return nil
-	}
-	req.Header.Set("Accept", "application/dns-json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-
-	var result struct {
-		Answer []struct {
-			Data string `json:"data"`
-			Type int    `json:"type"`
-		} `json:"Answer"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil
-	}
-
-	var ips []string
-	for _, a := range result.Answer {
-		if a.Type == 1 { // A record
-			if ip := net.ParseIP(a.Data); ip != nil && ip.To4() != nil {
-				ips = append(ips, a.Data)
-			}
-		}
-	}
-	return ips
-}
-
 
 // SingleStreamTest measures single-connection download speed with configurable duration (most realistic for streaming).
 // Returns avgSpeed (MB/s), minSpeed (MB/s), and stability (0-100).
@@ -604,7 +458,6 @@ func makeHTTPClient(ip string, port int, timeout time.Duration, proxyAddr string
 		MaxIdleConnsPerHost: 10,
 	}
 	// Only skip TLS verification for direct Cloudflare IP connections (no valid cert for raw IP).
-	// YouTube/DoH requests use standard TLS verification.
 	if ip != "" {
 		tr.TLSClientConfig = sharedTLSConfig
 	}
@@ -646,7 +499,7 @@ func makeHTTPClient(ip string, port int, timeout time.Duration, proxyAddr string
 			}
 		}
 	} else {
-		// 普通请求（YouTube 页面、DoH），通过代理但使用正常 DNS
+		// 普通请求（非指定 IP），通过代理但使用正常 DNS
 		if localProxyDialer != nil {
 			tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 				return localProxyDialer.Dial(network, addr)

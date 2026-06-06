@@ -29,7 +29,6 @@ type Config struct {
 	WebMode        bool
 	URL            string
 	Skip429        bool
-	YouTubeMode    bool
 	Proxy          string
 	QuickDuration  int     // 自定义 URL 时快速筛选测试时长（秒）
 }
@@ -347,18 +346,13 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 					return
 				}
 
-				testURL := cfg.URL
-				if cand.TestURL != "" {
-					testURL = cand.TestURL
-				}
-
 				t := totalTested.Add(1)
 				msg := fmt.Sprintf("Testing [%d/%d] %s (Skipped: %d)", t, len(candidates), cand.IP, int(totalSkipped.Load()))
 				if progressStatus != nil {
 					progressStatus(msg)
 				}
 
-				speed, minSpd, stab := SingleStreamTest(ctx, cand.IP, cfg.Port, cfg.Duration, testURL, cfg.Proxy, progressLive)
+				speed, minSpd, stab := SingleStreamTest(ctx, cand.IP, cfg.Port, cfg.Duration, cfg.URL, cfg.Proxy, progressLive)
 
 				if speed == 0 && minSpd == 0 && stab == 0 {
 					totalSkipped.Add(1)
@@ -377,13 +371,8 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 				} else {
 					workerCooldownMs = 500
 
-					// YouTube 节点不走 Cloudflare，跳过 Colo 和 LoadLatency 检测
-					if cand.Domain != "" {
-						cand.Colo = "YT"
-					} else {
-						cand.Colo = GetColo(cand.IP, cfg.Port, cfg.Proxy)
-						cand.LoadLatency = MeasureLoadLatency(cand.IP, cfg.Port, cfg.Proxy)
-					}
+					cand.Colo = GetColo(cand.IP, cfg.Port, cfg.Proxy)
+					cand.LoadLatency = MeasureLoadLatency(cand.IP, cfg.Port, cfg.Proxy)
 					cand.DownloadSpeed = speed
 					cand.SingleSpeed = speed
 					cand.MinSpeed = minSpd
@@ -420,30 +409,9 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 }
 
 func RunCLI(cfg Config) {
-	if cfg.YouTubeMode {
-		fmt.Printf("YouTube CDN SpeedTest v1.7.4 (Go Edition)\n\n")
-	} else {
-		fmt.Printf("Cloudflare SpeedTest v1.7.4 (Go Edition)\n\n")
-	}
+	fmt.Printf("Cloudflare SpeedTest v1.7.4 (Go Edition)\n\n")
 
-	var ips []string
-	var ytNodeMap map[string]NodeResult // IP -> NodeResult with TestURL/Domain
-	if cfg.YouTubeMode {
-		fmt.Printf("🔍 Resolving YouTube CDN nodes (max: %d)...\n", cfg.MaxScan)
-		ytNodes := ResolveYouTubeCDNIPs(cfg.MaxScan, cfg.Proxy)
-		if len(ytNodes) == 0 {
-			fmt.Println("[!] No YouTube CDN IPs found. Please check your network/DNS (YouTube requires proxy in some regions).")
-			return
-		}
-		ytNodeMap = make(map[string]NodeResult, len(ytNodes))
-		for _, n := range ytNodes {
-			ips = append(ips, n.IP)
-			ytNodeMap[n.IP] = n
-		}
-		fmt.Printf("  Found %d unique CDN IPs\n", len(ips))
-	} else {
-		ips = GenerateIPs(cfg.MaxScan, cfg.Unique, cfg.IPFile)
-	}
+	ips := GenerateIPs(cfg.MaxScan, cfg.Unique, cfg.IPFile)
 	fmt.Printf("🔍 Scanning %d IPs (concurrency: %d)...\n", len(ips), cfg.ScanConcurrent)
 
 	ctx := context.Background()
@@ -464,19 +432,9 @@ func RunCLI(cfg Config) {
 
 	candidates := validNodes
 
-	// For YouTube mode, inject TestURL/Domain into candidates
-	if ytNodeMap != nil {
-		for i := range candidates {
-			if yt, ok := ytNodeMap[candidates[i].IP]; ok {
-				candidates[i].TestURL = yt.TestURL
-				candidates[i].Domain = yt.Domain
-			}
-		}
-	}
-
 	// 自定义 URL 时：跳过 TopN，全部测试（延迟不等于到 VPS 的下载速度）
 	// 默认 speed.cloudflare.com 时：用延迟 TopN 筛选（延迟是好的代理指标）
-	if isCustomURL(cfg.URL) && !cfg.YouTubeMode {
+	if isCustomURL(cfg.URL) {
 		fmt.Printf("\n⚡ Custom URL mode: testing all %d candidates (no latency filter)\n", len(candidates))
 	} else {
 		// 取延迟最低的 TopN 个候选
@@ -485,8 +443,8 @@ func RunCLI(cfg Config) {
 		}
 	}
 
-	// Step 2: Colo 检测（YouTube 模式跳过，googlevideo.com 不是 Cloudflare）
-	if !cfg.YouTubeMode {
+	// Step 2: Colo 检测
+	{
 		fmt.Printf("\n🔍 Detecting Colo for %d candidates...\n", len(candidates))
 		bestColo, coloGroups := detectColoBatch(ctx, candidates, cfg.Port, cfg.ScanConcurrent, cfg.Proxy, func(done, total int) {
 			fmt.Printf("\r  Colo detection: %d/%d", done, total)
@@ -520,8 +478,6 @@ func RunCLI(cfg Config) {
 		} else {
 			fmt.Println("  [!] No valid Colo detected, testing all candidates")
 		}
-	} else {
-		fmt.Printf("\n[YouTube Mode] Skipping Colo detection, testing %d candidates directly...\n", len(candidates))
 	}
 
 	// Step 3: 并行下载测试

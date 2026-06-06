@@ -23,7 +23,6 @@ func main() {
 	flag.BoolVar(&cfg.Skip429, "skip429", cfg.Skip429, "Discard 429 rate-limited IPs silently and find replacements")
 	flag.StringVar(&cfg.URL, "url", cfg.URL, "Custom download test URL (bypass 429 block)")
 	flag.IntVar(&cfg.QuickDuration, "qd", cfg.QuickDuration, "Quick filter duration in seconds (custom URL only)")
-	flag.BoolVar(&cfg.YouTubeMode, "yt", cfg.YouTubeMode, "Test YouTube CDN nodes (googlevideo.com)")
 	flag.StringVar(&cfg.Proxy, "proxy", "", "Proxy address (socks5://127.0.0.1:1080 or http://127.0.0.1:1080)")
 
 	webMode := false
