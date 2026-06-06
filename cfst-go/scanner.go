@@ -45,7 +45,7 @@ func DefaultConfig() Config {
 		Output:         "result_colo.csv",
 		ScanConcurrent: 200,
 		WebPort:        "9876",
-		URL:            "https://speed.cloudflare.com/__down?bytes=50000000",
+		URL:            "https://speed.cloudflare.com/__down?bytes=500000000",
 		Skip429:        true,
 	}
 }
@@ -351,9 +351,9 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 
 func RunCLI(cfg Config) {
 	if cfg.YouTubeMode {
-		fmt.Printf("YouTube CDN SpeedTest v1.7.3 (Go Edition)\n\n")
+		fmt.Printf("YouTube CDN SpeedTest v1.7.4 (Go Edition)\n\n")
 	} else {
-		fmt.Printf("Cloudflare SpeedTest v1.7.3 (Go Edition)\n\n")
+		fmt.Printf("Cloudflare SpeedTest v1.7.4 (Go Edition)\n\n")
 	}
 
 	var ips []string
@@ -450,12 +450,13 @@ func RunCLI(cfg Config) {
 
 	// Step 3: 并行下载测试
 	fmt.Printf("\n🚀 Download Test (%ds duration, %d parallel)\n", cfg.Duration, cfg.DLConc)
-	fmt.Printf("%-16s %-6s %-8s %-8s %-10s %-8s %-8s %-8s %-6s\n", "IP", "Colo", "Latency", "Jitter", "Speed", "MinSpd", "LoadLat", "Stable", "Score")
-	fmt.Println("---------------------------------------------------------------------------------")
+	fmt.Printf("%-16s %-6s %-8s %-8s %-14s %-12s %-8s %-8s %-6s\n", "IP", "Colo", "Latency", "Jitter", "Speed", "MinSpd", "LoadLat", "Stable", "Score")
+	fmt.Println("------------------------------------------------------------------------------------")
 
 	results := runParallelDownloadTest(ctx, candidates, cfg, func(res NodeResult) {
 		if res.Colo != "429" || !cfg.Skip429 {
-			fmt.Printf("%-16s %-6s %5.1fms  %5.1fms  %7.2f    %5.2f  %5.1fms  %4.0f%%   %5.1f\n", res.IP, res.Colo, res.TCPLatency, res.Jitter, res.DownloadSpeed, res.MinSpeed, res.LoadLatency, res.Stability, res.Score)
+			fmt.Printf("\r%-120s\r", "") // 清除实时进度行
+			fmt.Printf("%-16s %-6s %5.1fms  %5.1fms  %6.2f MB/s  %5.2f MB/s  %5.1fms  %4.0f%%   %5.1f\n", res.IP, res.Colo, res.TCPLatency, res.Jitter, res.DownloadSpeed, res.MinSpeed, res.LoadLatency, res.Stability, res.Score)
 		}
 	}, nil, func(p LiveProgress) {
 		fmt.Printf("\r  📥 %-16s %6.1f MB  %6.2f MB/s  %4.0f/%ds    ", p.IP, float64(p.Bytes)/1024.0/1024.0, p.Speed, p.Elapsed, int(p.Duration))
