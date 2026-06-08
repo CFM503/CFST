@@ -1,3 +1,4 @@
 *.exe
 result_*.csv
 sin_ips.txt
+.claude/
