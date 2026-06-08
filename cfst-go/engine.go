@@ -126,16 +126,21 @@ func randIPFromCIDR(cidr string) string {
 // Returns avgSpeed (MB/s), minSpeed (MB/s), and stability (0-100).
 func SingleStreamTest(ctx context.Context, ip string, port int, duration int, testURL string, proxyAddr string,
 	progressCallback func(LiveProgress)) (avgSpeed, minSpeed, stability float64) {
-	client := makeHTTPClient(ip, port, 0, proxyAddr)
-	if tr, ok := client.Transport.(*http.Transport); ok {
-		defer tr.CloseIdleConnections()
-	}
-
 	parsedURL, err := url.Parse(testURL)
 	if err != nil {
 		return 0, 0, 0
 	}
 	host := parsedURL.Hostname()
+
+	// 设置 TLS SNI 为实际域名，让 Cloudflare 正确路由
+	sni := host
+	if strings.Contains(testURL, "speed.cloudflare.com") {
+		sni = "" // speed.cloudflare.com 用默认即可
+	}
+	client := makeHTTPClient(ip, port, 0, proxyAddr, sni)
+	if tr, ok := client.Transport.(*http.Transport); ok {
+		defer tr.CloseIdleConnections()
+	}
 
 	dur := time.Duration(duration) * time.Second
 	downloadCtx, cancel := context.WithTimeout(ctx, dur)
@@ -442,11 +447,21 @@ func TCPPing(ip string, port int, timeout time.Duration) float64 {
 var coloRe = regexp.MustCompile(`colo=([A-Z]+)`)
 
 var sharedTLSConfig = &tls.Config{InsecureSkipVerify: true}
+
+func makeTLSConfig(sniHostname string) *tls.Config {
+	if sniHostname == "" {
+		return sharedTLSConfig
+	}
+	return &tls.Config{
+		InsecureSkipVerify: true,
+		ServerName:         sniHostname,
+	}
+}
 var clientPool sync.Map // map[string]*http.Client
 
 var downloadBufPool = sync.Pool{
 	New: func() interface{} {
-		b := make([]byte, 65536)
+		b := make([]byte, 262144) // 256KB buffer for better throughput
 		return &b
 	},
 }
@@ -457,11 +472,15 @@ func init() {
 	}
 }
 
-func makeHTTPClient(ip string, port int, timeout time.Duration, proxyAddr string) *http.Client {
+func makeHTTPClient(ip string, port int, timeout time.Duration, proxyAddr string, sniHostname ...string) *http.Client {
 	var key string
 	var useCache = (ip == "")
+	sni := ""
+	if len(sniHostname) > 0 {
+		sni = sniHostname[0]
+	}
 	if useCache {
-		key = fmt.Sprintf("global:%d:%v:%s", port, timeout, proxyAddr)
+		key = fmt.Sprintf("global:%d:%v:%s:%s", port, timeout, proxyAddr, sni)
 		if v, ok := clientPool.Load(key); ok {
 			return v.(*http.Client)
 		}
@@ -472,7 +491,7 @@ func makeHTTPClient(ip string, port int, timeout time.Duration, proxyAddr string
 	}
 	// Only skip TLS verification for direct Cloudflare IP connections (no valid cert for raw IP).
 	if ip != "" {
-		tr.TLSClientConfig = sharedTLSConfig
+		tr.TLSClientConfig = makeTLSConfig(sni)
 	}
 
 	var localProxyDialer proxy.Dialer
