@@ -42,7 +42,7 @@ func DefaultConfig() Config {
 		DLConc:         1,
 		DownloadNum:    20,
 		Duration:       20,
-		StopThreshold:  15.0,
+		StopThreshold:  30.0,
 		Unique:         false,
 		Output:         "result_colo.csv",
 		ScanConcurrent: 200,
