@@ -25,6 +25,8 @@ var CloudflareIPv4Ranges = []string{
 	"141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
 	"197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
 	"104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+	// High-performance Cloudflare subnets (DNS, Pages, Workers, WARP)
+	"162.159.36.0/22", "162.159.44.0/24", "162.159.192.0/24", "162.159.193.0/24",
 }
 
 type cidrInfo struct {
@@ -356,6 +358,22 @@ func MeasureLoadLatency(ip string, port int) float64 {
 	return s / float64(len(lats))
 }
 
+func getRangeHostCount(r string) int64 {
+	if !strings.Contains(r, "/") {
+		return 1
+	}
+	_, ipNet, err := net.ParseCIDR(r)
+	if err != nil {
+		return 1
+	}
+	ones, bits := ipNet.Mask.Size()
+	hostBits := bits - ones
+	if hostBits < 0 || hostBits > 32 {
+		return 1
+	}
+	return int64(1) << uint(hostBits)
+}
+
 func GenerateIPs(maxScan int, unique bool, ipFile string) []string {
 	if maxScan <= 0 {
 		return nil
@@ -377,6 +395,14 @@ func GenerateIPs(maxScan int, unique bool, ipFile string) []string {
 		}
 	}
 
+	var totalHosts int64
+	rangeHosts := make([]int64, len(ranges))
+	for i, r := range ranges {
+		h := getRangeHostCount(r)
+		rangeHosts[i] = h
+		totalHosts += h
+	}
+
 	var ips []string
 	if unique {
 		seen := make(map[string]bool)
@@ -384,7 +410,24 @@ func GenerateIPs(maxScan int, unique bool, ipFile string) []string {
 		maxAttempts := maxScan * 5
 		for len(ips) < maxScan && attempts < maxAttempts {
 			attempts++
-			r := ranges[rand.Intn(len(ranges))]
+			var r string
+			if totalHosts <= 0 {
+				r = ranges[rand.Intn(len(ranges))]
+			} else {
+				val := int64(rand.Float64() * float64(totalHosts))
+				var runningSum int64
+				for idx, h := range rangeHosts {
+					runningSum += h
+					if val < runningSum {
+						r = ranges[idx]
+						break
+					}
+				}
+				if r == "" {
+					r = ranges[len(ranges)-1]
+				}
+			}
+
 			if !strings.Contains(r, "/") {
 				if !seen[r] {
 					seen[r] = true
@@ -408,13 +451,17 @@ func GenerateIPs(maxScan int, unique bool, ipFile string) []string {
 		return ips
 	}
 
-	perRange := maxScan/len(ranges) + 3
-	for _, r := range ranges {
+	for i, r := range ranges {
+		hosts := rangeHosts[i]
+		count := int(float64(hosts) / float64(totalHosts) * float64(maxScan))
+		if count < 1 {
+			count = 1
+		}
 		if !strings.Contains(r, "/") {
 			ips = append(ips, r)
 			continue
 		}
-		for i := 0; i < perRange; i++ {
+		for j := 0; j < count; j++ {
 			ip := randIPFromCIDR(r)
 			if ip != "" {
 				ips = append(ips, ip)
