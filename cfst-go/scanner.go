@@ -14,23 +14,23 @@ import (
 )
 
 type Config struct {
-	IPFile         string
-	Port           int
-	MaxScan        int
-	TopN           int     // 从延迟排序候选中取前 N 个用于测速
-	DLConc         int     // 并行下载测试并发数
-	DownloadNum    int
-	Duration       int
-	StopThreshold  float64
-	Unique         bool
-	Output         string
-	ScanConcurrent int
-	WebPort        string
-	WebMode        bool
-	URL            string
-	Skip429        bool
-	Proxy          string
-	QuickDuration  int     // 自定义 URL 时快速筛选测试时长（秒）
+	IPFile          string
+	Port            int
+	MaxScan         int
+	TopN            int
+	DLConc          int
+	DownloadNum     int
+	Duration        int
+	StopThreshold   float64
+	Unique          bool
+	Output          string
+	ScanConcurrent  int
+	WebPort         string
+	WebMode         bool
+	URL             string
+	Skip429         bool
+	QuickDuration   int
+	SkipLoadLatency bool // auto-set for custom URL mode
 }
 
 func DefaultConfig() Config {
@@ -39,7 +39,7 @@ func DefaultConfig() Config {
 		MaxScan:        5000,
 		TopN:           100,
 		DLConc:         3,
-		DownloadNum:    10,
+		DownloadNum:    20,
 		Duration:       15,
 		StopThreshold:  15.0,
 		Unique:         false,
@@ -52,11 +52,11 @@ func DefaultConfig() Config {
 	}
 }
 
-// isCustomURL returns true if the URL is not the default speed.cloudflare.com endpoint.
 func isCustomURL(urlStr string) bool {
 	return !strings.Contains(urlStr, "speed.cloudflare.com/__down")
 }
 
+// ScanPing runs 5 TCP pings per IP and filters by packet loss.
 func ScanPing(ctx context.Context, ips []string, port int, concurrency int, progressCallback func(done, total, valid int)) []NodeResult {
 	var validNodes []NodeResult
 	var mu sync.Mutex
@@ -86,7 +86,6 @@ func ScanPing(ctx context.Context, ips []string, port int, concurrency int, prog
 				return
 			}
 
-			// 5 次 ping 测量延迟和抖动，网络不稳时更客观
 			pingCount := 5
 			lats := make([]float64, 0, 5)
 			for i := 0; i < pingCount; i++ {
@@ -107,17 +106,13 @@ func ScanPing(ctx context.Context, ips []string, port int, concurrency int, prog
 			}
 
 			d := done.Add(1)
-			// 丢包率过滤：5 次 ping 中至少 4 次成功才保留
-			minSuccess := pingCount - 1 // 允许丢 1 包
-			if len(lats) >= minSuccess {
-				// 平均延迟
+			if len(lats) >= pingCount-1 { // allow 1 packet loss
 				var sum float64
 				for _, l := range lats {
 					sum += l
 				}
 				avgLat := sum / float64(len(lats))
 
-				// 抖动（标准差）
 				jitter := 0.0
 				if len(lats) > 1 {
 					var variance float64
@@ -125,13 +120,15 @@ func ScanPing(ctx context.Context, ips []string, port int, concurrency int, prog
 						diff := l - avgLat
 						variance += diff * diff
 					}
-					variance /= float64(len(lats))
-					jitter = math.Sqrt(variance)
+					jitter = math.Sqrt(variance / float64(len(lats)))
 				}
 
 				loss := float64(pingCount-len(lats)) / float64(pingCount)
 				mu.Lock()
-				validNodes = append(validNodes, NodeResult{IP: ip, Port: port, TCPLatency: avgLat, Jitter: jitter, PacketLoss: loss})
+				validNodes = append(validNodes, NodeResult{
+					IP: ip, Port: port,
+					TCPLatency: avgLat, Jitter: jitter, PacketLoss: loss,
+				})
 				mu.Unlock()
 				validCount.Add(1)
 			}
@@ -144,8 +141,52 @@ func ScanPing(ctx context.Context, ips []string, port int, concurrency int, prog
 	return validNodes
 }
 
-// detectColoBatch 并发检测所有候选节点的 Colo，按 Colo 分组返回最优组
-func detectColoBatch(ctx context.Context, candidates []NodeResult, port int, concurrency int, proxyAddr string, progressCallback func(done, total int)) (bestColo string, coloGroups map[string][]NodeResult) {
+// avgLatency returns the average TCPLatency of a node slice.
+func avgLatency(nodes []NodeResult) float64 {
+	if len(nodes) == 0 {
+		return math.MaxFloat64
+	}
+	var sum float64
+	for _, n := range nodes {
+		sum += n.TCPLatency
+	}
+	return sum / float64(len(nodes))
+}
+
+// selectBestColo picks the Colo with the LOWEST average TCP latency.
+// This is the correct criterion — not node count.
+func selectBestColo(coloGroups map[string][]NodeResult) string {
+	const minNodes = 3
+	best := ""
+	bestLat := math.MaxFloat64
+
+	// First pass: colos with enough nodes for statistical confidence
+	for colo, nodes := range coloGroups {
+		if len(nodes) < minNodes {
+			continue
+		}
+		if avg := avgLatency(nodes); avg < bestLat {
+			bestLat = avg
+			best = colo
+		}
+	}
+	// Fallback: any colo
+	if best == "" {
+		for colo, nodes := range coloGroups {
+			if avg := avgLatency(nodes); avg < bestLat {
+				bestLat = avg
+				best = colo
+			}
+		}
+	}
+	return best
+}
+
+// detectColoBatch concurrently queries the Colo for each candidate.
+// Returns the best Colo (by lowest avg latency) and the full coloGroups map.
+func detectColoBatch(ctx context.Context, candidates []NodeResult, port int, concurrency int,
+	progressCallback func(done, total int)) (bestColo string, coloGroups map[string][]NodeResult) {
+
 	var wg sync.WaitGroup
 	var done atomic.Int32
 	total := len(candidates)
@@ -162,14 +203,13 @@ func detectColoBatch(ctx context.Context, candidates []NodeResult, port int, con
 			wg.Done()
 			continue
 		}
-
 		go func(idx int) {
 			defer wg.Done()
 			defer func() { <-sem }()
 			if ctx.Err() != nil {
 				return
 			}
-			candidates[idx].Colo = GetColo(candidates[idx].IP, port, proxyAddr)
+			candidates[idx].Colo = GetColo(candidates[idx].IP, port)
 			d := done.Add(1)
 			if progressCallback != nil && (d%20 == 0 || d == int32(total)) {
 				progressCallback(int(d), total)
@@ -178,7 +218,6 @@ func detectColoBatch(ctx context.Context, candidates []NodeResult, port int, con
 	}
 	wg.Wait()
 
-	// 按 Colo 分组，选择节点数最多的 Colo
 	coloGroups = make(map[string][]NodeResult)
 	for _, c := range candidates {
 		if c.Colo != "ERR" && c.Colo != "UNK" && c.Colo != "" {
@@ -186,19 +225,12 @@ func detectColoBatch(ctx context.Context, candidates []NodeResult, port int, con
 		}
 	}
 
-	bestColo = ""
-	bestCount := 0
-	for colo, nodes := range coloGroups {
-		if len(nodes) > bestCount {
-			bestCount = len(nodes)
-			bestColo = colo
-		}
-	}
+	bestColo = selectBestColo(coloGroups)
 	return bestColo, coloGroups
 }
 
-// runQuickFilter 快速下载筛选：对所有候选 IP 做短时下载测试，按速度排序取 TopN
-// 用于自定义 URL 场景，替代延迟 TopN 筛选
+// runQuickFilter runs short download tests against cfg.URL to rank candidates by speed.
+// Used as a pre-filter in custom URL mode instead of Colo detection.
 func runQuickFilter(ctx context.Context, candidates []NodeResult, cfg Config, topN int,
 	progressCallback func(done, total int)) []NodeResult {
 
@@ -211,7 +243,6 @@ func runQuickFilter(ctx context.Context, candidates []NodeResult, cfg Config, to
 		idx   int
 		speed float64
 	}
-
 	results := make([]quickResult, len(candidates))
 	var doneCount atomic.Int32
 
@@ -227,25 +258,20 @@ func runQuickFilter(ctx context.Context, candidates []NodeResult, cfg Config, to
 		go func(idx int, ip string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-
-			speed, _, _ := SingleStreamTest(ctx, ip, cfg.Port, cfg.QuickDuration, cfg.URL, cfg.Proxy, nil)
+			speed, _, _ := SingleStreamTest(ctx, ip, cfg.Port, cfg.QuickDuration, cfg.URL, nil)
 			results[idx] = quickResult{idx: idx, speed: speed}
-
 			d := doneCount.Add(1)
 			if progressCallback != nil {
 				progressCallback(int(d), len(candidates))
 			}
 		}(i, cand.IP)
 	}
-
 	wg.Wait()
 
-	// 按速度降序排序
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].speed > results[j].speed
 	})
 
-	// 取 TopN 有速度的候选
 	var filtered []NodeResult
 	for _, r := range results {
 		if r.speed <= 0 {
@@ -259,7 +285,7 @@ func runQuickFilter(ctx context.Context, candidates []NodeResult, cfg Config, to
 	return filtered
 }
 
-// runParallelDownloadTest 并行下载测试，多个 worker 同时测速
+// runParallelDownloadTest runs the full download test on candidates.
 func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg Config,
 	progressRow func(res NodeResult),
 	progressStatus func(msg string),
@@ -285,14 +311,12 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 	var doneOnce sync.Once
 	closeDone := func() { doneOnce.Do(func() { close(doneCh) }) }
 
-	// 收集结果的 goroutine
 	go func() {
 		for res := range resultCh {
 			mu.Lock()
 			results = append(results, res)
 			n := len(results)
 			mu.Unlock()
-
 			if progressRow != nil {
 				progressRow(res)
 			}
@@ -304,7 +328,6 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 		closeDone()
 	}()
 
-	// 启动 workers
 	var wg sync.WaitGroup
 	var nextIdx atomic.Int32
 	for w := 0; w < numWorkers; w++ {
@@ -314,7 +337,6 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 			workerCooldownMs := 500
 
 			for {
-				// 检查是否已收集够结果
 				select {
 				case <-doneCh:
 					return
@@ -323,14 +345,12 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 				default:
 				}
 
-				// 获取下一个候选 IP
 				idx := int(nextIdx.Add(1) - 1)
 				if idx >= len(candidates) {
 					return
 				}
 				cand := candidates[idx]
 
-				// worker 间冷却
 				if workerCooldownMs > 0 && idx > 0 {
 					select {
 					case <-time.After(time.Duration(workerCooldownMs) * time.Millisecond):
@@ -341,18 +361,17 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 					}
 				}
 
-				// 检查 fast-exit
 				if fastCount.Load() >= 5 {
 					return
 				}
 
 				t := totalTested.Add(1)
-				msg := fmt.Sprintf("Testing [%d/%d] %s (Skipped: %d)", t, len(candidates), cand.IP, int(totalSkipped.Load()))
 				if progressStatus != nil {
-					progressStatus(msg)
+					progressStatus(fmt.Sprintf("Testing [%d/%d] %s (Skipped: %d)",
+						t, len(candidates), cand.IP, int(totalSkipped.Load())))
 				}
 
-				speed, minSpd, stab := SingleStreamTest(ctx, cand.IP, cfg.Port, cfg.Duration, cfg.URL, cfg.Proxy, progressLive)
+				speed, minSpd, stab := SingleStreamTest(ctx, cand.IP, cfg.Port, cfg.Duration, cfg.URL, progressLive)
 
 				if speed == 0 && minSpd == 0 && stab == 0 {
 					totalSkipped.Add(1)
@@ -370,9 +389,10 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 					}
 				} else {
 					workerCooldownMs = 500
-
-					cand.Colo = GetColo(cand.IP, cfg.Port, cfg.Proxy)
-					cand.LoadLatency = MeasureLoadLatency(cand.IP, cfg.Port, cfg.Proxy)
+					cand.Colo = GetColo(cand.IP, cfg.Port)
+					if !cfg.SkipLoadLatency {
+						cand.LoadLatency = MeasureLoadLatency(cand.IP, cfg.Port)
+					}
 					cand.DownloadSpeed = speed
 					cand.SingleSpeed = speed
 					cand.MinSpeed = minSpd
@@ -409,7 +429,7 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 }
 
 func RunCLI(cfg Config) {
-	fmt.Printf("Cloudflare SpeedTest v1.7.7 (Go Edition)\n\n")
+	fmt.Printf("Cloudflare SpeedTest v1.8.0 (Go Edition)\n\n")
 
 	ips := GenerateIPs(cfg.MaxScan, cfg.Unique, cfg.IPFile)
 	fmt.Printf("🔍 Scanning %d IPs (concurrency: %d)...\n", len(ips), cfg.ScanConcurrent)
@@ -422,7 +442,7 @@ func RunCLI(cfg Config) {
 	fmt.Println()
 
 	if len(validNodes) == 0 {
-		fmt.Println("[!] No valid IPs found. Please check your network or routing.")
+		fmt.Println("[!] No valid IPs found.")
 		return
 	}
 
@@ -432,27 +452,72 @@ func RunCLI(cfg Config) {
 
 	candidates := validNodes
 
-	// 自定义 URL 时：跳过 TopN，全部测试（延迟不等于到 VPS 的下载速度）
-	// 默认 speed.cloudflare.com 时：用延迟 TopN 筛选（延迟是好的代理指标）
 	if isCustomURL(cfg.URL) {
-		fmt.Printf("\n⚡ Custom URL mode: testing all %d candidates (no latency filter)\n", len(candidates))
+		// ── Custom URL Mode ──────────────────────────────────────────────
+		// Skip Colo (not relevant). Use speed-based pre-filter against the
+		// actual target URL, then full download test.
+		cfg.SkipLoadLatency = true
+		dlCfg := cfg
+		dlCfg.StopThreshold = 9999.0 // disable fast-exit — we want the best, not first-good
+
+		fmt.Printf("\n⚡ Custom URL mode\n")
+		fmt.Printf("   URL     : %s\n", cfg.URL)
+		fmt.Printf("   Pre-filter: %ds quick test on %d candidates...\n", cfg.QuickDuration, len(candidates))
+		if cfg.DLConc > 1 {
+			fmt.Printf("   Tip: -dlc 1 gives more accurate single-stream results\n")
+		}
+
+		candidates = runQuickFilter(ctx, candidates, cfg, cfg.TopN, func(d, t int) {
+			fmt.Printf("\r  Pre-filter: %d/%d", d, t)
+		})
+		fmt.Printf("\n  → %d candidates qualified\n", len(candidates))
+
+		if len(candidates) == 0 {
+			fmt.Println("[!] No IPs could reach the custom URL. Check URL and connectivity.")
+			return
+		}
+
+		fmt.Printf("\n🚀 Full Download Test (%ds, %d parallel, load-latency skipped)\n", cfg.Duration, cfg.DLConc)
+		fmt.Printf("%-16s %-6s %-9s %-9s %-13s %-12s %-8s %-6s\n",
+			"IP", "Colo", "Latency", "Jitter", "Speed", "MinSpd", "Stable", "Score")
+		fmt.Println("--------------------------------------------------------------------------")
+
+		results := runParallelDownloadTest(ctx, candidates, dlCfg, func(res NodeResult) {
+			if res.Colo != "429" || !cfg.Skip429 {
+				fmt.Printf("\r%-120s\r", "")
+				fmt.Printf("%-16s %-6s %6.1fms  %5.1fms  %6.2f MB/s  %5.2f MB/s  %4.0f%%   %5.1f\n",
+					res.IP, res.Colo, res.TCPLatency, res.Jitter,
+					res.DownloadSpeed, res.MinSpeed, res.Stability, res.Score)
+			}
+		}, nil, func(p LiveProgress) {
+			fmt.Printf("\r  📥 %-16s %6.1f MB  %6.2f MB/s  %4.0f/%ds    ",
+				p.IP, float64(p.Bytes)/1024/1024, p.Speed, p.Elapsed, int(p.Duration))
+		}, nil)
+
+		if len(results) == 0 {
+			fmt.Println("\n[!] All tested IPs failed or were rate-limited.")
+			return
+		}
+		saveCSV(cfg.Output, results)
+		fmt.Printf("\n💾 Saved to: %s\n", cfg.Output)
+
 	} else {
-		// 取延迟最低的 TopN 个候选
+		// ── Default CF URL Mode ──────────────────────────────────────────
+		// Latency TopN → Colo detection (select by LOWEST avg latency) → Download.
 		if len(candidates) > cfg.TopN {
 			candidates = candidates[:cfg.TopN]
 		}
-	}
 
-	// Step 2: Colo 检测
-	{
 		fmt.Printf("\n🔍 Detecting Colo for %d candidates...\n", len(candidates))
-		bestColo, coloGroups := detectColoBatch(ctx, candidates, cfg.Port, cfg.ScanConcurrent, cfg.Proxy, func(done, total int) {
+		bestColo, coloGroups := detectColoBatch(ctx, candidates, cfg.Port, cfg.ScanConcurrent, func(done, total int) {
 			fmt.Printf("\r  Colo detection: %d/%d", done, total)
 		})
 		fmt.Println()
 
 		if bestColo != "" {
-			fmt.Printf("  Best Colo: %s (%d nodes)\n", bestColo, len(coloGroups[bestColo]))
+			fmt.Printf("  Best Colo (lowest latency): %s — %d nodes, avg %.1fms\n",
+				bestColo, len(coloGroups[bestColo]), avgLatency(coloGroups[bestColo]))
+
 			type coloStat struct {
 				name  string
 				count int
@@ -460,13 +525,9 @@ func RunCLI(cfg Config) {
 			}
 			var stats []coloStat
 			for colo, nodes := range coloGroups {
-				var sum float64
-				for _, n := range nodes {
-					sum += n.TCPLatency
-				}
-				stats = append(stats, coloStat{colo, len(nodes), sum / float64(len(nodes))})
+				stats = append(stats, coloStat{colo, len(nodes), avgLatency(nodes)})
 			}
-			sort.Slice(stats, func(i, j int) bool { return stats[i].count > stats[j].count })
+			sort.Slice(stats, func(i, j int) bool { return stats[i].avgMs < stats[j].avgMs })
 			for _, s := range stats {
 				marker := "  "
 				if s.name == bestColo {
@@ -478,32 +539,34 @@ func RunCLI(cfg Config) {
 		} else {
 			fmt.Println("  [!] No valid Colo detected, testing all candidates")
 		}
-	}
 
-	// Step 3: 并行下载测试
-	fmt.Printf("\n🚀 Download Test (%ds duration, %d parallel)\n", cfg.Duration, cfg.DLConc)
-	fmt.Printf("%-16s %-6s %-8s %-8s %-14s %-12s %-8s %-8s %-6s\n", "IP", "Colo", "Latency", "Jitter", "Speed", "MinSpd", "LoadLat", "Stable", "Score")
-	fmt.Println("------------------------------------------------------------------------------------")
+		fmt.Printf("\n🚀 Download Test (%ds duration, %d parallel)\n", cfg.Duration, cfg.DLConc)
+		fmt.Printf("%-16s %-6s %-9s %-9s %-13s %-12s %-9s %-8s %-6s\n",
+			"IP", "Colo", "Latency", "Jitter", "Speed", "MinSpd", "LoadLat", "Stable", "Score")
+		fmt.Println("-------------------------------------------------------------------------------------------")
 
-	results := runParallelDownloadTest(ctx, candidates, cfg, func(res NodeResult) {
-		if res.Colo != "429" || !cfg.Skip429 {
-			fmt.Printf("\r%-120s\r", "") // 清除实时进度行
-			fmt.Printf("%-16s %-6s %5.1fms  %5.1fms  %6.2f MB/s  %5.2f MB/s  %5.1fms  %4.0f%%   %5.1f\n", res.IP, res.Colo, res.TCPLatency, res.Jitter, res.DownloadSpeed, res.MinSpeed, res.LoadLatency, res.Stability, res.Score)
+		results := runParallelDownloadTest(ctx, candidates, cfg, func(res NodeResult) {
+			if res.Colo != "429" || !cfg.Skip429 {
+				fmt.Printf("\r%-130s\r", "")
+				fmt.Printf("%-16s %-6s %6.1fms  %5.1fms  %6.2f MB/s  %5.2f MB/s  %6.1fms  %4.0f%%   %5.1f\n",
+					res.IP, res.Colo, res.TCPLatency, res.Jitter,
+					res.DownloadSpeed, res.MinSpeed, res.LoadLatency, res.Stability, res.Score)
+			}
+		}, nil, func(p LiveProgress) {
+			fmt.Printf("\r  📥 %-16s %6.1f MB  %6.2f MB/s  %4.0f/%ds    ",
+				p.IP, float64(p.Bytes)/1024/1024, p.Speed, p.Elapsed, int(p.Duration))
+		}, func() {
+			fmt.Println("\n⚡ Fast-exit triggered.")
+		})
+
+		if len(results) == 0 {
+			fmt.Println("\n[!] All tested IPs were rate-limited (429/403).")
+			fmt.Println("[!] Wait a moment or use -skip429=false to see them.")
+			return
 		}
-	}, nil, func(p LiveProgress) {
-		fmt.Printf("\r  📥 %-16s %6.1f MB  %6.2f MB/s  %4.0f/%ds    ", p.IP, float64(p.Bytes)/1024.0/1024.0, p.Speed, p.Elapsed, int(p.Duration))
-	}, func() {
-		fmt.Println("\n⚡ Fast-exit triggered.")
-	})
-
-	if len(results) == 0 {
-		fmt.Println("\n[!] All tested IPs were rate-limited (429/403) by Cloudflare or encountered errors.")
-		fmt.Println("[!] Please take a break to let CF clear your IP's rate limit, or use -skip429=false to view skipped IPs.")
-		return
+		saveCSV(cfg.Output, results)
+		fmt.Printf("\n💾 Saved to: %s\n", cfg.Output)
 	}
-
-	saveCSV(cfg.Output, results)
-	fmt.Printf("\n💾 Saved to: %s\n", cfg.Output)
 }
 
 func saveCSV(path string, results []NodeResult) {
@@ -514,16 +577,14 @@ func saveCSV(path string, results []NodeResult) {
 	}
 	defer f.Close()
 
-	// UTF-8 BOM
-	f.Write([]byte{0xEF, 0xBB, 0xBF})
+	f.Write([]byte{0xEF, 0xBB, 0xBF}) // UTF-8 BOM
 	w := csv.NewWriter(f)
 	defer w.Flush()
 
 	w.Write([]string{"IP", "Colo", "Latency", "Jitter", "SgSpeed_MB", "Speed_MB", "MinSpeed_MB", "LoadLatency", "Stability", "Score"})
 	for _, r := range results {
 		w.Write([]string{
-			r.IP,
-			r.Colo,
+			r.IP, r.Colo,
 			fmt.Sprintf("%.1f", r.TCPLatency),
 			fmt.Sprintf("%.1f", r.Jitter),
 			fmt.Sprintf("%.2f", r.SingleSpeed),

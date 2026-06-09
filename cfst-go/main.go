@@ -15,15 +15,14 @@ func main() {
 	flag.IntVar(&cfg.DLConc, "dlc", cfg.DLConc, "Parallel download test concurrency")
 	flag.IntVar(&cfg.DownloadNum, "dn", cfg.DownloadNum, "Download test count")
 	flag.IntVar(&cfg.Duration, "dt", cfg.Duration, "Download duration (seconds)")
-	flag.Float64Var(&cfg.StopThreshold, "st", cfg.StopThreshold, "Stop threshold MB/s")
+	flag.Float64Var(&cfg.StopThreshold, "st", cfg.StopThreshold, "Stop threshold MB/s (CF URL mode only)")
 	flag.BoolVar(&cfg.Unique, "u", cfg.Unique, "Unique C-subnet")
 	flag.StringVar(&cfg.IPFile, "f", cfg.IPFile, "Custom IP file")
 	flag.StringVar(&cfg.Output, "o", cfg.Output, "Output file")
 	flag.IntVar(&cfg.ScanConcurrent, "sc", cfg.ScanConcurrent, "Scan concurrency")
-	flag.BoolVar(&cfg.Skip429, "skip429", cfg.Skip429, "Discard 429 rate-limited IPs silently and find replacements")
-	flag.StringVar(&cfg.URL, "url", cfg.URL, "Custom download test URL (bypass 429 block)")
-	flag.IntVar(&cfg.QuickDuration, "qd", cfg.QuickDuration, "Quick filter duration in seconds (custom URL only)")
-	flag.StringVar(&cfg.Proxy, "proxy", "", "Proxy address (socks5://127.0.0.1:1080 or http://127.0.0.1:1080)")
+	flag.BoolVar(&cfg.Skip429, "skip429", cfg.Skip429, "Discard 429 rate-limited IPs silently")
+	flag.StringVar(&cfg.URL, "url", cfg.URL, "Custom download test URL")
+	flag.IntVar(&cfg.QuickDuration, "qd", cfg.QuickDuration, "Quick pre-filter duration in seconds (custom URL mode)")
 
 	webMode := false
 	webPort := "9876"

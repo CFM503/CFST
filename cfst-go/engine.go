@@ -18,8 +18,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"golang.org/x/net/proxy"
 )
 
 var CloudflareIPv4Ranges = []string{
@@ -30,12 +28,12 @@ var CloudflareIPv4Ranges = []string{
 }
 
 type cidrInfo struct {
-	baseIP    uint32
-	maxHost   int
-	hostBits  int
+	baseIP   uint32
+	maxHost  int
+	hostBits int
 }
 
-var cidrCache sync.Map // map[string]*cidrInfo
+var cidrCache sync.Map
 
 func parseCIDRCached(cidr string) *cidrInfo {
 	if v, ok := cidrCache.Load(cidr); ok {
@@ -68,33 +66,33 @@ type NodeResult struct {
 	Jitter        float64 `json:"jitter"`
 	Stability     float64 `json:"stability"`
 	MinSpeed      float64 `json:"min_speed"`
-	PacketLoss    float64 `json:"packet_loss"` // 丢包率 0.0~1.0
+	PacketLoss    float64 `json:"packet_loss"`
 }
 
 func (n *NodeResult) CalcScore() {
-	// Speed score (35%): Use single-stream speed, cap 15 MB/s (120 Mbps, enough for 4K)
+	// Speed score (35%): single-stream speed, cap 15 MB/s
 	effectiveSpeed := n.DownloadSpeed
 	if n.SingleSpeed > 0 {
 		effectiveSpeed = n.SingleSpeed
 	}
 	scoreSpeed := math.Min(effectiveSpeed/15.0*100.0, 100.0)
 
-	// MinSpeed score (20%): Floor speed determines buffering, cap 10 MB/s (80 Mbps)
+	// MinSpeed score (20%): floor speed, cap 10 MB/s
 	scoreMinSpeed := math.Min(n.MinSpeed/10.0*100.0, 100.0)
 
-	// Latency score (10%): Lower is better
+	// Latency score (10%): lower is better
 	scoreLatency := 100.0 - (n.TCPLatency-30.0)*0.5
 	if scoreLatency < 0 {
 		scoreLatency = 0
 	}
 
-	// Jitter score (10%): Lower is better, >10ms starts penalizing
+	// Jitter score (10%): >10ms starts penalizing
 	scoreJitter := 100.0 - n.Jitter*2.0
 	if scoreJitter < 0 {
 		scoreJitter = 0
 	}
 
-	// Stability score (25%): Already 0-100
+	// Stability score (25%)
 	scoreStability := n.Stability
 
 	n.Score = scoreSpeed*0.35 + scoreMinSpeed*0.20 + scoreLatency*0.10 +
@@ -122,22 +120,23 @@ func randIPFromCIDR(cidr string) string {
 	return net.IP(buf[:]).String()
 }
 
-// SingleStreamTest measures single-connection download speed with configurable duration (most realistic for streaming).
-// Returns avgSpeed (MB/s), minSpeed (MB/s), and stability (0-100).
-func SingleStreamTest(ctx context.Context, ip string, port int, duration int, testURL string, proxyAddr string,
+// SingleStreamTest measures single-connection download speed.
+// Returns avgSpeed (MB/s), minSpeed (MB/s), stability (0-100).
+func SingleStreamTest(ctx context.Context, ip string, port int, duration int, testURL string,
 	progressCallback func(LiveProgress)) (avgSpeed, minSpeed, stability float64) {
+
 	parsedURL, err := url.Parse(testURL)
 	if err != nil {
 		return 0, 0, 0
 	}
 	host := parsedURL.Hostname()
 
-	// 设置 TLS SNI 为实际域名，让 Cloudflare 正确路由
+	// Set SNI to the actual domain so CF routes correctly
 	sni := host
 	if strings.Contains(testURL, "speed.cloudflare.com") {
-		sni = "" // speed.cloudflare.com 用默认即可
+		sni = ""
 	}
-	client := makeHTTPClient(ip, port, 0, proxyAddr, sni)
+	client := makeHTTPClient(ip, port, sni)
 	if tr, ok := client.Transport.(*http.Transport); ok {
 		defer tr.CloseIdleConnections()
 	}
@@ -153,7 +152,6 @@ func SingleStreamTest(ctx context.Context, ip string, port int, duration int, te
 	req.Host = host
 	req.Header.Set("Connection", "keep-alive")
 
-	// 自定义 URL 时，用正确的域名构造 Referer/Origin，避免触发 Cloudflare bot 检测
 	if !strings.Contains(testURL, "speed.cloudflare.com") {
 		scheme := parsedURL.Scheme
 		if scheme == "" {
@@ -270,7 +268,6 @@ func SingleStreamTest(ctx context.Context, ip string, port int, duration int, te
 		sum += s
 	}
 
-	// Stability = 100 - CV*100 (coefficient of variation = stddev/mean)
 	mean := sum / float64(len(intervalSpeeds))
 	if mean < 0.01 {
 		return avgSpeed, minSpeed, 0.0
@@ -294,8 +291,9 @@ func SingleStreamTest(ctx context.Context, ip string, port int, duration int, te
 	return avgSpeed, minSpeed, stability
 }
 
-// MeasureLoadLatency measures TCP latency while download is in progress (catches bufferbloat)
-func MeasureLoadLatency(ip string, port int, proxyAddr string) float64 {
+// MeasureLoadLatency measures TCP latency while a download is saturating the connection.
+// Uses speed.cloudflare.com as the load source (only relevant for CF URL mode).
+func MeasureLoadLatency(ip string, port int) float64 {
 	testURL := "https://speed.cloudflare.com/__down?bytes=10000000"
 	parsedURL, _ := url.Parse(testURL)
 	host := parsedURL.Hostname()
@@ -303,9 +301,8 @@ func MeasureLoadLatency(ip string, port int, proxyAddr string) float64 {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 
-	// Create a dedicated client and transport for the background download
 	tr := &http.Transport{
-		TLSClientConfig:    sharedTLSConfig,
+		TLSClientConfig:     sharedTLSConfig,
 		MaxIdleConnsPerHost: 10,
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			addr := net.JoinHostPort(ip, strconv.Itoa(port))
@@ -321,7 +318,6 @@ func MeasureLoadLatency(ip string, port int, proxyAddr string) float64 {
 	}
 	req.Host = host
 
-	// Start background download to load the connection
 	go func() {
 		resp, err := client.Do(req)
 		if err == nil {
@@ -337,10 +333,8 @@ func MeasureLoadLatency(ip string, port int, proxyAddr string) float64 {
 		}
 	}()
 
-	// Wait for download to saturate the connection
 	time.Sleep(500 * time.Millisecond)
 
-	// Measure latency under load: 3 pings
 	var lats []float64
 	for i := 0; i < 3; i++ {
 		lat := TCPPing(ip, port, 2*time.Second)
@@ -355,11 +349,11 @@ func MeasureLoadLatency(ip string, port int, proxyAddr string) float64 {
 	if len(lats) == 0 {
 		return 0
 	}
-	var sum float64
+	var s float64
 	for _, l := range lats {
-		sum += l
+		s += l
 	}
-	return sum / float64(len(lats))
+	return s / float64(len(lats))
 }
 
 func GenerateIPs(maxScan int, unique bool, ipFile string) []string {
@@ -448,20 +442,19 @@ var coloRe = regexp.MustCompile(`colo=([A-Z]+)`)
 
 var sharedTLSConfig = &tls.Config{InsecureSkipVerify: true}
 
-func makeTLSConfig(sniHostname string) *tls.Config {
-	if sniHostname == "" {
+func makeTLSConfig(sni string) *tls.Config {
+	if sni == "" {
 		return sharedTLSConfig
 	}
 	return &tls.Config{
 		InsecureSkipVerify: true,
-		ServerName:         sniHostname,
+		ServerName:         sni,
 	}
 }
-var clientPool sync.Map // map[string]*http.Client
 
 var downloadBufPool = sync.Pool{
 	New: func() interface{} {
-		b := make([]byte, 262144) // 256KB buffer for better throughput
+		b := make([]byte, 262144) // 256KB
 		return &b
 	},
 }
@@ -472,84 +465,17 @@ func init() {
 	}
 }
 
-func makeHTTPClient(ip string, port int, timeout time.Duration, proxyAddr string, sniHostname ...string) *http.Client {
-	var key string
-	var useCache = (ip == "")
-	sni := ""
-	if len(sniHostname) > 0 {
-		sni = sniHostname[0]
-	}
-	if useCache {
-		key = fmt.Sprintf("global:%d:%v:%s:%s", port, timeout, proxyAddr, sni)
-		if v, ok := clientPool.Load(key); ok {
-			return v.(*http.Client)
-		}
-	}
-
+// makeHTTPClient creates an HTTP client that force-dials to the specified CF IP.
+func makeHTTPClient(ip string, port int, sni string) *http.Client {
+	addr := net.JoinHostPort(ip, strconv.Itoa(port))
 	tr := &http.Transport{
-		MaxIdleConnsPerHost: 10,
+		TLSClientConfig:     makeTLSConfig(sni),
+		MaxIdleConnsPerHost: 4,
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return net.DialTimeout("tcp", addr, 3*time.Second)
+		},
 	}
-	// Only skip TLS verification for direct Cloudflare IP connections (no valid cert for raw IP).
-	if ip != "" {
-		tr.TLSClientConfig = makeTLSConfig(sni)
-	}
-
-	var localProxyDialer proxy.Dialer
-	var localProxyURL *url.URL
-	if proxyAddr != "" {
-		pAddr := proxyAddr
-		if !strings.Contains(pAddr, "://") {
-			pAddr = "socks5://" + pAddr
-		}
-		if u, err := url.Parse(pAddr); err == nil {
-			switch u.Scheme {
-			case "socks5", "socks5h":
-				if dialer, err := proxy.FromURL(u, proxy.Direct); err == nil {
-					localProxyDialer = dialer
-				}
-			case "http", "https":
-				localProxyURL = u
-			}
-		}
-	}
-
-	if ip != "" {
-		// 强制拨号到指定 IP（用于测速特定节点）
-		addr := net.JoinHostPort(ip, strconv.Itoa(port))
-		if localProxyDialer != nil {
-			tr.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
-				return localProxyDialer.Dial(network, addr)
-			}
-		} else if localProxyURL != nil {
-			tr.Proxy = http.ProxyURL(localProxyURL)
-			tr.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
-				return net.DialTimeout("tcp", addr, 2*time.Second)
-			}
-		} else {
-			tr.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
-				return net.DialTimeout("tcp", addr, 2*time.Second)
-			}
-		}
-	} else {
-		// 普通请求（非指定 IP），通过代理但使用正常 DNS
-		if localProxyDialer != nil {
-			tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return localProxyDialer.Dial(network, addr)
-			}
-		} else if localProxyURL != nil {
-			tr.Proxy = http.ProxyURL(localProxyURL)
-		}
-	}
-
-	client := &http.Client{
-		Transport: tr,
-		Timeout:   timeout,
-	}
-
-	if useCache {
-		clientPool.Store(key, client)
-	}
-	return client
+	return &http.Client{Transport: tr}
 }
 
 func setCFHeaders(req *http.Request) {
@@ -570,8 +496,8 @@ func setCFHeadersForURL(req *http.Request, baseURL string) {
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 }
 
-func newCFRequest(method, url string) (*http.Request, error) {
-	req, err := http.NewRequest(method, url, nil)
+func newCFRequest(method, urlStr string) (*http.Request, error) {
+	req, err := http.NewRequest(method, urlStr, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -579,8 +505,8 @@ func newCFRequest(method, url string) (*http.Request, error) {
 	return req, nil
 }
 
-func newCFRequestWithContext(ctx context.Context, method, url string) (*http.Request, error) {
-	req, err := http.NewRequestWithContext(ctx, method, url, nil)
+func newCFRequestWithContext(ctx context.Context, method, urlStr string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, urlStr, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -588,11 +514,13 @@ func newCFRequestWithContext(ctx context.Context, method, url string) (*http.Req
 	return req, nil
 }
 
-func GetColo(ip string, port int, proxyAddr string) string {
-	client := makeHTTPClient(ip, port, 3*time.Second, proxyAddr)
+func GetColo(ip string, port int) string {
+	client := makeHTTPClient(ip, port, "")
 	if tr, ok := client.Transport.(*http.Transport); ok {
 		defer tr.CloseIdleConnections()
 	}
+	client.Timeout = 4 * time.Second
+
 	req, err := newCFRequest("GET", "https://speed.cloudflare.com/cdn-cgi/trace")
 	if err != nil {
 		return "ERR"
@@ -604,7 +532,6 @@ func GetColo(ip string, port int, proxyAddr string) string {
 	}
 	defer resp.Body.Close()
 
-	// Read full body — trace endpoint is tiny (~300 bytes), single read is faster than line-by-line
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "UNK"
@@ -615,7 +542,7 @@ func GetColo(ip string, port int, proxyAddr string) string {
 	return "UNK"
 }
 
-// LiveProgress 实时下载进度
+// LiveProgress holds real-time download progress for a single IP.
 type LiveProgress struct {
 	IP       string  `json:"ip"`
 	Bytes    int64   `json:"bytes"`
@@ -623,4 +550,3 @@ type LiveProgress struct {
 	Elapsed  float64 `json:"elapsed"`
 	Duration float64 `json:"duration"`
 }
-

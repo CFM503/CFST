@@ -329,7 +329,7 @@
                     <label
                         style="display: block; font-size: 0.85rem; color: var(--text-dim); margin-bottom: 0.4rem;">Download
                         Count</label>
-                    <input type="number" id="inpDn" value="10"
+                    <input type="number" id="inpDn" value="20"
                         style="width: 100%; padding: 0.6rem; border-radius: 8px; border: 1px solid var(--border); background: rgba(0,0,0,0.2); color: white; box-sizing: border-box; font-family: inherit;">
                 </div>
                 <div>
@@ -340,19 +340,19 @@
                         style="width: 100%; padding: 0.6rem; border-radius: 8px; border: 1px solid var(--border); background: rgba(0,0,0,0.2); color: white; box-sizing: border-box; font-family: inherit;">
                 </div>
                 <div
-                    style="grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 0.5rem; align-items: flex-end;">
+                    style="grid-column: 1 / -1; display: grid; grid-template-columns: 1fr auto; gap: 1rem; margin-top: 0.5rem; align-items: flex-end;">
                     <div>
                         <label
-                            style="display: block; font-size: 0.85rem; color: var(--text-dim); margin-bottom: 0.4rem;">Custom
-                            Download URL</label>
+                            style="display: block; font-size: 0.85rem; color: var(--text-dim); margin-bottom: 0.4rem;">Download URL
+                            <span style="color:#64748b;font-size:0.78rem;"> — custom URL activates speed pre-filter mode</span></label>
                         <input type="text" id="inpUrl" value="https://speed.cloudflare.com/__down?bytes=500000000"
                             style="width: 100%; padding: 0.6rem; border-radius: 8px; border: 1px solid var(--border); background: rgba(0,0,0,0.2); color: white; box-sizing: border-box; font-family: inherit;">
                     </div>
-                    <div>
+                    <div style="min-width:120px;">
                         <label
-                            style="display: block; font-size: 0.85rem; color: var(--text-dim); margin-bottom: 0.4rem;">Proxy
-                            (socks5://127.0.0.1:1080)</label>
-                        <input type="text" id="inpProxy" placeholder="留空=直连"
+                            style="display: block; font-size: 0.85rem; color: var(--text-dim); margin-bottom: 0.4rem;">Quick Filter (s)
+                            <span style="color:#64748b;font-size:0.78rem;">custom URL</span></label>
+                        <input type="number" id="inpQd" value="3"
                             style="width: 100%; padding: 0.6rem; border-radius: 8px; border: 1px solid var(--border); background: rgba(0,0,0,0.2); color: white; box-sizing: border-box; font-family: inherit;">
                     </div>
                 </div>
@@ -452,8 +452,8 @@
                 dlc: document.getElementById('inpDLC').value,
                 dt: document.getElementById('inpDt').value,
                 url: document.getElementById('inpUrl').value,
-                skip429: document.getElementById('inpSkip429').checked ? 'true' : 'false',
-                proxy: document.getElementById('inpProxy').value
+                qd: document.getElementById('inpQd').value,
+                skip429: document.getElementById('inpSkip429').checked ? 'true' : 'false'
             });
 
             const evtSource = new EventSource('/api/test?' + params.toString());

@@ -67,9 +67,6 @@ func RunWeb(cfg Config) {
 		if s := q.Get("skip429"); s != "" {
 			reqCfg.Skip429 = (s == "true")
 		}
-		if p := q.Get("proxy"); p != "" {
-			reqCfg.Proxy = p
-		}
 
 		var sendMu sync.Mutex
 		sendEvent := func(evtType string, data interface{}) {
@@ -82,10 +79,10 @@ func RunWeb(cfg Config) {
 			flusher.Flush()
 		}
 
-		sendEvent("status", "Generating IP Ranges...")
+		sendEvent("status", "Generating IPs...")
 		ips := GenerateIPs(reqCfg.MaxScan, reqCfg.Unique, reqCfg.IPFile)
 
-		sendEvent("status", fmt.Sprintf("Ping Scanning %d IPs...", len(ips)))
+		sendEvent("status", fmt.Sprintf("Ping scanning %d IPs...", len(ips)))
 		validNodes := ScanPing(r.Context(), ips, reqCfg.Port, reqCfg.ScanConcurrent, func(done, total, valid int) {
 			if done%10 == 0 || done == total {
 				sendEvent("progress_scan", map[string]int{"done": done, "total": total, "valid": valid})
@@ -100,55 +97,84 @@ func RunWeb(cfg Config) {
 		sort.Slice(validNodes, func(i, j int) bool {
 			return validNodes[i].TCPLatency < validNodes[j].TCPLatency
 		})
-
 		candidates := validNodes
 
-		// 自定义 URL 时全部测试，否则用延迟 TopN
 		if isCustomURL(reqCfg.URL) {
-			sendEvent("status", fmt.Sprintf("Custom URL mode: testing all %d candidates", len(candidates)))
+			// Custom URL mode: speed pre-filter → full test (no Colo step)
+			reqCfg.SkipLoadLatency = true
+			dlCfg := reqCfg
+			dlCfg.StopThreshold = 9999.0 // disable fast-exit
+
+			sendEvent("status", fmt.Sprintf("Custom URL: quick pre-filter (%ds) on %d candidates...", reqCfg.QuickDuration, len(candidates)))
+			candidates = runQuickFilter(r.Context(), candidates, reqCfg, reqCfg.TopN, func(done, total int) {
+				sendEvent("progress_colo", map[string]int{"done": done, "total": total})
+			})
+
+			if len(candidates) == 0 {
+				sendEvent("error", "No IPs could reach the custom URL.")
+				return
+			}
+			sendEvent("status", fmt.Sprintf("%d candidates qualified, running full download test...", len(candidates)))
+
+			results := runParallelDownloadTest(r.Context(), candidates, dlCfg, func(res NodeResult) {
+				if res.Colo != "429" || !reqCfg.Skip429 {
+					sendEvent("progress_download", res)
+				}
+			}, func(msg string) {
+				sendEvent("status", msg)
+			}, func(p LiveProgress) {
+				sendEvent("progress_live", p)
+			}, nil)
+
+			if len(results) == 0 {
+				sendEvent("error", "All tested IPs failed or were rate-limited.")
+				return
+			}
+			sendEvent("status", "Test Complete")
+			sendEvent("complete", results)
+
 		} else {
+			// Default CF URL mode: TopN → Colo (by lowest avg latency) → Download
 			if len(candidates) > reqCfg.TopN {
 				candidates = candidates[:reqCfg.TopN]
 			}
-		}
 
-		// Colo 检测
-		sendEvent("status", fmt.Sprintf("Detecting Colo for %d candidates...", len(candidates)))
-		bestColo, coloGroups := detectColoBatch(r.Context(), candidates, reqCfg.Port, reqCfg.ScanConcurrent, reqCfg.Proxy, func(done, total int) {
-			sendEvent("progress_colo", map[string]int{"done": done, "total": total})
-		})
-		if bestColo != "" {
-			sendEvent("status", fmt.Sprintf("Best Colo: %s (%d nodes), testing...", bestColo, len(coloGroups[bestColo])))
-			candidates = coloGroups[bestColo]
-		} else {
-			sendEvent("status", "No valid Colo detected, testing all candidates...")
-		}
+			sendEvent("status", fmt.Sprintf("Detecting Colo for %d candidates...", len(candidates)))
+			bestColo, coloGroups := detectColoBatch(r.Context(), candidates, reqCfg.Port, reqCfg.ScanConcurrent, func(done, total int) {
+				sendEvent("progress_colo", map[string]int{"done": done, "total": total})
+			})
 
-		sendEvent("status", "Running Download Speed Tests...")
-		results := runParallelDownloadTest(r.Context(), candidates, reqCfg, func(res NodeResult) {
-			if res.Colo != "429" || !reqCfg.Skip429 {
-				sendEvent("progress_download", res)
+			if bestColo != "" {
+				sendEvent("status", fmt.Sprintf("Best Colo: %s (%d nodes, avg %.1fms) — running download test...",
+					bestColo, len(coloGroups[bestColo]), avgLatency(coloGroups[bestColo])))
+				candidates = coloGroups[bestColo]
+			} else {
+				sendEvent("status", "No valid Colo detected, testing all candidates...")
 			}
-		}, func(msg string) {
-			sendEvent("status", msg)
-		}, func(p LiveProgress) {
-			sendEvent("progress_live", p)
-		}, func() {
-			sendEvent("fast_exit", "Target speed threshold reached, stopping early.")
-		})
 
-		if len(results) == 0 {
-			sendEvent("error", "All tested IPs were rate-limited (429/403) by Cloudflare. Please wait or change the URL.")
-			return
+			results := runParallelDownloadTest(r.Context(), candidates, reqCfg, func(res NodeResult) {
+				if res.Colo != "429" || !reqCfg.Skip429 {
+					sendEvent("progress_download", res)
+				}
+			}, func(msg string) {
+				sendEvent("status", msg)
+			}, func(p LiveProgress) {
+				sendEvent("progress_live", p)
+			}, func() {
+				sendEvent("fast_exit", "Speed threshold reached, stopping early.")
+			})
+
+			if len(results) == 0 {
+				sendEvent("error", "All tested IPs were rate-limited (429/403). Please wait and retry.")
+				return
+			}
+			sendEvent("status", "Test Complete")
+			sendEvent("complete", results)
 		}
-
-		sendEvent("status", "Test Complete")
-		sendEvent("complete", results)
 	})
 
 	fmt.Printf("🚀 Web UI started. Open http://localhost%s in your browser\n", cfg.WebPort)
-	err := http.ListenAndServe(cfg.WebPort, nil)
-	if err != nil {
+	if err := http.ListenAndServe(cfg.WebPort, nil); err != nil {
 		fmt.Printf("Web server error: %v\n", err)
 	}
 }
