@@ -124,7 +124,7 @@ func randIPFromCIDR(cidr string) string {
 
 // SingleStreamTest measures single-connection download speed.
 // Returns avgSpeed (MB/s), minSpeed (MB/s), stability (0-100).
-func SingleStreamTest(ctx context.Context, ip string, port int, duration int, testURL string,
+func SingleStreamTest(ctx context.Context, ip string, port int, duration int, testURL string, customSNI string,
 	progressCallback func(LiveProgress)) (avgSpeed, minSpeed, stability float64) {
 
 	parsedURL, err := url.Parse(testURL)
@@ -135,7 +135,9 @@ func SingleStreamTest(ctx context.Context, ip string, port int, duration int, te
 
 	// Set SNI to the actual domain so CF routes correctly
 	sni := host
-	if strings.Contains(testURL, "speed.cloudflare.com") {
+	if customSNI != "" {
+		sni = customSNI
+	} else if strings.Contains(testURL, "speed.cloudflare.com") {
 		sni = ""
 	}
 	client := makeHTTPClient(ip, port, sni)

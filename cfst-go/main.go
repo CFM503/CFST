@@ -24,6 +24,7 @@ func main() {
 	flag.StringVar(&cfg.URL, "url", cfg.URL, "Custom download test URL")
 	flag.IntVar(&cfg.QuickDuration, "qd", cfg.QuickDuration, "Quick pre-filter duration in seconds (custom URL mode)")
 	flag.StringVar(&cfg.FilterMode, "filter", cfg.FilterMode, "Candidate filter mode (speed, multi-colo, none)")
+	flag.StringVar(&cfg.SNI, "sni", cfg.SNI, "Custom TLS SNI (ServerName)")
 
 	webMode := false
 	webPort := "9876"

@@ -32,6 +32,7 @@ type Config struct {
 	QuickDuration   int
 	SkipLoadLatency bool // auto-set for custom URL mode
 	FilterMode      string
+	SNI             string
 }
 
 func DefaultConfig() Config {
@@ -260,7 +261,7 @@ func runQuickFilter(ctx context.Context, candidates []NodeResult, cfg Config, to
 		go func(idx int, ip string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			speed, _, _ := SingleStreamTest(ctx, ip, cfg.Port, cfg.QuickDuration, cfg.URL, nil)
+			speed, _, _ := SingleStreamTest(ctx, ip, cfg.Port, cfg.QuickDuration, cfg.URL, cfg.SNI, nil)
 			results[idx] = quickResult{idx: idx, speed: speed}
 			d := doneCount.Add(1)
 			if progressCallback != nil {
@@ -373,7 +374,7 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 						t, len(candidates), cand.IP, int(totalSkipped.Load())))
 				}
 
-				speed, minSpd, stab := SingleStreamTest(ctx, cand.IP, cfg.Port, cfg.Duration, cfg.URL, progressLive)
+				speed, minSpd, stab := SingleStreamTest(ctx, cand.IP, cfg.Port, cfg.Duration, cfg.URL, cfg.SNI, progressLive)
 
 				if speed == 0 && minSpd == 0 && stab == 0 {
 					totalSkipped.Add(1)
@@ -431,7 +432,7 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 }
 
 func RunCLI(cfg Config) {
-	fmt.Printf("Cloudflare SpeedTest v1.8.3 (Go Edition)\n\n")
+	fmt.Printf("Cloudflare SpeedTest v1.8.4 (Go Edition)\n\n")
 
 	ips := GenerateIPs(cfg.MaxScan, cfg.Unique, cfg.IPFile)
 	fmt.Printf("🔍 Scanning %d IPs (concurrency: %d)...\n", len(ips), cfg.ScanConcurrent)

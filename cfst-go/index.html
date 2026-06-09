@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CFST v1.8.3</title>
+    <title>CFST v1.8.4</title>
     <!-- Google Fonts for modern typography -->
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
@@ -281,7 +281,7 @@
             <div class="header">
                 <div style="display: flex; align-items: baseline; gap: 12px;">
                     <h1>✨ CFST Ultimate</h1>
-                    <span style="color: var(--text-dim); font-size: 1.1rem; font-weight: 600;">v1.8.3</span>
+                    <span style="color: var(--text-dim); font-size: 1.1rem; font-weight: 600;">v1.8.4</span>
                 </div>
                 <button id="startBtn">
                     <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -348,6 +348,12 @@
                         <option value="multi-colo">Multi-Colo</option>
                         <option value="none">No Filter</option>
                     </select>
+                </div>
+                <div>
+                    <label
+                        style="display: block; font-size: 0.85rem; color: var(--text-dim); margin-bottom: 0.4rem;">Custom SNI</label>
+                    <input type="text" id="inpSNI" value="" placeholder="e.g. domain.com"
+                        style="width: 100%; padding: 0.6rem; border-radius: 8px; border: 1px solid var(--border); background: rgba(0,0,0,0.2); color: white; box-sizing: border-box; font-family: inherit; font-size: 0.95rem; height: 38px;">
                 </div>
                 <div
                     style="grid-column: 1 / -1; display: grid; grid-template-columns: 1fr auto; gap: 1rem; margin-top: 0.5rem; align-items: flex-end;">
@@ -464,7 +470,8 @@
                 url: document.getElementById('inpUrl').value,
                 qd: document.getElementById('inpQd').value,
                 skip429: document.getElementById('inpSkip429').checked ? 'true' : 'false',
-                filter: document.getElementById('inpFilter').value
+                filter: document.getElementById('inpFilter').value,
+                sni: document.getElementById('inpSNI').value
             });
 
             const evtSource = new EventSource('/api/test?' + params.toString());

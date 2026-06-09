@@ -70,6 +70,9 @@ func RunWeb(cfg Config) {
 		if f := q.Get("filter"); f != "" {
 			reqCfg.FilterMode = f
 		}
+		if s := q.Get("sni"); s != "" {
+			reqCfg.SNI = s
+		}
 
 		var sendMu sync.Mutex
 		sendEvent := func(evtType string, data interface{}) {
