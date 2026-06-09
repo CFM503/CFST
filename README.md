@@ -1,6 +1,6 @@
 # CFST - Cloudflare & YouTube CDN SpeedTest
 
-> v1.7.0 | Go Edition
+> v1.8.1 | Go Edition
 
 从 Cloudflare 或 YouTube CDN 节点中筛选出**高速、低延迟、高稳定性**的 IP，专为流媒体场景优化。
 

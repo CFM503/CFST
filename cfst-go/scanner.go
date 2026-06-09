@@ -31,16 +31,17 @@ type Config struct {
 	Skip429         bool
 	QuickDuration   int
 	SkipLoadLatency bool // auto-set for custom URL mode
+	FilterMode      string
 }
 
 func DefaultConfig() Config {
 	return Config{
 		Port:           443,
-		MaxScan:        5000,
+		MaxScan:        3000,
 		TopN:           100,
-		DLConc:         3,
+		DLConc:         1,
 		DownloadNum:    20,
-		Duration:       15,
+		Duration:       20,
 		StopThreshold:  15.0,
 		Unique:         false,
 		Output:         "result_colo.csv",
@@ -49,6 +50,7 @@ func DefaultConfig() Config {
 		URL:            "https://speed.cloudflare.com/__down?bytes=500000000",
 		Skip429:        true,
 		QuickDuration:  3,
+		FilterMode:     "speed",
 	}
 }
 
@@ -429,7 +431,7 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 }
 
 func RunCLI(cfg Config) {
-	fmt.Printf("Cloudflare SpeedTest v1.8.0 (Go Edition)\n\n")
+	fmt.Printf("Cloudflare SpeedTest v1.8.1 (Go Edition)\n\n")
 
 	ips := GenerateIPs(cfg.MaxScan, cfg.Unique, cfg.IPFile)
 	fmt.Printf("🔍 Scanning %d IPs (concurrency: %d)...\n", len(ips), cfg.ScanConcurrent)
@@ -453,13 +455,16 @@ func RunCLI(cfg Config) {
 	candidates := validNodes
 
 	if isCustomURL(cfg.URL) {
-		// ── Custom URL Mode ──────────────────────────────────────────────
-		// Skip Colo (not relevant). Use speed-based pre-filter against the
-		// actual target URL, then full download test.
 		cfg.SkipLoadLatency = true
-		dlCfg := cfg
-		dlCfg.StopThreshold = 9999.0 // disable fast-exit — we want the best, not first-good
+		cfg.StopThreshold = 9999.0 // disable fast-exit
+		if cfg.FilterMode == "multi-colo" {
+			fmt.Println("[!] Multi-Colo filtering is not supported in custom URL mode. Falling back to speed pre-filter.")
+			cfg.FilterMode = "speed"
+		}
+	}
 
+	switch cfg.FilterMode {
+	case "speed":
 		// Cap quick filter pool: take top TopN*2 by latency (already sorted).
 		// This bounds pre-filter time to ~1-2 min regardless of total candidates.
 		quickPool := candidates
@@ -474,9 +479,7 @@ func RunCLI(cfg Config) {
 			quickCfg.DLConc = 6
 		}
 
-		fmt.Printf("\n⚡ Custom URL mode\n")
-		fmt.Printf("   URL      : %s\n", cfg.URL)
-		fmt.Printf("   Pre-filter: %ds quick test on %d candidates (%d workers)...\n",
+		fmt.Printf("\n⚡ Speed Pre-filter mode (%ds quick test on %d candidates, %d workers)...\n",
 			cfg.QuickDuration, len(quickPool), quickCfg.DLConc)
 
 		candidates = runQuickFilter(ctx, quickPool, quickCfg, cfg.TopN, func(d, t int) {
@@ -484,52 +487,18 @@ func RunCLI(cfg Config) {
 		})
 		fmt.Printf("\n  → %d candidates selected for full test\n", len(candidates))
 
-		if len(candidates) == 0 {
-			fmt.Println("[!] No IPs could reach the custom URL. Check URL and connectivity.")
-			return
-		}
-
-		fmt.Printf("\n🚀 Full Download Test (%ds, %d parallel, load-latency skipped)\n", cfg.Duration, cfg.DLConc)
-		fmt.Printf("%-16s %-6s %-9s %-9s %-13s %-12s %-8s %-6s\n",
-			"IP", "Colo", "Latency", "Jitter", "Speed", "MinSpd", "Stable", "Score")
-		fmt.Println("--------------------------------------------------------------------------")
-
-		results := runParallelDownloadTest(ctx, candidates, dlCfg, func(res NodeResult) {
-			if res.Colo != "429" || !cfg.Skip429 {
-				fmt.Printf("\r%-120s\r", "")
-				fmt.Printf("%-16s %-6s %6.1fms  %5.1fms  %6.2f MB/s  %5.2f MB/s  %4.0f%%   %5.1f\n",
-					res.IP, res.Colo, res.TCPLatency, res.Jitter,
-					res.DownloadSpeed, res.MinSpeed, res.Stability, res.Score)
-			}
-		}, nil, func(p LiveProgress) {
-			fmt.Printf("\r  📥 %-16s %6.1f MB  %6.2f MB/s  %4.0f/%ds    ",
-				p.IP, float64(p.Bytes)/1024/1024, p.Speed, p.Elapsed, int(p.Duration))
-		}, nil)
-
-		if len(results) == 0 {
-			fmt.Println("\n[!] All tested IPs failed or were rate-limited.")
-			return
-		}
-		saveCSV(cfg.Output, results)
-		fmt.Printf("\n💾 Saved to: %s\n", cfg.Output)
-
-	} else {
-		// ── Default CF URL Mode ──────────────────────────────────────────
-		// Latency TopN → Colo detection (select by LOWEST avg latency) → Download.
+	case "multi-colo":
 		if len(candidates) > cfg.TopN {
 			candidates = candidates[:cfg.TopN]
 		}
 
 		fmt.Printf("\n🔍 Detecting Colo for %d candidates...\n", len(candidates))
-		bestColo, coloGroups := detectColoBatch(ctx, candidates, cfg.Port, cfg.ScanConcurrent, func(done, total int) {
+		_, coloGroups := detectColoBatch(ctx, candidates, cfg.Port, cfg.ScanConcurrent, func(done, total int) {
 			fmt.Printf("\r  Colo detection: %d/%d", done, total)
 		})
 		fmt.Println()
 
-		if bestColo != "" {
-			fmt.Printf("  Best Colo (lowest latency): %s — %d nodes, avg %.1fms\n",
-				bestColo, len(coloGroups[bestColo]), avgLatency(coloGroups[bestColo]))
-
+		if len(coloGroups) > 0 {
 			type coloStat struct {
 				name  string
 				count int
@@ -540,45 +509,79 @@ func RunCLI(cfg Config) {
 				stats = append(stats, coloStat{colo, len(nodes), avgLatency(nodes)})
 			}
 			sort.Slice(stats, func(i, j int) bool { return stats[i].avgMs < stats[j].avgMs })
-			for _, s := range stats {
+
+			fmt.Println("  Colo average latencies (lowest to highest):")
+			for idx, s := range stats {
 				marker := "  "
-				if s.name == bestColo {
+				if idx < 3 {
 					marker = "★ "
 				}
 				fmt.Printf("  %s%-6s  %4d nodes  avg %.1fms\n", marker, s.name, s.count, s.avgMs)
 			}
-			candidates = coloGroups[bestColo]
+
+			var multiColoCandidates []NodeResult
+			numColos := 3
+			if len(stats) < numColos {
+				numColos = len(stats)
+			}
+			for i := 0; i < numColos; i++ {
+				multiColoCandidates = append(multiColoCandidates, coloGroups[stats[i].name]...)
+			}
+			candidates = multiColoCandidates
+			fmt.Printf("  → %d candidates selected from top %d Colos\n", len(candidates), numColos)
 		} else {
 			fmt.Println("  [!] No valid Colo detected, testing all candidates")
 		}
 
-		fmt.Printf("\n🚀 Download Test (%ds duration, %d parallel)\n", cfg.Duration, cfg.DLConc)
+	default: // "none" or fallback
+		if len(candidates) > cfg.TopN {
+			candidates = candidates[:cfg.TopN]
+		}
+		fmt.Printf("\n🚀 Skipping candidate filtering. Testing top %d candidates directly.\n", len(candidates))
+	}
+
+	if len(candidates) == 0 {
+		fmt.Println("[!] No candidates selected for testing.")
+		return
+	}
+
+	fmt.Printf("\n🚀 Download Test (%ds duration, %d parallel)\n", cfg.Duration, cfg.DLConc)
+	if cfg.SkipLoadLatency {
+		fmt.Printf("%-16s %-6s %-9s %-9s %-13s %-12s %-8s %-6s\n",
+			"IP", "Colo", "Latency", "Jitter", "Speed", "MinSpd", "Stable", "Score")
+		fmt.Println("--------------------------------------------------------------------------")
+	} else {
 		fmt.Printf("%-16s %-6s %-9s %-9s %-13s %-12s %-9s %-8s %-6s\n",
 			"IP", "Colo", "Latency", "Jitter", "Speed", "MinSpd", "LoadLat", "Stable", "Score")
 		fmt.Println("-------------------------------------------------------------------------------------------")
+	}
 
-		results := runParallelDownloadTest(ctx, candidates, cfg, func(res NodeResult) {
-			if res.Colo != "429" || !cfg.Skip429 {
-				fmt.Printf("\r%-130s\r", "")
+	results := runParallelDownloadTest(ctx, candidates, cfg, func(res NodeResult) {
+		if res.Colo != "429" || !cfg.Skip429 {
+			fmt.Printf("\r%-130s\r", "")
+			if cfg.SkipLoadLatency {
+				fmt.Printf("%-16s %-6s %6.1fms  %5.1fms  %6.2f MB/s  %5.2f MB/s  %4.0f%%   %5.1f\n",
+					res.IP, res.Colo, res.TCPLatency, res.Jitter,
+					res.DownloadSpeed, res.MinSpeed, res.Stability, res.Score)
+			} else {
 				fmt.Printf("%-16s %-6s %6.1fms  %5.1fms  %6.2f MB/s  %5.2f MB/s  %6.1fms  %4.0f%%   %5.1f\n",
 					res.IP, res.Colo, res.TCPLatency, res.Jitter,
 					res.DownloadSpeed, res.MinSpeed, res.LoadLatency, res.Stability, res.Score)
 			}
-		}, nil, func(p LiveProgress) {
-			fmt.Printf("\r  📥 %-16s %6.1f MB  %6.2f MB/s  %4.0f/%ds    ",
-				p.IP, float64(p.Bytes)/1024/1024, p.Speed, p.Elapsed, int(p.Duration))
-		}, func() {
-			fmt.Println("\n⚡ Fast-exit triggered.")
-		})
-
-		if len(results) == 0 {
-			fmt.Println("\n[!] All tested IPs were rate-limited (429/403).")
-			fmt.Println("[!] Wait a moment or use -skip429=false to see them.")
-			return
 		}
-		saveCSV(cfg.Output, results)
-		fmt.Printf("\n💾 Saved to: %s\n", cfg.Output)
+	}, nil, func(p LiveProgress) {
+		fmt.Printf("\r  📥 %-16s %6.1f MB  %6.2f MB/s  %4.0f/%ds    ",
+			p.IP, float64(p.Bytes)/1024/1024, p.Speed, p.Elapsed, int(p.Duration))
+	}, func() {
+		fmt.Println("\n⚡ Fast-exit triggered.")
+	})
+
+	if len(results) == 0 {
+		fmt.Println("\n[!] All tested IPs failed or were rate-limited.")
+		return
 	}
+	saveCSV(cfg.Output, results)
+	fmt.Printf("\n💾 Saved to: %s\n", cfg.Output)
 }
 
 func saveCSV(path string, results []NodeResult) {

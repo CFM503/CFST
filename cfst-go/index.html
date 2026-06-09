@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CFST v1.7.7</title>
+    <title>CFST v1.8.1</title>
     <!-- Google Fonts for modern typography -->
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
@@ -281,7 +281,7 @@
             <div class="header">
                 <div style="display: flex; align-items: baseline; gap: 12px;">
                     <h1>✨ CFST Ultimate</h1>
-                    <span style="color: var(--text-dim); font-size: 1.1rem; font-weight: 600;">v1.7.7</span>
+                    <span style="color: var(--text-dim); font-size: 1.1rem; font-weight: 600;">v1.8.1</span>
                 </div>
                 <button id="startBtn">
                     <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -301,7 +301,7 @@
                     <label
                         style="display: block; font-size: 0.85rem; color: var(--text-dim); margin-bottom: 0.4rem;">Max
                         Scan IPs</label>
-                    <input type="number" id="inpMax" value="5000"
+                    <input type="number" id="inpMax" value="3000"
                         style="width: 100%; padding: 0.6rem; border-radius: 8px; border: 1px solid var(--border); background: rgba(0,0,0,0.2); color: white; box-sizing: border-box; font-family: inherit;">
                 </div>
                 <div>
@@ -322,7 +322,7 @@
                     <label
                         style="display: block; font-size: 0.85rem; color: var(--text-dim); margin-bottom: 0.4rem;">Parallel
                         Tests</label>
-                    <input type="number" id="inpDLC" value="3"
+                    <input type="number" id="inpDLC" value="1"
                         style="width: 100%; padding: 0.6rem; border-radius: 8px; border: 1px solid var(--border); background: rgba(0,0,0,0.2); color: white; box-sizing: border-box; font-family: inherit;">
                 </div>
                 <div>
@@ -336,8 +336,18 @@
                     <label
                         style="display: block; font-size: 0.85rem; color: var(--text-dim); margin-bottom: 0.4rem;">Duration
                         (s)</label>
-                    <input type="number" id="inpDt" value="15"
+                    <input type="number" id="inpDt" value="20"
                         style="width: 100%; padding: 0.6rem; border-radius: 8px; border: 1px solid var(--border); background: rgba(0,0,0,0.2); color: white; box-sizing: border-box; font-family: inherit;">
+                </div>
+                <div>
+                    <label
+                        style="display: block; font-size: 0.85rem; color: var(--text-dim); margin-bottom: 0.4rem;">Filter Mode</label>
+                    <select id="inpFilter"
+                        style="width: 100%; padding: 0.6rem; border-radius: 8px; border: 1px solid var(--border); background: #1e293b; color: white; box-sizing: border-box; font-family: inherit; font-size: 0.95rem; height: 38px;">
+                        <option value="speed" selected>Speed Pre-filter</option>
+                        <option value="multi-colo">Multi-Colo</option>
+                        <option value="none">No Filter</option>
+                    </select>
                 </div>
                 <div
                     style="grid-column: 1 / -1; display: grid; grid-template-columns: 1fr auto; gap: 1rem; margin-top: 0.5rem; align-items: flex-end;">
@@ -453,7 +463,8 @@
                 dt: document.getElementById('inpDt').value,
                 url: document.getElementById('inpUrl').value,
                 qd: document.getElementById('inpQd').value,
-                skip429: document.getElementById('inpSkip429').checked ? 'true' : 'false'
+                skip429: document.getElementById('inpSkip429').checked ? 'true' : 'false',
+                filter: document.getElementById('inpFilter').value
             });
 
             const evtSource = new EventSource('/api/test?' + params.toString());

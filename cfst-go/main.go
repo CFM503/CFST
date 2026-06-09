@@ -23,6 +23,7 @@ func main() {
 	flag.BoolVar(&cfg.Skip429, "skip429", cfg.Skip429, "Discard 429 rate-limited IPs silently")
 	flag.StringVar(&cfg.URL, "url", cfg.URL, "Custom download test URL")
 	flag.IntVar(&cfg.QuickDuration, "qd", cfg.QuickDuration, "Quick pre-filter duration in seconds (custom URL mode)")
+	flag.StringVar(&cfg.FilterMode, "filter", cfg.FilterMode, "Candidate filter mode (speed, multi-colo, none)")
 
 	webMode := false
 	webPort := "9876"
