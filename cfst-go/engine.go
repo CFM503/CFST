@@ -138,7 +138,7 @@ func SingleStreamTest(ctx context.Context, ip string, port int, duration int, te
 	if customSNI != "" {
 		sni = customSNI
 	} else if strings.Contains(testURL, "speed.cloudflare.com") {
-		sni = ""
+		sni = "speed.cloudflare.com"
 	}
 	client := makeHTTPClient(ip, port, sni)
 	if tr, ok := client.Transport.(*http.Transport); ok {
