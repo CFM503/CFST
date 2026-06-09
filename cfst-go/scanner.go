@@ -460,17 +460,29 @@ func RunCLI(cfg Config) {
 		dlCfg := cfg
 		dlCfg.StopThreshold = 9999.0 // disable fast-exit — we want the best, not first-good
 
-		fmt.Printf("\n⚡ Custom URL mode\n")
-		fmt.Printf("   URL     : %s\n", cfg.URL)
-		fmt.Printf("   Pre-filter: %ds quick test on %d candidates...\n", cfg.QuickDuration, len(candidates))
-		if cfg.DLConc > 1 {
-			fmt.Printf("   Tip: -dlc 1 gives more accurate single-stream results\n")
+		// Cap quick filter pool: take top TopN*2 by latency (already sorted).
+		// This bounds pre-filter time to ~1-2 min regardless of total candidates.
+		quickPool := candidates
+		maxPool := cfg.TopN * 2
+		if len(quickPool) > maxPool {
+			quickPool = quickPool[:maxPool]
+		}
+		// Boost concurrency for the rough pre-filter pass (parallel is fine here).
+		quickCfg := cfg
+		quickCfg.DLConc = cfg.DLConc * 3
+		if quickCfg.DLConc < 6 {
+			quickCfg.DLConc = 6
 		}
 
-		candidates = runQuickFilter(ctx, candidates, cfg, cfg.TopN, func(d, t int) {
+		fmt.Printf("\n⚡ Custom URL mode\n")
+		fmt.Printf("   URL      : %s\n", cfg.URL)
+		fmt.Printf("   Pre-filter: %ds quick test on %d candidates (%d workers)...\n",
+			cfg.QuickDuration, len(quickPool), quickCfg.DLConc)
+
+		candidates = runQuickFilter(ctx, quickPool, quickCfg, cfg.TopN, func(d, t int) {
 			fmt.Printf("\r  Pre-filter: %d/%d", d, t)
 		})
-		fmt.Printf("\n  → %d candidates qualified\n", len(candidates))
+		fmt.Printf("\n  → %d candidates selected for full test\n", len(candidates))
 
 		if len(candidates) == 0 {
 			fmt.Println("[!] No IPs could reach the custom URL. Check URL and connectivity.")

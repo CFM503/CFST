@@ -105,8 +105,21 @@ func RunWeb(cfg Config) {
 			dlCfg := reqCfg
 			dlCfg.StopThreshold = 9999.0 // disable fast-exit
 
-			sendEvent("status", fmt.Sprintf("Custom URL: quick pre-filter (%ds) on %d candidates...", reqCfg.QuickDuration, len(candidates)))
-			candidates = runQuickFilter(r.Context(), candidates, reqCfg, reqCfg.TopN, func(done, total int) {
+			// Cap pre-filter pool to TopN*2 (sorted by latency), boost concurrency.
+			quickPool := candidates
+			maxPool := reqCfg.TopN * 2
+			if len(quickPool) > maxPool {
+				quickPool = quickPool[:maxPool]
+			}
+			quickCfg := reqCfg
+			quickCfg.DLConc = reqCfg.DLConc * 3
+			if quickCfg.DLConc < 6 {
+				quickCfg.DLConc = 6
+			}
+
+			sendEvent("status", fmt.Sprintf("Custom URL: quick pre-filter (%ds) on %d candidates (%d workers)...",
+				reqCfg.QuickDuration, len(quickPool), quickCfg.DLConc))
+			candidates = runQuickFilter(r.Context(), quickPool, quickCfg, reqCfg.TopN, func(done, total int) {
 				sendEvent("progress_colo", map[string]int{"done": done, "total": total})
 			})
 
@@ -114,7 +127,7 @@ func RunWeb(cfg Config) {
 				sendEvent("error", "No IPs could reach the custom URL.")
 				return
 			}
-			sendEvent("status", fmt.Sprintf("%d candidates qualified, running full download test...", len(candidates)))
+			sendEvent("status", fmt.Sprintf("%d candidates selected, running full download test...", len(candidates)))
 
 			results := runParallelDownloadTest(r.Context(), candidates, dlCfg, func(res NodeResult) {
 				if res.Colo != "429" || !reqCfg.Skip429 {
