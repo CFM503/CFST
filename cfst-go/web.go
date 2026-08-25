@@ -89,7 +89,7 @@ func RunWeb(cfg Config) {
 		ips := GenerateIPs(reqCfg.MaxScan, reqCfg.Unique, reqCfg.IPFile)
 
 		sendEvent("status", fmt.Sprintf("Ping scanning %d IPs...", len(ips)))
-		validNodes := ScanPing(r.Context(), ips, reqCfg.Port, reqCfg.ScanConcurrent, func(done, total, valid int) {
+		validNodes := ScanPing(r.Context(), ips, reqCfg.Port, reqCfg.ScanConcurrent, reqCfg.WSSHost, func(done, total, valid int) {
 			if done%10 == 0 || done == total {
 				sendEvent("progress_scan", map[string]int{"done": done, "total": total, "valid": valid})
 			}

@@ -33,6 +33,7 @@ type Config struct {
 	SkipLoadLatency bool // auto-set for custom URL mode
 	FilterMode      string
 	SNI             string
+	WSSHost         string
 }
 
 func DefaultConfig() Config {
@@ -52,6 +53,7 @@ func DefaultConfig() Config {
 		Skip429:        true,
 		QuickDuration:  3,
 		FilterMode:     "speed",
+		WSSHost:        "colo.4467107.xyz",
 	}
 }
 
@@ -60,7 +62,9 @@ func isCustomURL(urlStr string) bool {
 }
 
 // ScanPing runs 5 TCP pings per IP and filters by packet loss.
-func ScanPing(ctx context.Context, ips []string, port int, concurrency int, progressCallback func(done, total, valid int)) []NodeResult {
+// When wssHost is non-empty, it additionally verifies goway's WebSocket
+// upgrade handshake and drops IPs that fail it (e.g. Cloudflare 403).
+func ScanPing(ctx context.Context, ips []string, port int, concurrency int, wssHost string, progressCallback func(done, total, valid int)) []NodeResult {
 	var validNodes []NodeResult
 	var mu sync.Mutex
 	var done, validCount atomic.Int32
@@ -115,6 +119,14 @@ func ScanPing(ctx context.Context, ips []string, port int, concurrency int, prog
 					sum += l
 				}
 				avgLat := sum / float64(len(lats))
+
+				if wssHost != "" && !WSSHandshakeCheck(ip, port, wssHost, 3*time.Second) {
+					d := done.Add(1)
+					if progressCallback != nil && (d%10 == 0 || d == int32(total)) {
+						progressCallback(int(d), total, int(validCount.Load()))
+					}
+					return
+				}
 
 				jitter := 0.0
 				if len(lats) > 1 {
@@ -432,14 +444,14 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 }
 
 func RunCLI(cfg Config) {
-	fmt.Printf("Cloudflare SpeedTest v1.8.5 (Go Edition)\n\n")
+	fmt.Printf("Cloudflare SpeedTest v1.8.6 (Go Edition)\n\n")
 
 	ips := GenerateIPs(cfg.MaxScan, cfg.Unique, cfg.IPFile)
 	fmt.Printf("🔍 Scanning %d IPs (concurrency: %d)...\n", len(ips), cfg.ScanConcurrent)
 
 	ctx := context.Background()
 
-	validNodes := ScanPing(ctx, ips, cfg.Port, cfg.ScanConcurrent, func(done, total, valid int) {
+	validNodes := ScanPing(ctx, ips, cfg.Port, cfg.ScanConcurrent, cfg.WSSHost, func(done, total, valid int) {
 		fmt.Printf("\r  Process: %d/%d | Valid: %d", done, total, valid)
 	})
 	fmt.Println()

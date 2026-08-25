@@ -487,6 +487,46 @@ func TCPPing(ip string, port int, timeout time.Duration) float64 {
 	return float64(time.Since(start).Microseconds()) / 1000.0
 }
 
+// WSSHandshakeCheck simulates goway's WebSocket upgrade handshake over TLS.
+// Returns true if the server responds with 101 Switching Protocols.
+func WSSHandshakeCheck(ip string, port int, sni string, timeout time.Duration) bool {
+	addr := net.JoinHostPort(ip, fmt.Sprintf("%d", port))
+	conn, err := net.DialTimeout("tcp", addr, timeout)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+
+	tlsConf := &tls.Config{InsecureSkipVerify: true, ServerName: sni}
+	tlsConn := tls.Client(conn, tlsConf)
+	if err := tlsConn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return false
+	}
+	if err := tlsConn.Handshake(); err != nil {
+		return false
+	}
+
+	req := "GET /pyway HTTP/1.1\r\n" +
+		fmt.Sprintf("Host: %s\r\n", sni) +
+		"Upgrade: websocket\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+		"Sec-WebSocket-Version: 13\r\n" +
+		"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n" +
+		"\r\n"
+	if _, err := tlsConn.Write([]byte(req)); err != nil {
+		return false
+	}
+
+	buf := make([]byte, 512)
+	n, err := tlsConn.Read(buf)
+	if err != nil || n == 0 {
+		return false
+	}
+	resp := string(buf[:n])
+	return strings.Contains(resp, "101")
+}
+
 var coloRe = regexp.MustCompile(`colo=([A-Z]+)`)
 
 var sharedTLSConfig = &tls.Config{InsecureSkipVerify: true}
