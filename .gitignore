@@ -1,5 +1,10 @@
 *.exe
+*.exe~
+*~
 result_*.csv
+cfst_state.json
+dist/
 sin_ips.txt
 .claude/
 test_ip.txt
+

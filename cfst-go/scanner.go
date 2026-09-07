@@ -34,26 +34,44 @@ type Config struct {
 	FilterMode      string
 	SNI             string
 	WSSHost         string
+
+	// Route Quality Probe daemon options
+	DaemonMode        bool
+	APIAddr           string
+	ActiveInterval    int // seconds
+	StandbyInterval   int // seconds
+	CandidateInterval int // seconds
+	FailedInterval    int // seconds
+	ScoreMode         string // "normal" or "peak"
+	StateFile         string // path to state snapshot json
 }
 
 func DefaultConfig() Config {
 	return Config{
-		Port:           443,
-		MaxScan:        3000,
-		TopN:           100,
-		DLConc:         1,
-		DownloadNum:    20,
-		Duration:       20,
-		StopThreshold:  30.0,
-		Unique:         false,
-		Output:         "result_colo.csv",
-		ScanConcurrent: 200,
-		WebPort:        "9876",
-		URL:            "https://speed.cloudflare.com/__down?bytes=500000000",
-		Skip429:        true,
-		QuickDuration:  3,
-		FilterMode:     "speed",
-		WSSHost:        "colo.4467107.xyz",
+		Port:              443,
+		MaxScan:           3000,
+		TopN:              100,
+		DLConc:            1,
+		DownloadNum:       20,
+		Duration:          20,
+		StopThreshold:     30.0,
+		Unique:            false,
+		Output:            "result_colo.csv",
+		ScanConcurrent:    200,
+		WebPort:           "9876",
+		URL:               "https://speed.cloudflare.com/__down?bytes=500000000",
+		Skip429:           true,
+		QuickDuration:     3,
+		FilterMode:        "speed",
+		WSSHost:           "colo.4467107.xyz",
+		DaemonMode:        false,
+		APIAddr:           "127.0.0.1:9876",
+		ActiveInterval:    10,
+		StandbyInterval:   30,
+		CandidateInterval: 180,
+		FailedInterval:    60,
+		ScoreMode:         "normal",
+		StateFile:         "cfst_state.json",
 	}
 }
 
@@ -444,7 +462,7 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 }
 
 func RunCLI(cfg Config) {
-	fmt.Printf("Cloudflare SpeedTest v1.8.6 (Go Edition)\n\n")
+	fmt.Printf("Cloudflare SpeedTest v2.0.0 (Route Quality Probe - Go Edition)\n\n")
 
 	ips := GenerateIPs(cfg.MaxScan, cfg.Unique, cfg.IPFile)
 	fmt.Printf("🔍 Scanning %d IPs (concurrency: %d)...\n", len(ips), cfg.ScanConcurrent)
@@ -593,8 +611,29 @@ func RunCLI(cfg Config) {
 		fmt.Println("\n[!] All tested IPs failed or were rate-limited.")
 		return
 	}
+
+	for i, res := range results {
+		tier := TierCandidate
+		if i == 0 {
+			tier = TierActive
+		} else if i <= 2 {
+			tier = TierStandby
+		}
+		rm := FromNodeResult(res, tier)
+		GlobalRouteStore.UpsertRoute(*rm)
+	}
+
 	saveCSV(cfg.Output, results)
 	fmt.Printf("\n💾 Saved to: %s\n", cfg.Output)
+	if cfg.StateFile != "" {
+		_ = GlobalRouteStore.SaveSnapshot(cfg.StateFile)
+		fmt.Printf("💾 Saved route state to: %s\n", cfg.StateFile)
+	}
+
+	if cfg.DaemonMode {
+		fmt.Println("\n⚡ Transitioning to Route Quality Probe daemon...")
+		RunDaemon(cfg)
+	}
 }
 
 func saveCSV(path string, results []NodeResult) {

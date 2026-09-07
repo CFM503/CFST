@@ -72,37 +72,12 @@ type NodeResult struct {
 }
 
 func (n *NodeResult) CalcScore() {
-	// Speed score (35%): single-stream speed, cap 15 MB/s
+	w := GlobalScoreEngine.ActiveWeights()
 	effectiveSpeed := n.DownloadSpeed
 	if n.SingleSpeed > 0 {
 		effectiveSpeed = n.SingleSpeed
 	}
-	scoreSpeed := math.Min(effectiveSpeed/15.0*100.0, 100.0)
-
-	// MinSpeed score (20%): floor speed, cap 10 MB/s
-	scoreMinSpeed := math.Min(n.MinSpeed/10.0*100.0, 100.0)
-
-	// Latency score (10%): lower is better
-	scoreLatency := 100.0 - (n.TCPLatency-30.0)*0.5
-	if scoreLatency < 0 {
-		scoreLatency = 0
-	}
-
-	// Jitter score (10%): >10ms starts penalizing
-	scoreJitter := 100.0 - n.Jitter*2.0
-	if scoreJitter < 0 {
-		scoreJitter = 0
-	}
-
-	// Stability score (25%)
-	scoreStability := n.Stability
-
-	n.Score = scoreSpeed*0.35 + scoreMinSpeed*0.20 + scoreLatency*0.10 +
-		scoreJitter*0.10 + scoreStability*0.25
-
-	if n.Colo != "UNK" && n.Colo != "ERR" && n.Colo != "" {
-		n.Score += 5.0
-	}
+	n.Score = GlobalScoreEngine.calcMetricScore(w, effectiveSpeed, n.MinSpeed, n.TCPLatency, n.Jitter, n.PacketLoss, n.Stability, true, n.Colo)
 }
 
 func randIPFromCIDR(cidr string) string {

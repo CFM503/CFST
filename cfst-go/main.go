@@ -26,6 +26,14 @@ func main() {
 	flag.StringVar(&cfg.FilterMode, "filter", cfg.FilterMode, "Candidate filter mode (speed, multi-colo, none)")
 	flag.StringVar(&cfg.SNI, "sni", cfg.SNI, "Custom TLS SNI (ServerName)")
 	flag.StringVar(&cfg.WSSHost, "wsshost", cfg.WSSHost, "WebSocket fake Host for goway handshake check (enabled by default, pass empty string to disable)")
+	flag.BoolVar(&cfg.DaemonMode, "daemon", cfg.DaemonMode, "Run as continuous Route Quality Probe daemon")
+	flag.StringVar(&cfg.APIAddr, "api-addr", cfg.APIAddr, "Local API listen address (default 127.0.0.1:9876)")
+	flag.IntVar(&cfg.ActiveInterval, "active-interval", cfg.ActiveInterval, "Active route probe interval in seconds")
+	flag.IntVar(&cfg.StandbyInterval, "standby-interval", cfg.StandbyInterval, "Standby route probe interval in seconds")
+	flag.IntVar(&cfg.CandidateInterval, "candidate-interval", cfg.CandidateInterval, "Candidate route probe interval in seconds")
+	flag.IntVar(&cfg.FailedInterval, "failed-interval", cfg.FailedInterval, "Failed route recovery probe interval in seconds")
+	flag.StringVar(&cfg.ScoreMode, "mode", cfg.ScoreMode, "Scoring mode: normal or peak")
+	flag.StringVar(&cfg.StateFile, "state", cfg.StateFile, "State persistence JSON file path")
 
 	webMode := false
 	webPort := "9876"
@@ -49,7 +57,9 @@ func main() {
 	flag.Bool("web", false, "Start Web UI server (-web <port>)")
 	flag.Parse()
 
-	if webMode {
+	if cfg.DaemonMode {
+		RunDaemon(cfg)
+	} else if webMode {
 		cfg.WebMode = true
 		cfg.WebPort = webPort
 		if !strings.Contains(cfg.WebPort, ":") {

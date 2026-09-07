@@ -13,17 +13,21 @@ import (
 //go:embed index.html
 var indexHTML []byte
 
-func RunWeb(cfg Config) {
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write(indexHTML)
-	})
+var registerWebOnce sync.Once
 
-	http.HandleFunc("/api/test", func(w http.ResponseWriter, r *http.Request) {
+// RegisterWebRoutes registers Web UI and SSE testing endpoints on http.DefaultServeMux.
+func RegisterWebRoutes(cfg Config) {
+	registerWebOnce.Do(func() {
+		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/" {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Write(indexHTML)
+		})
+
+		http.HandleFunc("/api/test", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -198,10 +202,26 @@ func RunWeb(cfg Config) {
 			sendEvent("error", "All tested IPs failed or were rate-limited. Please wait and retry.")
 			return
 		}
+
+		for i, res := range results {
+			tier := TierCandidate
+			if i == 0 {
+				tier = TierActive
+			} else if i <= 2 {
+				tier = TierStandby
+			}
+			rm := FromNodeResult(res, tier)
+			GlobalRouteStore.UpsertRoute(*rm)
+		}
+
 		sendEvent("status", "Test Complete")
 		sendEvent("complete", results)
 	})
+	})
+}
 
+func RunWeb(cfg Config) {
+	RegisterWebRoutes(cfg)
 	fmt.Printf("🚀 Web UI started. Open http://localhost%s in your browser\n", cfg.WebPort)
 	if err := http.ListenAndServe(cfg.WebPort, nil); err != nil {
 		fmt.Printf("Web server error: %v\n", err)
