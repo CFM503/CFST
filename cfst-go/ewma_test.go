@@ -39,21 +39,21 @@ func TestRouteEWMATracker(t *testing.T) {
 
 	// Record several samples
 	for i := 0; i < 5; i++ {
-		tracker.Record(50.0, 40.0, 0.0, 2.0, 95.0, now.Add(time.Duration(i)*time.Minute))
+		tracker.Record(50.0, 40.0, 40.0, 0.0, 2.0, 95.0, now.Add(time.Duration(i)*time.Minute))
 	}
 
 	shortSnap := tracker.ShortSnapshot()
 	longSnap := tracker.LongSnapshot()
 
-	if shortSnap.Speed <= 0 || shortSnap.Latency <= 0 || shortSnap.Stability <= 0 {
+	if shortSnap.Speed <= 0 || shortSnap.MinSpeed <= 0 || shortSnap.Latency <= 0 || shortSnap.Stability <= 0 {
 		t.Fatalf("short EWMA snapshot values missing: %+v", shortSnap)
 	}
-	if longSnap.Speed <= 0 || longSnap.Latency <= 0 || longSnap.Stability <= 0 {
+	if longSnap.Speed <= 0 || longSnap.MinSpeed <= 0 || longSnap.Latency <= 0 || longSnap.Stability <= 0 {
 		t.Fatalf("long EWMA snapshot values missing: %+v", longSnap)
 	}
 
 	// Sudden speed drop in next measurement
-	tracker.Record(10.0, 80.0, 0.1, 10.0, 50.0, now.Add(6*time.Minute))
+	tracker.Record(10.0, 5.0, 80.0, 0.1, 10.0, 50.0, now.Add(6*time.Minute))
 
 	newShort := tracker.ShortSnapshot()
 	newLong := tracker.LongSnapshot()

@@ -85,7 +85,7 @@ func (r *RouteRecord) AddSample(s MeasurementSample) {
 
 	// 2. Update EWMA
 	if s.Success {
-		r.EWMA.Record(s.Speed, s.RTT, s.PacketLoss, s.Jitter, s.Stability, s.Timestamp)
+		r.EWMA.Record(s.Speed, s.MinSpeed, s.RTT, s.PacketLoss, s.Jitter, s.Stability, s.Timestamp)
 	}
 
 	// 3. Update PeakHour stats (0..23)

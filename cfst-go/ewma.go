@@ -34,6 +34,7 @@ func (e *EWMAValue) Update(val float64, now time.Time) {
 // EWMASnapshot is an immutable representation of current EWMA values.
 type EWMASnapshot struct {
 	Speed     float64 `json:"speed"`
+	MinSpeed  float64 `json:"min_speed"`
 	Latency   float64 `json:"latency"`
 	Loss      float64 `json:"loss"`
 	Jitter    float64 `json:"jitter"`
@@ -46,6 +47,7 @@ type RouteEWMATracker struct {
 
 	// Short-term (alpha ~ 0.3 for faster reaction, ~5-15 min horizon)
 	ShortSpeed     EWMAValue `json:"short_speed"`
+	ShortMinSpeed  EWMAValue `json:"short_min_speed"`
 	ShortLatency   EWMAValue `json:"short_latency"`
 	ShortLoss      EWMAValue `json:"short_loss"`
 	ShortJitter    EWMAValue `json:"short_jitter"`
@@ -53,6 +55,7 @@ type RouteEWMATracker struct {
 
 	// Long-term (alpha ~ 0.05 for smoothed long-term baseline)
 	LongSpeed     EWMAValue `json:"long_speed"`
+	LongMinSpeed  EWMAValue `json:"long_min_speed"`
 	LongLatency   EWMAValue `json:"long_latency"`
 	LongLoss      EWMAValue `json:"long_loss"`
 	LongJitter    EWMAValue `json:"long_jitter"`
@@ -68,12 +71,14 @@ func NewRouteEWMATracker(shortAlpha, longAlpha float64) *RouteEWMATracker {
 	}
 	return &RouteEWMATracker{
 		ShortSpeed:     NewEWMAValue(shortAlpha),
+		ShortMinSpeed:  NewEWMAValue(shortAlpha),
 		ShortLatency:   NewEWMAValue(shortAlpha),
 		ShortLoss:      NewEWMAValue(shortAlpha),
 		ShortJitter:    NewEWMAValue(shortAlpha),
 		ShortStability: NewEWMAValue(shortAlpha),
 
 		LongSpeed:     NewEWMAValue(longAlpha),
+		LongMinSpeed:  NewEWMAValue(longAlpha),
 		LongLatency:   NewEWMAValue(longAlpha),
 		LongLoss:      NewEWMAValue(longAlpha),
 		LongJitter:    NewEWMAValue(longAlpha),
@@ -81,17 +86,19 @@ func NewRouteEWMATracker(shortAlpha, longAlpha float64) *RouteEWMATracker {
 	}
 }
 
-func (t *RouteEWMATracker) Record(speed, latency, loss, jitter, stability float64, now time.Time) {
+func (t *RouteEWMATracker) Record(speed, minSpeed, latency, loss, jitter, stability float64, now time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	t.ShortSpeed.Update(speed, now)
+	t.ShortMinSpeed.Update(minSpeed, now)
 	t.ShortLatency.Update(latency, now)
 	t.ShortLoss.Update(loss, now)
 	t.ShortJitter.Update(jitter, now)
 	t.ShortStability.Update(stability, now)
 
 	t.LongSpeed.Update(speed, now)
+	t.LongMinSpeed.Update(minSpeed, now)
 	t.LongLatency.Update(latency, now)
 	t.LongLoss.Update(loss, now)
 	t.LongJitter.Update(jitter, now)
@@ -103,6 +110,7 @@ func (t *RouteEWMATracker) ShortSnapshot() EWMASnapshot {
 	defer t.mu.RUnlock()
 	return EWMASnapshot{
 		Speed:     t.ShortSpeed.Value,
+		MinSpeed:  t.ShortMinSpeed.Value,
 		Latency:   t.ShortLatency.Value,
 		Loss:      t.ShortLoss.Value,
 		Jitter:    t.ShortJitter.Value,
@@ -115,6 +123,7 @@ func (t *RouteEWMATracker) LongSnapshot() EWMASnapshot {
 	defer t.mu.RUnlock()
 	return EWMASnapshot{
 		Speed:     t.LongSpeed.Value,
+		MinSpeed:  t.LongMinSpeed.Value,
 		Latency:   t.LongLatency.Value,
 		Loss:      t.LongLoss.Value,
 		Jitter:    t.LongJitter.Value,
