@@ -1,5 +1,12 @@
 # Changelog
 
+## v2.0.1 (2026-09-07)
+
+### Enhancements
+- **EWMA MinSpeed Integration**: Added `MinSpeed` tracking into both short-term and long-term EWMA snapshots (`RouteEWMATracker`), providing direct buffer-underrun indicators for continuous video streaming scenarios.
+- **Scoring Engine Polish**: Updated `ShortTermScore` and `LongTermScore` to incorporate smoothed `EWMA MinSpeed` instead of raw instantaneous minimums.
+- **Version Bump**: Updated version string across CLI banner, Web UI header, Daemon banner, and REST API (`/api/health`).
+
 ## v2.0.0 (2026-09-07)
 
 ### Major Architecture Upgrade: Route Quality Probe

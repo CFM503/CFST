@@ -15,7 +15,7 @@ import (
 // RunDaemon initializes and runs CFST as a continuous Route Quality Probe daemon.
 func RunDaemon(cfg Config) {
 	fmt.Println("============================================================")
-	fmt.Println("   CFST Route Quality Probe v2.0.0 (Continuous Daemon Mode)")
+	fmt.Println("   CFST Route Quality Probe v2.0.1 (Continuous Daemon Mode)")
 	fmt.Printf("   Listening on: http://%s\n", cfg.APIAddr)
 	fmt.Printf("   Score Mode:   %s\n", cfg.ScoreMode)
 	fmt.Printf("   Intervals:    Active: %ds | Standby: %ds | Candidate: %ds | Failed: %ds\n",

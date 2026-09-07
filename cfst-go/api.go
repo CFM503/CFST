@@ -54,7 +54,7 @@ func handleAPIHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":          "ok",
 		"service":         "CFST Route Quality Probe",
-		"version":         "v2.0.0",
+		"version":         "v2.0.1",
 		"uptime_seconds":  int64(time.Since(appStartTime).Seconds()),
 		"score_mode":      GlobalScoreEngine.GetMode(),
 		"total_routes":    len(all),
