@@ -1,5 +1,39 @@
 # Changelog
 
+## v2.1.3 (2026-09-08)
+
+### Fix: Unify Daemon and Initial Scan with ProbeProfile Architecture
+- **Daemon Profile Initialization (`daemon.go`)**:
+  - Eliminated hardcoded `ProfileGOWAYWSS` override in `RunDaemon()`. Daemon now strictly builds on `DefaultProbeConfig()` (`ProfileCFST`).
+  - Added `ConfigToProbeConfig()` which only modifies profile-independent scheduling parameters (`ActiveInterval`, `StandbyInterval`, `CandidateInterval`, `FailedInterval`, `QuickDuration`, `FullDuration`).
+  - Abolished automatic switching to GOWAY-WSS based on non-empty `WSSHost`. Switching to GOWAY-WSS or CUSTOM now strictly requires explicit profile configuration.
+  - Added explicit profile details in daemon startup banner (`Profile`, `Protocol`, `Test URL`, `SNI`, `Host`, `Path`).
+- **Profile-Driven Candidate Discovery & Seeding (`scanner.go`, `daemon.go`)**:
+  - Implemented `ScanRoutesWithProfile()`:
+    - `ProfileCFST`: TCP Ping + `HTTPSConnectivityCheck` (strictly zero WSS checks, never requests `/pyway`).
+    - `ProfileGOWAYWSS`: TCP Ping + `WSSHandshakeCheck` using `profile.Host`, `profile.SNI`, and `profile.Path`.
+    - `ProfileCustom`: Protocol-driven (`HTTPSConnectivityCheck` for HTTP/HTTPS, `WSSHandshakeCheck` for WSS).
+  - Updated `seedCandidates()` in `daemon.go` to use `ScanRoutesWithProfile()` with the active scheduler profile.
+  - Updated `runQuickFilter()` and `runParallelDownloadTest()` to resolve targets strictly from `ProbeProfile`.
+  - Retained `ScanPing()` as a legacy compatibility wrapper and fixed duplicate `done.Add(1)` progress counter.
+- **Custom VPS Port & Host Header Preservation (`probe.go`, `engine.go`, `api.go`)**:
+  - In `NewProfileCustom()`, `NormalizeProbeConfig()`, and `ResolveProbeTarget()`:
+    - Non-default ports (e.g. `:8443`) are properly retained in HTTP `Host` header (`my-vps.com:8443`).
+    - TLS SNI strictly remains the hostname without port (`my-vps.com`).
+    - Default port (443) uses hostname without port in `Host`.
+  - Updated `SingleStreamTestDetailed()` to accept and execute directly against `ResolvedProbeTarget`.
+  - Added `LightweightHTTPProbeTarget()` driven by `ResolvedProbeTarget`.
+- **API & CLI Profile Extensions (`main.go`, `api.go`)**:
+  - Added `-profile` CLI flag to `main.go`.
+  - Added `Port` support in `ConfigUpdateRequest` and URL port extraction in `/api/config`.
+- **Comprehensive Regression Test Suite (`daemon_test.go`, `probe_test.go`)**:
+  - Added `TestRunDaemonDefaultProfileIsCFST`: guarantees daemon defaults to CFST HTTPS probe.
+  - Added `TestSeedCandidatesCFSTDoesNotUseWSS`: verifies candidate seeding never touches WSS in CFST mode.
+  - Added `TestSeedCandidatesGOWAYWSSUsesProfile`: verifies WSS candidate seeding strictly uses profile Host/Path.
+  - Added `TestCustomNonDefaultPortHost`: verifies non-default port header formatting.
+  - Added `TestAPIConfigActuallyChangesExecutionProfile`: verifies API updates directly modify probe execution targets.
+  - Added `TestArchitectureAntiRegression`: guards against profile override regressions across all subsystems.
+
 ## v2.1.2 (2026-09-08)
 
 ### Fix: Unify Probe Profile Execution & Isolate GOWAY WSS Mode

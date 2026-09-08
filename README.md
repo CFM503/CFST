@@ -1,10 +1,10 @@
 # CFST - Cloudflare Route Quality Probe & SpeedTest
 
-> v2.1.2 | Go Edition
+> v2.1.3 | Go Edition
 
 CFST 已从一次性 Cloudflare IP 测速工具全面重构升级为 **GOWAY 线路质量长期探针 + 稳定性分析 + 高峰期选路数据源 (Route Quality Probe & Stability Analyzer)**。
 
-核心设计哲学：**稳定性与保底速度 (P10) > 峰值瞬时速度**。杜绝瞬时抽水型峰值节点影响排名，为流媒体、高速隧道与科学选路提供最具韧性的前置线路决策依据。v2.1.2 全面实现了统一 ProbeProfile 驱动执行架构，彻底解耦 Cloudflare 官方探针与 GOWAY WSS 模式，消除配置漂移并支持 API 即时热生效。
+核心设计哲学：**稳定性与保底速度 (P10) > 峰值瞬时速度**。杜绝瞬时抽水型峰值节点影响排名，为流媒体、高速隧道与科学选路提供最具韧性的前置线路决策依据。v2.1.3 彻底消除了后台 daemon 与种子扫描中的旧 WSS 架构回归，统一 ProbeProfile 执行链，并修复了自定义 VPS 非标准端口 Host 头保留与 L4 目标直通。
 
 作为测量层无缝对接 **GoPass 控制器** 与 **GOWAY 隧道**。
 
@@ -70,6 +70,28 @@ CFST 已从一次性 Cloudflare IP 测速工具全面重构升级为 **GOWAY 线
 - 🧭 **智能选路建议体系 (Recommendations)** — 输出 `BEST`、`GOOD`、`USABLE`、`DEGRADED`、`AVOID`、`FAILED` 等级并附带诊断原因列表。
 - 📉 **EWMA 故障压制与衰减** — 线路发生探测失败时，EWMA 立即施加失败压力（`RecordFailure`），指数级衰减历史速度，防止离线节点残留虚高评分。
 - 💾 **原子化安全持久化** — 支持 Windows 文件系统安全的临时文件写入、`.bak` 轮转备份与双重恢复机制。
+
+## 架构统一与候选池初始化解耦 (v2.1.3)
+
+- 🔒 **消除 Daemon 启动默认配置覆盖回归 (`daemon.go`)** —
+  - `RunDaemon()` 强制构造 `ProfileGOWAYWSS` 的代码被彻底清除，严谨以 `DefaultProbeConfig()`（`ProfileCFST`）为唯一基础。
+  - 转换 CLI 参数至 `ProbeConfig` 时仅同步调度周期与并发等与 Profile 无关的参数。
+  - **彻底废除“WSSHost 非空即转为 WSS”的旧模式**：保留 `WSSHost` 仅作兼容字段，默认模式严格保持 `ProfileCFST`，只有显式指定 `--profile GOWAY-WSS` 时才允许启用 WSS。
+- 🔍 **候选节点种子扫描全面 Profile 驱动 (`scanner.go`)** —
+  - 淘汰初始扫描直接调用 `ScanPing(... cfg.WSSHost ...)` 的做法，实现 `ScanRoutesWithProfile()`。
+  - **默认 ProfileCFST**：仅执行 TCP Ping + HTTPS 连通性校验，**绝不调用 `WSSHandshakeCheck`，也绝不对 Cloudflare 官方 IP 请求 `/pyway`**。
+  - **ProfileGOWAYWSS**：仅在用户显式选定时执行 WSS 握手校验（使用配置的 Host、SNI 与 Path）。
+- 🌐 **自建 VPS 非标准端口与 HTTP Host 标头保持 (`probe.go`)** —
+  - 针对自建 VPS 目标（如 `https://my-vps.com:8443/data/speedtest.bin`），规范区分 HTTP Host 与 TLS SNI：
+    - `Host` 标头保持：`my-vps.com:8443`
+    - TLS SNI 保持（不带端口）：`my-vps.com`
+    - 标准端口（443/80）自动保持不带端口的标准 Host 形式。
+- 🎯 **L4 全量测速直通 ResolvedProbeTarget (`engine.go`)** —
+  - `SingleStreamTestDetailed()` 全面重构为直接接收 `ResolvedProbeTarget`，严格保证 `Target.URL`、`Target.SNI`、`Target.Host`、`Target.Protocol` 全部直接参与测速执行，避免局部重新解析丢失配置。
+- 📋 **启动日志明晰展示探针目标** —
+  - Daemon 启动时直接打印当前真实生效的 Profile 类型、协议、URL、Host、SNI 等关键参数，一目了然确认是否误入 WSS。
+- 🛡️ **六维架构防回归自动化测试集 (`daemon_test.go`)** —
+  - 包含 `TestRunDaemonDefaultProfileIsCFST`、`TestSeedCandidatesCFSTDoesNotUseWSS`、`TestSeedCandidatesGOWAYWSSUsesProfile`、`TestCustomNonDefaultPortHost`、`TestAPIConfigActuallyChangesExecutionProfile` 与 `TestArchitectureAntiRegression`。
 
 ---
 

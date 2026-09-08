@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"math"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -56,7 +57,7 @@ func handleAPIHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":         "ok",
 		"service":        "CFST Route Quality Probe",
-		"version":        "v2.1.2",
+		"version":        "v2.1.3",
 		"uptime_seconds": int64(time.Since(appStartTime).Seconds()),
 		"score_mode":     GlobalScoreEngine.GetMode(),
 		"profile":        cfg.Profile.Type,
@@ -291,11 +292,11 @@ func handleAPIRouteDetail(w http.ResponseWriter, r *http.Request, idOrIP string)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"metrics":           rec.Metrics,
-		"recommendation":    rec.Metrics.Recommendation,
-		"stability_grade":   rec.Metrics.StabilityGrade,
-		"confidence":        rec.Metrics.Confidence,
-		"final_score":       rec.Metrics.FinalScore,
+		"metrics":         rec.Metrics,
+		"recommendation":  rec.Metrics.Recommendation,
+		"stability_grade": rec.Metrics.StabilityGrade,
+		"confidence":      rec.Metrics.Confidence,
+		"final_score":     rec.Metrics.FinalScore,
 		"speed": SpeedSummary{
 			Avg:    math.Round(effectiveSpeed*10) / 10,
 			Median: math.Round(median*10) / 10,
@@ -307,10 +308,10 @@ func handleAPIRouteDetail(w http.ResponseWriter, r *http.Request, idOrIP string)
 			Rate:          math.Round(rec.Metrics.StallRate*1000) / 1000,
 			TotalDuration: math.Round(rec.Metrics.TotalStallDuration*10) / 10,
 		},
-		"ewma_short":        rec.EWMA.ShortSnapshot(),
-		"ewma_long":         rec.EWMA.LongSnapshot(),
-		"history":           windows,
-		"peak_hours":        peakHours,
+		"ewma_short": rec.EWMA.ShortSnapshot(),
+		"ewma_long":  rec.EWMA.LongSnapshot(),
+		"history":    windows,
+		"peak_hours": peakHours,
 	})
 }
 
@@ -395,6 +396,7 @@ type ConfigUpdateRequest struct {
 	SNI                *string           `json:"sni,omitempty"`
 	Host               *string           `json:"host,omitempty"`
 	Path               *string           `json:"path,omitempty"`
+	Port               *int              `json:"port,omitempty"`
 	ActiveIntervalSec  *int              `json:"active_interval_sec,omitempty"`
 	StandbyIntervalSec *int              `json:"standby_interval_sec,omitempty"`
 	L3ProbeCycle       *int              `json:"l3_probe_cycle,omitempty"`
@@ -405,7 +407,7 @@ func handleAPIConfig(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		cfg := GlobalProbeScheduler.GetConfig()
 		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"version":                "v2.1.2",
+			"version":                "v2.1.3",
 			"score_mode":             GlobalScoreEngine.GetMode(),
 			"profile":                cfg.Profile,
 			"profile_type":           cfg.Profile.Type,
@@ -451,8 +453,16 @@ func handleAPIConfig(w http.ResponseWriter, r *http.Request) {
 				cfg.Profile = NewProfileCustom("", "", 443)
 			}
 		}
+		if req.Port != nil && *req.Port > 0 {
+			cfg.Profile.Port = *req.Port
+		}
 		if req.TestURL != nil {
 			cfg.Profile.TestURL = *req.TestURL
+			if u, err := url.Parse(*req.TestURL); err == nil && u.Port() != "" {
+				if p, err := strconv.Atoi(u.Port()); err == nil && p > 0 {
+					cfg.Profile.Port = p
+				}
+			}
 		}
 		if req.SNI != nil {
 			cfg.Profile.SNI = *req.SNI

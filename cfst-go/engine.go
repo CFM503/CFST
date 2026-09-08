@@ -326,22 +326,16 @@ func ProcessIntervalSamples(intervals []SpeedIntervalSample, totalBytes int64, t
 }
 
 // SingleStreamTestDetailed runs true 1s interval sampling and returns full SpeedMetrics.
-func SingleStreamTestDetailed(ctx context.Context, ip string, port int, duration int, testURL string, customSNI string,
+// It executes strictly driven by the provided ResolvedProbeTarget (Target.URL, Target.SNI, Target.Host, Target.Port, Target.Protocol).
+func SingleStreamTestDetailed(ctx context.Context, target ResolvedProbeTarget, duration int,
 	progressCallback func(LiveProgress), tcpRTT, jitter, packetLoss float64) SpeedMetrics {
 
-	parsedURL, err := url.Parse(testURL)
+	parsedURL, err := url.Parse(target.URL)
 	if err != nil {
 		return SpeedMetrics{}
 	}
-	host := parsedURL.Hostname()
 
-	sni := host
-	if customSNI != "" {
-		sni = customSNI
-	} else if strings.Contains(testURL, "speed.cloudflare.com") {
-		sni = "speed.cloudflare.com"
-	}
-	client := makeHTTPClient(ip, port, sni)
+	client := makeHTTPClient(target.IP, target.Port, target.SNI)
 	if tr, ok := client.Transport.(*http.Transport); ok {
 		defer tr.CloseIdleConnections()
 	}
@@ -350,22 +344,22 @@ func SingleStreamTestDetailed(ctx context.Context, ip string, port int, duration
 	downloadCtx, cancel := context.WithTimeout(ctx, dur)
 	defer cancel()
 
-	req, err := newCFRequestWithContext(downloadCtx, "GET", testURL)
+	req, err := newCFRequestWithContext(downloadCtx, "GET", target.URL)
 	if err != nil {
 		return SpeedMetrics{}
 	}
-	req.Host = host
+	req.Host = target.Host
 	req.Header.Set("Connection", "keep-alive")
 
-	if !strings.Contains(testURL, "speed.cloudflare.com") {
-		scheme := parsedURL.Scheme
+	if !strings.Contains(target.URL, "speed.cloudflare.com") {
+		scheme := target.Protocol
+		if scheme == "" {
+			scheme = parsedURL.Scheme
+		}
 		if scheme == "" {
 			scheme = "https"
 		}
-		baseURL := scheme + "://" + host
-		if parsedURL.Port() != "" {
-			baseURL += ":" + parsedURL.Port()
-		}
+		baseURL := scheme + "://" + target.Host
 		setCFHeadersForURL(req, baseURL)
 	}
 
@@ -421,7 +415,7 @@ func SingleStreamTestDetailed(ctx context.Context, ip string, port int, duration
 
 					if progressCallback != nil {
 						progressCallback(LiveProgress{
-							IP:       ip,
+							IP:       target.IP,
 							Bytes:    curBytes,
 							Speed:    cumSpd,
 							Elapsed:  now.Sub(startGlobal).Seconds(),
@@ -503,7 +497,8 @@ func SingleStreamTestDetailed(ctx context.Context, ip string, port int, duration
 // Returns avgSpeed (MB/s), minSpeed (MB/s), stability (0-100).
 func SingleStreamTest(ctx context.Context, ip string, port int, duration int, testURL string, customSNI string,
 	progressCallback func(LiveProgress)) (avgSpeed, minSpeed, stability float64) {
-	sm := SingleStreamTestDetailed(ctx, ip, port, duration, testURL, customSNI, progressCallback, 0, 0, 0)
+	target := ResolveProbeTarget(ProbeConfig{Profile: NewProfileCustom(testURL, customSNI, port)}, ip, port)
+	sm := SingleStreamTestDetailed(ctx, target, duration, progressCallback, 0, 0, 0)
 	return sm.AverageSpeed, sm.MinSpeed, sm.Stability
 }
 
@@ -970,31 +965,17 @@ type LightweightHTTPProbeResult struct {
 	Error      string  `json:"error,omitempty"`
 }
 
-// LightweightHTTPProbe performs a minimal-overhead HTTP check (e.g. 100KB or range request)
-// to verify HTTP reachability, TTFB, and CDN Colo without consuming excessive bandwidth.
-func LightweightHTTPProbe(ctx context.Context, ip string, port int, testURL, customSNI string) LightweightHTTPProbeResult {
+// LightweightHTTPProbeTarget performs a minimal-overhead HTTP check driven strictly by ResolvedProbeTarget.
+func LightweightHTTPProbeTarget(ctx context.Context, target ResolvedProbeTarget) LightweightHTTPProbeResult {
 	res := LightweightHTTPProbeResult{}
-	parsedURL, err := url.Parse(testURL)
-	if err != nil {
-		res.Error = err.Error()
-		return res
-	}
-	host := parsedURL.Hostname()
-	sni := host
-	if customSNI != "" {
-		sni = customSNI
-	} else if strings.Contains(testURL, "speed.cloudflare.com") {
-		sni = "speed.cloudflare.com"
-	}
-
-	client := makeHTTPClient(ip, port, sni)
+	client := makeHTTPClient(target.IP, target.Port, target.SNI)
 	if tr, ok := client.Transport.(*http.Transport); ok {
 		defer tr.CloseIdleConnections()
 	}
 
 	// For Cloudflare official speed test, request a small 100KB chunk instead of 500MB
-	probeURL := testURL
-	if strings.Contains(testURL, "speed.cloudflare.com/__down") {
+	probeURL := target.URL
+	if strings.Contains(target.URL, "speed.cloudflare.com/__down") {
 		probeURL = "https://speed.cloudflare.com/__down?bytes=100000"
 	}
 
@@ -1006,20 +987,21 @@ func LightweightHTTPProbe(ctx context.Context, ip string, port int, testURL, cus
 		res.Error = err.Error()
 		return res
 	}
-	req.Host = host
+	req.Host = target.Host
 	req.Header.Set("Connection", "close")
 
-	if strings.Contains(testURL, "speed.cloudflare.com") {
+	if strings.Contains(target.URL, "speed.cloudflare.com") {
 		setCFHeaders(req)
 	} else {
-		scheme := parsedURL.Scheme
+		parsedURL, err := url.Parse(target.URL)
+		scheme := target.Protocol
+		if scheme == "" && err == nil && parsedURL.Scheme != "" {
+			scheme = parsedURL.Scheme
+		}
 		if scheme == "" {
 			scheme = "https"
 		}
-		baseURL := scheme + "://" + host
-		if parsedURL.Port() != "" {
-			baseURL += ":" + parsedURL.Port()
-		}
+		baseURL := scheme + "://" + target.Host
 		setCFHeadersForURL(req, baseURL)
 		req.Header.Set("Range", "bytes=0-102399")
 	}
@@ -1069,4 +1051,10 @@ func LightweightHTTPProbe(ctx context.Context, ip string, port int, testURL, cus
 	}
 	res.Success = true
 	return res
+}
+
+// LightweightHTTPProbe performs a minimal-overhead HTTP check (backward-compatible wrapper).
+func LightweightHTTPProbe(ctx context.Context, ip string, port int, testURL, customSNI string) LightweightHTTPProbeResult {
+	target := ResolveProbeTarget(ProbeConfig{Profile: NewProfileCustom(testURL, customSNI, port)}, ip, port)
+	return LightweightHTTPProbeTarget(ctx, target)
 }

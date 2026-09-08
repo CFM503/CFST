@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -70,18 +72,17 @@ func NewProfileGOWAYWSS(host, path, sni string, port int) ProbeProfile {
 
 // NewProfileCustom returns custom user-configured VPS URL probe profile.
 func NewProfileCustom(customURL, sni string, port int) ProbeProfile {
-	if port <= 0 {
-		port = 443
-	}
-	host := sni
 	path := "/"
 	protocol := "https"
+	hostname := sni
 	if customURL != "" {
 		if u, err := url.Parse(customURL); err == nil {
 			if u.Hostname() != "" {
-				host = u.Hostname()
-				if sni == "" {
-					sni = host
+				hostname = u.Hostname()
+			}
+			if u.Port() != "" {
+				if p, err := strconv.Atoi(u.Port()); err == nil && p > 0 {
+					port = p
 				}
 			}
 			if u.RequestURI() != "" {
@@ -92,9 +93,25 @@ func NewProfileCustom(customURL, sni string, port int) ProbeProfile {
 			}
 		}
 	}
-	if host == "" {
-		host = sni
+	if port <= 0 {
+		if protocol == "http" {
+			port = 80
+		} else {
+			port = 443
+		}
 	}
+	if sni == "" {
+		sni = hostname
+	}
+	if strings.Contains(sni, ":") {
+		sni = strings.Split(sni, ":")[0]
+	}
+
+	host := hostname
+	if port != 443 && port != 80 && hostname != "" && !strings.Contains(host, ":") {
+		host = fmt.Sprintf("%s:%d", hostname, port)
+	}
+
 	return ProbeProfile{
 		Type:     ProfileCustom,
 		Port:     port,
@@ -175,16 +192,18 @@ func NormalizeProbeConfig(cfg *ProbeConfig) {
 		cfg.WSSHost = cfg.Profile.Host
 
 	case ProfileCustom:
-		if cfg.Profile.Port <= 0 {
-			cfg.Profile.Port = 443
-		}
 		if cfg.Profile.TestURL != "" {
 			if u, err := url.Parse(cfg.Profile.TestURL); err == nil && u.Hostname() != "" {
+				if u.Port() != "" {
+					if p, err := strconv.Atoi(u.Port()); err == nil && p > 0 {
+						cfg.Profile.Port = p
+					}
+				}
 				if cfg.Profile.Host == "" {
 					cfg.Profile.Host = u.Hostname()
 				}
 				if cfg.Profile.SNI == "" {
-					cfg.Profile.SNI = cfg.Profile.Host
+					cfg.Profile.SNI = u.Hostname()
 				}
 				if cfg.Profile.Path == "" {
 					cfg.Profile.Path = u.RequestURI()
@@ -194,11 +213,24 @@ func NormalizeProbeConfig(cfg *ProbeConfig) {
 				}
 			}
 		}
+		if cfg.Profile.Port <= 0 {
+			if cfg.Profile.Protocol == "http" {
+				cfg.Profile.Port = 80
+			} else {
+				cfg.Profile.Port = 443
+			}
+		}
 		if cfg.Profile.Protocol == "" {
 			cfg.Profile.Protocol = "https"
 		}
 		if cfg.Profile.Path == "" {
 			cfg.Profile.Path = "/"
+		}
+		if strings.Contains(cfg.Profile.SNI, ":") {
+			cfg.Profile.SNI = strings.Split(cfg.Profile.SNI, ":")[0]
+		}
+		if cfg.Profile.Port != 443 && cfg.Profile.Port != 80 && cfg.Profile.Host != "" && !strings.Contains(cfg.Profile.Host, ":") {
+			cfg.Profile.Host = fmt.Sprintf("%s:%d", cfg.Profile.Host, cfg.Profile.Port)
 		}
 		if cfg.Profile.Protocol == "wss" {
 			cfg.WSSHost = cfg.Profile.Host
@@ -237,12 +269,25 @@ func ResolveProbeTarget(cfg ProbeConfig, ip string, port int) ResolvedProbeTarge
 	if targetPort <= 0 {
 		targetPort = 443
 	}
+
+	host := cfg.Profile.Host
+	if cfg.Profile.Type == ProfileCustom {
+		if targetPort != 443 && targetPort != 80 && host != "" && !strings.Contains(host, ":") {
+			host = fmt.Sprintf("%s:%d", host, targetPort)
+		}
+	}
+
+	sni := cfg.Profile.SNI
+	if strings.Contains(sni, ":") {
+		sni = strings.Split(sni, ":")[0]
+	}
+
 	return ResolvedProbeTarget{
 		ProfileType: cfg.Profile.Type,
 		IP:          ip,
 		Port:        targetPort,
-		SNI:         cfg.Profile.SNI,
-		Host:        cfg.Profile.Host,
+		SNI:         sni,
+		Host:        host,
 		Path:        cfg.Profile.Path,
 		URL:         cfg.Profile.TestURL,
 		Protocol:    cfg.Profile.Protocol,
@@ -475,7 +520,7 @@ func (ps *ProbeScheduler) ExecuteLayeredProbe(ctx context.Context, ip string, po
 	// Layer 3: Lightweight HTTP / HTTPS Probe (~100KB payload)
 	// -------------------------------------------------------------
 	if runL3 && !runFullSpeed {
-		l3Res := LightweightHTTPProbe(ctx, target.IP, target.Port, target.URL, target.SNI)
+		l3Res := LightweightHTTPProbeTarget(ctx, target)
 		if !l3Res.Success {
 			res.Error = "L3 HTTP probe failed: " + l3Res.Error
 			return res
@@ -504,7 +549,7 @@ func (ps *ProbeScheduler) ExecuteLayeredProbe(ctx context.Context, ip string, po
 			duration = 5
 		}
 
-		sm := SingleStreamTestDetailed(ctx, target.IP, target.Port, duration, target.URL, target.SNI, nil, res.RTT, res.Jitter, res.PacketLoss)
+		sm := SingleStreamTestDetailed(ctx, target, duration, nil, res.RTT, res.Jitter, res.PacketLoss)
 		res.SingleSpeed = sm.AverageSpeed
 		res.MinSpeed = sm.MinSpeed
 		res.P10Speed = sm.P10Speed

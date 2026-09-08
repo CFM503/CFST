@@ -34,14 +34,15 @@ type Config struct {
 	FilterMode      string
 	SNI             string
 	WSSHost         string
+	Profile         string // "CFST" (default), "GOWAY-WSS", "CUSTOM"
 
 	// Route Quality Probe daemon options
 	DaemonMode        bool
 	APIAddr           string
-	ActiveInterval    int // seconds
-	StandbyInterval   int // seconds
-	CandidateInterval int // seconds
-	FailedInterval    int // seconds
+	ActiveInterval    int    // seconds
+	StandbyInterval   int    // seconds
+	CandidateInterval int    // seconds
+	FailedInterval    int    // seconds
 	ScoreMode         string // "normal" or "peak"
 	StateFile         string // path to state snapshot json
 }
@@ -64,6 +65,7 @@ func DefaultConfig() Config {
 		QuickDuration:     3,
 		FilterMode:        "speed",
 		WSSHost:           "colo.4467107.xyz",
+		Profile:           "CFST",
 		DaemonMode:        false,
 		APIAddr:           "127.0.0.1:9876",
 		ActiveInterval:    10,
@@ -75,13 +77,186 @@ func DefaultConfig() Config {
 	}
 }
 
+// GetProbeProfile returns the effective ProbeProfile derived strictly from Config.
+// The default is strictly ProfileCFST unless cfg.Profile is explicitly "GOWAY-WSS" or "CUSTOM".
+func (cfg Config) GetProbeProfile() ProbeProfile {
+	switch strings.ToUpper(strings.TrimSpace(cfg.Profile)) {
+	case "GOWAY-WSS", "GOWAY_WSS", "WSS":
+		return NewProfileGOWAYWSS(cfg.WSSHost, "/pyway", cfg.SNI, cfg.Port)
+	case "CUSTOM":
+		return NewProfileCustom(cfg.URL, cfg.SNI, cfg.Port)
+	default:
+		if isCustomURL(cfg.URL) {
+			return NewProfileCustom(cfg.URL, cfg.SNI, cfg.Port)
+		}
+		return NewProfileCFST()
+	}
+}
+
 func isCustomURL(urlStr string) bool {
 	return !strings.Contains(urlStr, "speed.cloudflare.com/__down")
 }
 
+// ScanRoutesWithProfile runs profile-driven candidate discovery.
+// - ProfileCFST: TCP Ping + HTTPSConnectivityCheck (strictly NO WSS, NEVER calls WSSHandshakeCheck).
+// - ProfileGOWAYWSS: TCP Ping + WSSHandshakeCheck (using Profile.Host, Profile.SNI, Profile.Path).
+// - ProfileCustom: TCP Ping + (HTTPSConnectivityCheck if http/https, WSSHandshakeCheck if wss).
+func ScanRoutesWithProfile(ctx context.Context, ips []string, port int, concurrency int, profile ProbeProfile, progressCallback func(done, total, valid int)) []NodeResult {
+	if profile.Type == "" {
+		profile = NewProfileCFST()
+	}
+	targetPort := port
+	if targetPort <= 0 {
+		targetPort = profile.Port
+	}
+	if targetPort <= 0 {
+		targetPort = 443
+	}
+
+	var validNodes []NodeResult
+	var mu sync.Mutex
+	var done, validCount atomic.Int32
+	total := len(ips)
+
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+
+	for _, ip := range ips {
+		if ctx.Err() != nil {
+			break
+		}
+		wg.Add(1)
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			wg.Done()
+			continue
+		}
+
+		go func(ip string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			if ctx.Err() != nil {
+				return
+			}
+
+			// Layer 1: TCP Ping (5 pings)
+			pingCount := 5
+			lats := make([]float64, 0, 5)
+			for i := 0; i < pingCount; i++ {
+				if ctx.Err() != nil {
+					return
+				}
+				lat := TCPPing(ip, targetPort, 1500*time.Millisecond)
+				if lat > 0 {
+					lats = append(lats, lat)
+				}
+				if i < pingCount-1 {
+					select {
+					case <-time.After(30 * time.Millisecond):
+					case <-ctx.Done():
+						return
+					}
+				}
+			}
+
+			d := done.Add(1)
+			if len(lats) < pingCount-1 { // require at least 4 successful pings
+				if progressCallback != nil && (d%10 == 0 || d == int32(total)) {
+					progressCallback(int(d), total, int(validCount.Load()))
+				}
+				return
+			}
+
+			var sum float64
+			for _, l := range lats {
+				sum += l
+			}
+			avgLat := sum / float64(len(lats))
+
+			jitter := 0.0
+			if len(lats) > 1 {
+				var variance float64
+				for _, l := range lats {
+					diff := l - avgLat
+					variance += diff * diff
+				}
+				jitter = math.Sqrt(variance / float64(len(lats)))
+			}
+			loss := float64(pingCount-len(lats)) / float64(pingCount)
+
+			// Layer 2: Profile-driven check
+			var detectedColo string
+			switch profile.Type {
+			case ProfileCFST:
+				// TCP Ping + HTTPSConnectivityCheck (Cloudflare Official, strictly NO WSS)
+				ok, _, _, colo, err := HTTPSConnectivityCheck(ctx, ip, targetPort, profile.SNI, profile.Host, profile.TestURL, 3*time.Second)
+				if !ok || err != nil {
+					if progressCallback != nil && (d%10 == 0 || d == int32(total)) {
+						progressCallback(int(d), total, int(validCount.Load()))
+					}
+					return
+				}
+				detectedColo = colo
+
+			case ProfileGOWAYWSS:
+				// TCP Ping + WSSHandshakeCheck using Profile fields
+				ok := WSSHandshakeCheck(ip, targetPort, profile.SNI, profile.Host, profile.Path, 3*time.Second)
+				if !ok {
+					if progressCallback != nil && (d%10 == 0 || d == int32(total)) {
+						progressCallback(int(d), total, int(validCount.Load()))
+					}
+					return
+				}
+
+			case ProfileCustom:
+				if profile.Protocol == "wss" {
+					ok := WSSHandshakeCheck(ip, targetPort, profile.SNI, profile.Host, profile.Path, 3*time.Second)
+					if !ok {
+						if progressCallback != nil && (d%10 == 0 || d == int32(total)) {
+							progressCallback(int(d), total, int(validCount.Load()))
+						}
+						return
+					}
+				} else {
+					ok, _, _, colo, err := HTTPSConnectivityCheck(ctx, ip, targetPort, profile.SNI, profile.Host, profile.TestURL, 3*time.Second)
+					if !ok || err != nil {
+						if progressCallback != nil && (d%10 == 0 || d == int32(total)) {
+							progressCallback(int(d), total, int(validCount.Load()))
+						}
+						return
+					}
+					detectedColo = colo
+				}
+			}
+
+			mu.Lock()
+			validNodes = append(validNodes, NodeResult{
+				IP:         ip,
+				Port:       targetPort,
+				TCPLatency: avgLat,
+				Jitter:     jitter,
+				PacketLoss: loss,
+				Colo:       detectedColo,
+			})
+			mu.Unlock()
+			validCount.Add(1)
+
+			if progressCallback != nil && (d%10 == 0 || d == int32(total)) {
+				progressCallback(int(d), total, int(validCount.Load()))
+			}
+		}(ip)
+	}
+	wg.Wait()
+	return validNodes
+}
+
 // ScanPing runs 5 TCP pings per IP and filters by packet loss.
-// When wssHost is non-empty, it additionally verifies goway's WebSocket
-// upgrade handshake and drops IPs that fail it (e.g. Cloudflare 403).
+// Legacy compatibility wrapper for CLI; for profile-driven scanning, use ScanRoutesWithProfile.
 func ScanPing(ctx context.Context, ips []string, port int, concurrency int, wssHost string, progressCallback func(done, total, valid int)) []NodeResult {
 	var validNodes []NodeResult
 	var mu sync.Mutex
@@ -139,7 +314,6 @@ func ScanPing(ctx context.Context, ips []string, port int, concurrency int, wssH
 				avgLat := sum / float64(len(lats))
 
 				if wssHost != "" && !WSSHandshakeCheck(ip, port, wssHost, wssHost, "/pyway", 3*time.Second) {
-					d := done.Add(1)
 					if progressCallback != nil && (d%10 == 0 || d == int32(total)) {
 						progressCallback(int(d), total, int(validCount.Load()))
 					}
@@ -291,8 +465,9 @@ func runQuickFilter(ctx context.Context, candidates []NodeResult, cfg Config, to
 		go func(idx int, ip string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			speed, _, _ := SingleStreamTest(ctx, ip, cfg.Port, cfg.QuickDuration, cfg.URL, cfg.SNI, nil)
-			results[idx] = quickResult{idx: idx, speed: speed}
+			target := ResolveProbeTarget(ProbeConfig{Profile: cfg.GetProbeProfile()}, ip, cfg.Port)
+			sm := SingleStreamTestDetailed(ctx, target, cfg.QuickDuration, nil, 0, 0, 0)
+			results[idx] = quickResult{idx: idx, speed: sm.AverageSpeed}
 			d := doneCount.Add(1)
 			if progressCallback != nil {
 				progressCallback(int(d), len(candidates))
@@ -404,7 +579,8 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 						t, len(candidates), cand.IP, int(totalSkipped.Load())))
 				}
 
-				sm := SingleStreamTestDetailed(ctx, cand.IP, cfg.Port, cfg.Duration, cfg.URL, cfg.SNI, progressLive, cand.TCPLatency, cand.Jitter, cand.PacketLoss)
+				candTarget := ResolveProbeTarget(ProbeConfig{Profile: cfg.GetProbeProfile()}, cand.IP, cfg.Port)
+				sm := SingleStreamTestDetailed(ctx, candTarget, cfg.Duration, progressLive, cand.TCPLatency, cand.Jitter, cand.PacketLoss)
 
 				if sm.AverageSpeed == 0 && sm.MinSpeed == 0 && sm.Stability == 0 {
 					totalSkipped.Add(1)
@@ -422,9 +598,11 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 					}
 				} else {
 					workerCooldownMs = 500
-					cand.Colo = GetColo(cand.IP, cfg.Port)
-					if !cfg.SkipLoadLatency {
-						cand.LoadLatency = MeasureLoadLatency(cand.IP, cfg.Port)
+					if candTarget.ProfileType == ProfileCFST && strings.Contains(candTarget.URL, "speed.cloudflare.com") {
+						cand.Colo = GetColo(cand.IP, cfg.Port)
+						if !cfg.SkipLoadLatency {
+							cand.LoadLatency = MeasureLoadLatency(cand.IP, cfg.Port)
+						}
 					}
 					cand.DownloadSpeed = sm.AverageSpeed
 					cand.SingleSpeed = sm.AverageSpeed
@@ -466,14 +644,14 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 }
 
 func RunCLI(cfg Config) {
-	fmt.Printf("Cloudflare SpeedTest v2.1.2 (Route Quality Probe - Go Edition)\n\n")
+	fmt.Printf("Cloudflare SpeedTest v2.1.3 (Route Quality Probe - Go Edition)\n\n")
 
 	ips := GenerateIPs(cfg.MaxScan, cfg.Unique, cfg.IPFile)
 	fmt.Printf("🔍 Scanning %d IPs (concurrency: %d)...\n", len(ips), cfg.ScanConcurrent)
 
 	ctx := context.Background()
 
-	validNodes := ScanPing(ctx, ips, cfg.Port, cfg.ScanConcurrent, cfg.WSSHost, func(done, total, valid int) {
+	validNodes := ScanRoutesWithProfile(ctx, ips, cfg.Port, cfg.ScanConcurrent, cfg.GetProbeProfile(), func(done, total, valid int) {
 		fmt.Printf("\r  Process: %d/%d | Valid: %d", done, total, valid)
 	})
 	fmt.Println()

@@ -26,6 +26,7 @@ func main() {
 	flag.StringVar(&cfg.FilterMode, "filter", cfg.FilterMode, "Candidate filter mode (speed, multi-colo, none)")
 	flag.StringVar(&cfg.SNI, "sni", cfg.SNI, "Custom TLS SNI (ServerName)")
 	flag.StringVar(&cfg.WSSHost, "wsshost", cfg.WSSHost, "WebSocket fake Host for goway handshake check (enabled by default, pass empty string to disable)")
+	flag.StringVar(&cfg.Profile, "profile", cfg.Profile, "Probe profile: CFST (default), GOWAY-WSS, CUSTOM")
 	flag.BoolVar(&cfg.DaemonMode, "daemon", cfg.DaemonMode, "Run as continuous Route Quality Probe daemon")
 	flag.StringVar(&cfg.APIAddr, "api-addr", cfg.APIAddr, "Local API listen address (default 127.0.0.1:9876)")
 	flag.IntVar(&cfg.ActiveInterval, "active-interval", cfg.ActiveInterval, "Active route probe interval in seconds")
@@ -60,7 +61,7 @@ func main() {
 	flag.Parse()
 
 	if *versionFlag {
-		println("CFST v2.1.2 (GOWAY Route Quality Probe & Long-Term Stability Analyzer)")
+		println("CFST v2.1.3 (GOWAY Route Quality Probe & Long-Term Stability Analyzer)")
 		return
 	}
 

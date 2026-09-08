@@ -8,46 +8,80 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 )
 
+// ConfigToProbeConfig converts daemon CLI Config to ProbeConfig.
+// It starts strictly with DefaultProbeConfig() (ProfileCFST) as the base configuration.
+// Only profile-independent scheduling parameters are copied from cfg.
+// Profile remains strictly ProfileCFST unless cfg.Profile is explicitly "GOWAY-WSS" or "CUSTOM".
+// It NEVER automatically switches to GOWAY-WSS due to cfg.WSSHost being non-empty.
+func ConfigToProbeConfig(cfg Config) ProbeConfig {
+	probeCfg := DefaultProbeConfig()
+
+	if cfg.ActiveInterval > 0 {
+		probeCfg.ActiveInterval = time.Duration(cfg.ActiveInterval) * time.Second
+	}
+	if cfg.StandbyInterval > 0 {
+		probeCfg.StandbyInterval = time.Duration(cfg.StandbyInterval) * time.Second
+	}
+	if cfg.CandidateInterval > 0 {
+		probeCfg.CandidateInterval = time.Duration(cfg.CandidateInterval) * time.Second
+	}
+	if cfg.FailedInterval > 0 {
+		probeCfg.FailedInterval = time.Duration(cfg.FailedInterval) * time.Second
+	}
+	if cfg.QuickDuration > 0 {
+		probeCfg.QuickDuration = cfg.QuickDuration
+	}
+	if cfg.Duration > 0 {
+		probeCfg.FullDuration = cfg.Duration
+	}
+
+	// Profile is strictly explicit!
+	switch strings.ToUpper(strings.TrimSpace(cfg.Profile)) {
+	case "GOWAY-WSS", "GOWAY_WSS", "WSS":
+		probeCfg.Profile = NewProfileGOWAYWSS(cfg.WSSHost, "/pyway", cfg.SNI, cfg.Port)
+	case "CUSTOM":
+		probeCfg.Profile = NewProfileCustom(cfg.URL, cfg.SNI, cfg.Port)
+	default:
+		// Keep DefaultProbeConfig()'s ProfileCFST!
+		// WSSHost does NOT cause automatic switch to GOWAY-WSS.
+	}
+
+	NormalizeProbeConfig(&probeCfg)
+	return probeCfg
+}
+
 // RunDaemon initializes and runs CFST as a continuous Route Quality Probe daemon.
 func RunDaemon(cfg Config) {
+	probeCfg := ConfigToProbeConfig(cfg)
+	GlobalProbeScheduler.UpdateConfig(probeCfg)
+	GlobalScoreEngine.SetMode(ScoreMode(cfg.ScoreMode))
+
 	fmt.Println("============================================================")
-	fmt.Println("   CFST Route Quality Probe v2.1.2 (Continuous Daemon Mode)")
+	fmt.Println("   CFST Route Quality Probe v2.1.3 (Continuous Daemon Mode)")
 	fmt.Printf("   Listening on: http://%s\n", cfg.APIAddr)
 	fmt.Printf("   Score Mode:   %s\n", cfg.ScoreMode)
 	fmt.Printf("   Intervals:    Active: %ds | Standby: %ds | Candidate: %ds | Failed: %ds\n",
-		cfg.ActiveInterval, cfg.StandbyInterval, cfg.CandidateInterval, cfg.FailedInterval)
-	fmt.Println("============================================================")
-
-	GlobalScoreEngine.SetMode(ScoreMode(cfg.ScoreMode))
-
-	probeCfg := ProbeConfig{
-		Profile: ProbeProfile{
-			Type:     ProfileGOWAYWSS,
-			Port:     cfg.Port,
-			Host:     cfg.WSSHost,
-			Path:     "/pyway",
-			TestURL:  cfg.URL,
-			Protocol: "wss",
-		},
-		ActiveInterval:    time.Duration(cfg.ActiveInterval) * time.Second,
-		StandbyInterval:   time.Duration(cfg.StandbyInterval) * time.Second,
-		CandidateInterval: time.Duration(cfg.CandidateInterval) * time.Second,
-		FailedInterval:    time.Duration(cfg.FailedInterval) * time.Second,
-		MaxConcurrent:     4,
-		MaxSpeedTests:     1,
-		QuickDuration:     cfg.QuickDuration,
-		FullDuration:      cfg.Duration,
-		SpeedTestCycle:    6,
-		WSSHost:           cfg.WSSHost,
-		SNI:               cfg.SNI,
-		URL:               cfg.URL,
-		Port:              cfg.Port,
+		int(probeCfg.ActiveInterval.Seconds()),
+		int(probeCfg.StandbyInterval.Seconds()),
+		int(probeCfg.CandidateInterval.Seconds()),
+		int(probeCfg.FailedInterval.Seconds()))
+	fmt.Printf("   Profile:      %s\n", probeCfg.Profile.Type)
+	fmt.Printf("   Protocol:     %s\n", strings.ToUpper(probeCfg.Profile.Protocol))
+	if probeCfg.Profile.Type == ProfileGOWAYWSS {
+		fmt.Printf("   Host:         %s\n", probeCfg.Profile.Host)
+		fmt.Printf("   SNI:          %s\n", probeCfg.Profile.SNI)
+		fmt.Printf("   Path:         %s\n", probeCfg.Profile.Path)
+	} else {
+		fmt.Printf("   Test URL:     %s\n", probeCfg.Profile.TestURL)
+		fmt.Printf("   SNI:          %s\n", probeCfg.Profile.SNI)
+		fmt.Printf("   Host:         %s\n", probeCfg.Profile.Host)
 	}
-	GlobalProbeScheduler.UpdateConfig(probeCfg)
+	fmt.Println("============================================================")
 
 	// 1. Try loading cached snapshot from disk
 	if cfg.StateFile != "" {
@@ -122,17 +156,19 @@ func RunDaemon(cfg Config) {
 	}
 }
 
-// seedCandidates runs an initial scan to discover candidates and populate the store.
+// seedCandidates runs an initial scan to discover candidates and populate the store,
+// strictly driven by the active ProbeProfile in GlobalProbeScheduler.
 func seedCandidates(ctx context.Context, cfg Config) {
+	probeCfg := GlobalProbeScheduler.GetConfig()
 	ips := GenerateIPs(cfg.MaxScan, cfg.Unique, cfg.IPFile)
 	if len(ips) == 0 {
 		return
 	}
 
-	fmt.Printf("  Scanning %d IPs (concurrency: %d)...\n", len(ips), cfg.ScanConcurrent)
-	validNodes := ScanPing(ctx, ips, cfg.Port, cfg.ScanConcurrent, cfg.WSSHost, func(done, total, valid int) {
+	fmt.Printf("  Scanning %d IPs with Profile: %s (concurrency: %d)...\n", len(ips), probeCfg.Profile.Type, cfg.ScanConcurrent)
+	validNodes := ScanRoutesWithProfile(ctx, ips, probeCfg.Port, cfg.ScanConcurrent, probeCfg.Profile, func(done, total, valid int) {
 		if done%50 == 0 || done == total {
-			fmt.Printf("\r  Seed Ping Scan: %d/%d (Valid: %d)", done, total, valid)
+			fmt.Printf("\r  Seed %s Scan: %d/%d (Valid: %d)", probeCfg.Profile.Type, done, total, valid)
 		}
 	})
 	fmt.Println()
@@ -154,10 +190,17 @@ func seedCandidates(ctx context.Context, cfg Config) {
 	// Quick filter
 	quickCfg := cfg
 	quickCfg.DLConc = 4
+	quickCfg.Profile = string(probeCfg.Profile.Type)
+	quickCfg.URL = probeCfg.Profile.TestURL
+	quickCfg.SNI = probeCfg.Profile.SNI
 	candidates = runQuickFilter(ctx, candidates, quickCfg, cfg.DownloadNum, nil)
 
 	// Test and insert into store
-	results := runParallelDownloadTest(ctx, candidates, cfg, nil, nil, nil, nil)
+	testCfg := cfg
+	testCfg.Profile = string(probeCfg.Profile.Type)
+	testCfg.URL = probeCfg.Profile.TestURL
+	testCfg.SNI = probeCfg.Profile.SNI
+	results := runParallelDownloadTest(ctx, candidates, testCfg, nil, nil, nil, nil)
 	for i, res := range results {
 		tier := TierCandidate
 		if i == 0 {

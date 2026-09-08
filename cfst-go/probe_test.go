@@ -74,8 +74,8 @@ func TestLowTrafficProbeScheduler(t *testing.T) {
 		if c != int64(i) {
 			t.Fatalf("expected cycle %d, got %d", i, c)
 		}
-		isL3 := (int(c) % cfg.L3ProbeCycle == 0)
-		isL4 := (int(c) % cfg.FullSpeedCycle == 0)
+		isL3 := (int(c)%cfg.L3ProbeCycle == 0)
+		isL4 := (int(c)%cfg.FullSpeedCycle == 0)
 
 		if i == 1 || i == 2 {
 			if isL3 || isL4 {
@@ -191,8 +191,8 @@ func TestProfileCustomVPSURL(t *testing.T) {
 	if target.URL != vpsURL {
 		t.Fatalf("expected %s, got %s", vpsURL, target.URL)
 	}
-	if target.Host != "my-vps.com" {
-		t.Fatalf("expected host my-vps.com, got %s", target.Host)
+	if target.Host != "my-vps.com:8443" {
+		t.Fatalf("expected host my-vps.com:8443, got %s", target.Host)
 	}
 	if target.SNI != "my-vps.com" {
 		t.Fatalf("expected SNI my-vps.com, got %s", target.SNI)
