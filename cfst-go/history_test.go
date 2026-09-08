@@ -644,3 +644,287 @@ func TestUpsertRoutePreservesGOWAYWSSDiagnostics(t *testing.T) {
 		t.Fatalf("expected Path '/pyway-recovered', got %q", got3.GOWAYWSSPathSent)
 	}
 }
+
+func TestGetBestExcludesIncompatibleGOWAYWSS(t *testing.T) {
+	origCfg := GlobalProbeScheduler.GetConfig()
+	defer GlobalProbeScheduler.UpdateConfig(origCfg)
+
+	cfg := DefaultProbeConfig()
+	cfg.Profile = NewProfileGOWAYWSS("wss.example.com", "/pyway", "sni.example.com", 443)
+	GlobalProbeScheduler.UpdateConfig(cfg)
+
+	store := NewRouteStore()
+	now := time.Now()
+
+	// Node A: WSS incompatible, but high score and healthy
+	store.UpsertRoute(RouteMetrics{
+		ID:                 "route-A",
+		IP:                 "198.51.100.1",
+		Port:               443,
+		Tier:               TierStandby,
+		Health:             HealthHealthy,
+		FinalScore:         99.0,
+		Confidence:         100.0,
+		GOWAYWSSCompatible: false,
+		LastTested:         now,
+	})
+
+	// Node B: WSS compatible, lower score but healthy
+	store.UpsertRoute(RouteMetrics{
+		ID:                 "route-B",
+		IP:                 "198.51.100.2",
+		Port:               443,
+		Tier:               TierStandby,
+		Health:             HealthHealthy,
+		FinalScore:         80.0,
+		Confidence:         80.0,
+		GOWAYWSSCompatible: true,
+		LastTested:         now,
+	})
+
+	best := store.GetBest(10, "")
+	for _, r := range best {
+		if r.IP == "198.51.100.1" {
+			t.Fatalf("Node A (WSS incompatible, score 99) must NOT appear in GetBest() under GOWAY-WSS mode")
+		}
+	}
+
+	foundB := false
+	for _, r := range best {
+		if r.IP == "198.51.100.2" {
+			foundB = true
+			break
+		}
+	}
+	if !foundB {
+		t.Fatalf("Node B (WSS compatible, score 80) must appear in GetBest(), got: %+v", best)
+	}
+}
+
+func TestCandidateCannotPromoteWhenGOWAYWSSIncompatible(t *testing.T) {
+	origCfg := GlobalProbeScheduler.GetConfig()
+	defer GlobalProbeScheduler.UpdateConfig(origCfg)
+
+	cfg := DefaultProbeConfig()
+	cfg.Profile = NewProfileGOWAYWSS("wss.example.com", "/pyway", "sni.example.com", 443)
+	GlobalProbeScheduler.UpdateConfig(cfg)
+
+	store := NewRouteStore()
+	now := time.Now()
+
+	rec := store.UpsertRoute(RouteMetrics{
+		ID:                  "cand-incompatible",
+		IP:                  "192.0.2.1",
+		Port:                443,
+		Tier:                TierCandidate,
+		Health:              HealthHealthy,
+		ObservationDuration: 350.0,
+		Confidence:          40.0,
+		FinalScore:          75.0,
+		PacketLoss:          0.01,
+		Jitter:              10.0,
+		StallCount:          0,
+		GOWAYWSSCompatible:  false,
+		LastTested:          now,
+	})
+
+	for i := 0; i < 3; i++ {
+		rec.Samples = append(rec.Samples, MeasurementSample{
+			Timestamp: now.Add(time.Duration(i) * time.Minute),
+			Speed:     20.0,
+			Success:   true,
+		})
+	}
+
+	store.EvaluateTierTransitions(now)
+
+	got, ok := store.Get("192.0.2.1")
+	if !ok {
+		t.Fatalf("route not found")
+	}
+	if got.Metrics.Tier == TierStandby {
+		t.Fatalf("Candidate with GOWAYWSSCompatible=false must NOT promote to TierStandby in GOWAY-WSS mode, got %s", got.Metrics.Tier)
+	}
+	if got.Metrics.Tier != TierCandidate {
+		t.Fatalf("expected TierCandidate, got %s", got.Metrics.Tier)
+	}
+}
+
+func TestStandbyCannotPromoteWhenGOWAYWSSIncompatible(t *testing.T) {
+	origCfg := GlobalProbeScheduler.GetConfig()
+	defer GlobalProbeScheduler.UpdateConfig(origCfg)
+
+	cfg := DefaultProbeConfig()
+	cfg.Profile = NewProfileGOWAYWSS("wss.example.com", "/pyway", "sni.example.com", 443)
+	GlobalProbeScheduler.UpdateConfig(cfg)
+
+	store := NewRouteStore()
+	now := time.Now()
+
+	store.UpsertRoute(RouteMetrics{
+		ID:                 "standby-incompatible",
+		IP:                 "192.0.2.2",
+		Port:               443,
+		Tier:               TierStandby,
+		Health:             HealthHealthy,
+		Confidence:         60.0,
+		FinalScore:         80.0,
+		PacketLoss:         0.01,
+		StallCount:         0,
+		GOWAYWSSCompatible: false,
+		LastTested:         now,
+	})
+
+	store.EvaluateTierTransitions(now)
+
+	got, ok := store.Get("192.0.2.2")
+	if !ok {
+		t.Fatalf("route not found")
+	}
+	if got.Metrics.Tier == TierActive {
+		t.Fatalf("Standby with GOWAYWSSCompatible=false must NOT promote to TierActive in GOWAY-WSS mode")
+	}
+	if got.Metrics.Tier != TierStandby {
+		t.Fatalf("expected TierStandby, got %s", got.Metrics.Tier)
+	}
+}
+
+func TestGOWAYWSSIncompatibleChallengerCannotReplaceActive(t *testing.T) {
+	origCfg := GlobalProbeScheduler.GetConfig()
+	defer GlobalProbeScheduler.UpdateConfig(origCfg)
+
+	cfg := DefaultProbeConfig()
+	cfg.Profile = NewProfileGOWAYWSS("wss.example.com", "/pyway", "sni.example.com", 443)
+	GlobalProbeScheduler.UpdateConfig(cfg)
+
+	store := NewRouteStore()
+	now := time.Now()
+
+	// Active route: WSS compatible, score 70
+	store.UpsertRoute(RouteMetrics{
+		ID:                  "active-compatible",
+		IP:                  "192.0.2.10",
+		Port:                443,
+		Tier:                TierActive,
+		Health:              HealthHealthy,
+		Confidence:          70.0,
+		ObservationDuration: 1000.0,
+		FinalScore:          70.0,
+		P10Speed:            20.0,
+		PacketLoss:          0.0,
+		StallCount:          0,
+		GOWAYWSSCompatible:  true,
+		LastTested:          now,
+	})
+
+	// Standby challenger: WSS incompatible, score 99, beats active in every metric
+	store.UpsertRoute(RouteMetrics{
+		ID:                  "standby-challenger",
+		IP:                  "192.0.2.11",
+		Port:                443,
+		Tier:                TierStandby,
+		Health:              HealthHealthy,
+		Confidence:          100.0,
+		ObservationDuration: 1200.0,
+		FinalScore:          99.0,
+		P10Speed:            50.0,
+		PacketLoss:          0.0,
+		StallCount:          0,
+		GOWAYWSSCompatible:  false,
+		LastTested:          now,
+	})
+
+	store.EvaluateTierTransitions(now)
+
+	activeGot, ok := store.Get("192.0.2.10")
+	if !ok || activeGot.Metrics.Tier != TierActive {
+		t.Fatalf("original active must remain TierActive, got %+v", activeGot)
+	}
+
+	challengerGot, ok := store.Get("192.0.2.11")
+	if !ok || challengerGot.Metrics.Tier != TierStandby {
+		t.Fatalf("WSS incompatible challenger must remain TierStandby, got %+v", challengerGot)
+	}
+}
+
+func TestCFSTModeIgnoresGOWAYWSSCompatibilityFlag(t *testing.T) {
+	origCfg := GlobalProbeScheduler.GetConfig()
+	defer GlobalProbeScheduler.UpdateConfig(origCfg)
+
+	cfg := DefaultProbeConfig()
+	cfg.Profile = NewProfileCFST()
+	GlobalProbeScheduler.UpdateConfig(cfg)
+
+	store := NewRouteStore()
+	now := time.Now()
+
+	// Route with GOWAYWSSCompatible = false, but healthy and good score
+	store.UpsertRoute(RouteMetrics{
+		ID:                 "cfst-route-1",
+		IP:                 "192.0.2.20",
+		Port:               443,
+		Tier:               TierStandby,
+		Health:             HealthHealthy,
+		Confidence:         80.0,
+		FinalScore:         90.0,
+		PacketLoss:         0.01,
+		StallCount:         0,
+		GOWAYWSSCompatible: false,
+		LastTested:         now,
+	})
+
+	// 1. GetBest in CFST mode MUST return this route despite GOWAYWSSCompatible=false
+	best := store.GetBest(1, "")
+	if len(best) != 1 || best[0].IP != "192.0.2.20" {
+		t.Fatalf("CFST mode must ignore GOWAYWSSCompatible=false in GetBest, got %+v", best)
+	}
+
+	// 2. Promotion to TierActive in CFST mode MUST succeed despite GOWAYWSSCompatible=false
+	store.EvaluateTierTransitions(now)
+	got, ok := store.Get("192.0.2.20")
+	if !ok {
+		t.Fatalf("route not found")
+	}
+	if got.Metrics.Tier != TierActive {
+		t.Fatalf("CFST mode must promote healthy standby to TierActive regardless of GOWAYWSSCompatible flag, got %s", got.Metrics.Tier)
+	}
+}
+
+func TestActiveDemotedWhenGOWAYWSSIncompatible(t *testing.T) {
+	origCfg := GlobalProbeScheduler.GetConfig()
+	defer GlobalProbeScheduler.UpdateConfig(origCfg)
+
+	cfg := DefaultProbeConfig()
+	cfg.Profile = NewProfileGOWAYWSS("wss.example.com", "/pyway", "sni.example.com", 443)
+	GlobalProbeScheduler.UpdateConfig(cfg)
+
+	store := NewRouteStore()
+	now := time.Now()
+
+	// Active route that failed WSS handshake (GOWAYWSSCompatible = false)
+	store.UpsertRoute(RouteMetrics{
+		ID:                 "active-bad-wss",
+		IP:                 "192.0.2.30",
+		Port:               443,
+		Tier:               TierActive,
+		Health:             HealthHealthy,
+		Confidence:         80.0,
+		FinalScore:         90.0,
+		GOWAYWSSCompatible: false,
+		LastTested:         now,
+	})
+
+	store.EvaluateTierTransitions(now)
+
+	got, ok := store.Get("192.0.2.30")
+	if !ok {
+		t.Fatalf("route not found")
+	}
+	if got.Metrics.Tier == TierActive {
+		t.Fatalf("Active route with GOWAYWSSCompatible=false must be demoted from TierActive in GOWAY-WSS mode")
+	}
+	if got.Metrics.Tier != TierStandby {
+		t.Fatalf("expected demotion to TierStandby, got %s", got.Metrics.Tier)
+	}
+}
+

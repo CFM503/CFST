@@ -697,6 +697,16 @@ func (s *RouteStore) GetAll() []RouteMetrics {
 	return s.getAllLocked()
 }
 
+// isCurrentProfileGOWAYWSS checks if the active probe profile in GlobalProbeScheduler is GOWAY-WSS
+// or CUSTOM with protocol "wss".
+func isCurrentProfileGOWAYWSS() bool {
+	if GlobalProbeScheduler == nil {
+		return false
+	}
+	cfg := GlobalProbeScheduler.GetConfig()
+	return cfg.Profile.Type == ProfileGOWAYWSS || (cfg.Profile.Type == ProfileCustom && cfg.Profile.Protocol == "wss")
+}
+
 // GetBest selects routes optimizing for stability > peak speed, with multi-level tie-breaking.
 func (s *RouteStore) GetBest(limit int, colo string) []RouteMetrics {
 	s.mu.RLock()
@@ -707,6 +717,7 @@ func (s *RouteStore) GetBest(limit int, colo string) []RouteMetrics {
 	now := time.Now()
 	curHour := now.Hour()
 	isPeakTime := (mode == ModePeak) || (curHour >= 19 && curHour <= 23)
+	isGOWAYWSS := isCurrentProfileGOWAYWSS()
 
 	type candidateScore struct {
 		m              RouteMetrics
@@ -728,6 +739,12 @@ func (s *RouteStore) GetBest(limit int, colo string) []RouteMetrics {
 
 		// 1. Exclude FAILED and FAILING routes
 		if m.Health == HealthFailed || m.Health == HealthFailing {
+			continue
+		}
+
+		// GOWAY-WSS hard compatibility gate:
+		// In GOWAY-WSS mode, routes incompatible with WSS handshake must be excluded completely.
+		if isGOWAYWSS && !m.GOWAYWSSCompatible {
 			continue
 		}
 
@@ -866,6 +883,8 @@ func (s *RouteStore) evaluateTierTransitionsLocked(now time.Time) {
 		now = time.Now()
 	}
 
+	isGOWAYWSS := isCurrentProfileGOWAYWSS()
+
 	seen := make(map[string]bool)
 	var records []*RouteRecord
 	for _, rec := range s.routes {
@@ -905,7 +924,7 @@ func (s *RouteStore) evaluateTierTransitionsLocked(now time.Time) {
 	// 2. Demotion: Active -> Standby
 	if activeRec != nil {
 		m := &activeRec.Metrics
-		if m.Health == HealthDegraded || m.Health == HealthFailing || m.Health == HealthFailed || m.SpeedDropPercent >= 35.0 || m.ConsecutiveFails >= 2 {
+		if m.Health == HealthDegraded || m.Health == HealthFailing || m.Health == HealthFailed || m.SpeedDropPercent >= 35.0 || m.ConsecutiveFails >= 2 || (isGOWAYWSS && !m.GOWAYWSSCompatible) {
 			m.Tier = TierStandby
 			transitioned[m.IP] = true
 			standbyRecs = append(standbyRecs, activeRec)
@@ -958,14 +977,16 @@ func (s *RouteStore) evaluateTierTransitionsLocked(now time.Time) {
 	// - PacketLoss <= 0.05
 	// - Jitter <= 25.0
 	// - StallCount == 0
+	// - GOWAY-WSS compatibility gate
 	for _, rec := range candidateRecs {
 		if transitioned[rec.Metrics.IP] {
 			continue
 		}
 		m := &rec.Metrics
+		wssGateOK := !isGOWAYWSS || m.GOWAYWSSCompatible
 		if m.ObservationDuration >= 300.0 && len(rec.Samples) >= 3 && m.Confidence >= 35.0 &&
 			m.Health == HealthHealthy && m.FinalScore >= 70.0 && m.PacketLoss <= 0.05 &&
-			m.Jitter <= 25.0 && m.StallCount == 0 {
+			m.Jitter <= 25.0 && m.StallCount == 0 && wssGateOK {
 			m.Tier = TierStandby
 			transitioned[m.IP] = true
 			standbyRecs = append(standbyRecs, rec)
@@ -979,6 +1000,7 @@ func (s *RouteStore) evaluateTierTransitionsLocked(now time.Time) {
 	// - FinalScore >= 70.0
 	// - PacketLoss <= 0.02
 	// - StallCount == 0
+	// - GOWAY-WSS compatibility gate
 	if activeRec == nil {
 		var bestStandby *RouteRecord
 		for _, rec := range standbyRecs {
@@ -986,7 +1008,8 @@ func (s *RouteStore) evaluateTierTransitionsLocked(now time.Time) {
 				continue
 			}
 			m := &rec.Metrics
-			if m.Health == HealthHealthy && m.Confidence >= 50.0 && m.FinalScore >= 70.0 && m.PacketLoss <= 0.02 && m.StallCount == 0 {
+			wssGateOK := !isGOWAYWSS || m.GOWAYWSSCompatible
+			if m.Health == HealthHealthy && m.Confidence >= 50.0 && m.FinalScore >= 70.0 && m.PacketLoss <= 0.02 && m.StallCount == 0 && wssGateOK {
 				if bestStandby == nil || m.FinalScore > bestStandby.Metrics.FinalScore {
 					bestStandby = rec
 				}
@@ -1005,9 +1028,10 @@ func (s *RouteStore) evaluateTierTransitionsLocked(now time.Time) {
 				continue
 			}
 			m := &rec.Metrics
+			wssGateOK := !isGOWAYWSS || m.GOWAYWSSCompatible
 			if m.Health == HealthHealthy && m.Confidence >= 60.0 && m.ObservationDuration >= 900.0 &&
 				m.FinalScore >= activeRec.Metrics.FinalScore+5.0 && m.P10Speed >= activeRec.Metrics.P10Speed &&
-				m.PacketLoss <= 0.02 && m.StallCount == 0 {
+				m.PacketLoss <= 0.02 && m.StallCount == 0 && wssGateOK {
 				if bestChallenger == nil || m.FinalScore > bestChallenger.Metrics.FinalScore {
 					bestChallenger = rec
 				}
