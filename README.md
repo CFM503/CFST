@@ -257,34 +257,103 @@ CFST 默认监听 `127.0.0.1:9876`，提供以下高可靠接口供 GoPass 控�
 
 ---
 
+## 使用方法 (Quick Start & Usage)
+
+CFST 支持三种运行模式：
+1. **CLI 一次性扫描测速模式**（筛选优质线路、评估抗缓冲保底速度与断流卡顿，结果导出为 CSV）
+2. **Daemon 常驻守护进程模式**（后台持续自动化探测，对接过 GoPass 控制器）
+3. **Web UI 可视化控制台模式**（交互式网页实时观测与控制）
+
+---
+
+### 1. GOWAY-WSS 兼容性门禁测速 (推荐)
+
+针对部署了 GOWAY 隧道的 CDN 节点选路，采用**两阶段严格分离机制**：
+- **阶段一 (WSS 门禁)**：对候选 Cloudflare IP 执行 TCP Ping 与 TLS WebSocket 握手，严格校验服务端是否响应 `HTTP 101 Switching Protocols`。只有返回 101 的合法节点才被标记为兼容。
+- **阶段二 (测速与评分)**：通过 WSS 门禁的节点自动切换至 Cloudflare 官方 HTTPS 测速端点，测算抗缓冲保底速度（P10）、卡顿率与稳定性评分。
+
+> [!NOTE]
+> 请将命令中的示例域名 `goway.example.com` 替换为您实际部署的 GOWAY 域名或 SNI。
+
+#### CLI 一次性测速
+```bash
+# 基础测速命令（示例域名）
+./CFST-windows-amd64.exe -profile GOWAY-WSS -wsshost goway.example.com -wsspath /pyway -sni goway.example.com
+
+# 进阶参数调优：扫描 500 个 IP、初筛 20 个候选、每个测速 10 秒、结果输出到 result.csv
+./CFST-windows-amd64.exe -profile GOWAY-WSS -wsshost goway.example.com -wsspath /pyway -sni goway.example.com -max 500 -topn 20 -dt 10 -o result.csv
+```
+
+#### Daemon 常驻守护进程模式 (对接 GoPass 控制器)
+```bash
+# 后台常驻模式：自动周期性探测 Active/Standby/Candidate 线路，提供本地 REST API (http://127.0.0.1:9876)
+./CFST-windows-amd64.exe -daemon -profile GOWAY-WSS -wsshost goway.example.com -wsspath /pyway -sni goway.example.com
+```
+
+---
+
+### 2. Cloudflare 官方测速模式 (CFST 默认模式)
+
+官方纯净测速模式，不执行任何 WebSocket 升级请求，严格直连 Cloudflare 官方端点：
+
+```bash
+# 默认扫描 3000 个官方 IPv4 并进行保底速度测试
+./CFST-windows-amd64.exe
+
+# 常用参数：开启 C 段去重、只测前 10 个最优节点、测速 15 秒
+./CFST-windows-amd64.exe -u -dn 10 -dt 15 -o cfst_result.csv
+
+# 启动 Web UI 网页交互控制台
+./CFST-windows-amd64.exe -web
+```
+
+---
+
+### 3. 自建 VPS / 自定义反代测速模式 (CUSTOM 模式)
+
+支持自定义私有测速文件或后端 WebSocket 探测源：
+
+```bash
+# 自建 HTTPS 测速源
+./CFST-windows-amd64.exe -profile CUSTOM -url https://custom.example.com:8443/speedtest.bin -sni custom.example.com
+
+# 自建 WSS 探针源
+./CFST-windows-amd64.exe -profile CUSTOM -url wss://custom.example.com:443/custom-ws -sni custom.example.com
+```
+
+---
+
 ## 命令行参数一览
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `-daemon` | false | 启动常驻 Route Quality Probe 探针模式 |
-| `-api-addr` | 127.0.0.1:9876 | REST API 本地监听地址 |
-| `-mode` | normal | 评分模式（`normal` 或 `peak`） |
-| `-active-interval` | 10 | Active 线路探测周期（秒） |
-| `-standby-interval` | 30 | Standby 线路探测周期（秒） |
-| `-candidate-interval` | 180 | Candidate 候选池探测周期（秒） |
-| `-failed-interval` | 60 | Failed 故障线路复活重试周期（秒） |
-| `-state` | cfst_state.json | 线路状态与时序历史持久化文件 |
-| `-p` | 443 | 目标端口 |
-| `-max` | 3000 | 初始扫描最大 IP 数量 |
-| `-topn` | 100 | 初筛进入详细测试的候选数量 |
-| `-dlc` | 1 | 测速并发数 |
-| `-dn` | 20 | 测速节点数量 |
-| `-dt` | 20 | 测速持续时长（秒） |
-| `-st` | 30.0 | 停止阈值（MB/s） |
-| `-u` | false | C 段去重 |
-| `-f` | - | 自定义 IP 列表文件 |
-| `-o` | result_colo.csv | CSV 结果输出路径 |
-| `-sc` | 200 | TCP 扫描并发度 |
-| `-skip429` | true | 静默跳过 429 限流节点 |
-| `-url` | speed.cloudflare.com | 自定义下载测速 URL |
-| `-sni` | - | 自定义 TLS SNI |
-| `-wsshost` | colo.4467107.xyz | GOWAY WSS 握手校验 Fake Host |
-| `-web` | false | 启动 Web UI 界面 |
+| `-profile` | `CFST` | 探针配置类型：`CFST`（官方 HTTPS）、`GOWAY-WSS`、`CUSTOM` |
+| `-wsshost` | `""` | GOWAY WSS 握手校验 Fake Host（例如 `goway.example.com`） |
+| `-wsspath` | `/pyway` | GOWAY WSS 握手请求路径 |
+| `-sni` | `""` | 自定义 TLS SNI（例如 `goway.example.com`） |
+| `-daemon` | `false` | 启动常驻 Route Quality Probe 探针守护进程模式 |
+| `-api-addr` | `127.0.0.1:9876` | REST API 本地监听地址 |
+| `-mode` | `normal` | 评分模式（`normal` 或 `peak` 晚高峰模式） |
+| `-active-interval` | `10` | Active 活跃线路探测周期（秒） |
+| `-standby-interval` | `30` | Standby 备选线路探测周期（秒） |
+| `-candidate-interval` | `180` | Candidate 候选池探测周期（秒） |
+| `-failed-interval` | `60` | Failed 故障线路复活重试周期（秒） |
+| `-state` | `cfst_state.json` | 线路状态与时序历史持久化文件 |
+| `-p` | `443` | 目标端口 |
+| `-max` | `3000` | 初始扫描最大 IP 数量 |
+| `-topn` | `100` | 初筛进入详细测试的候选数量 |
+| `-qd` | `3` | 快速初筛测速时长（秒） |
+| `-dlc` | `1` | 测速并发数 |
+| `-dn` | `20` | 测速节点数量 |
+| `-dt` | `20` | 测速持续时长（秒） |
+| `-st` | `30.0` | 停止阈值（MB/s） |
+| `-u` | `false` | 启用 C 段去重 |
+| `-f` | `""` | 自定义 IP 列表文件 |
+| `-o` | `result_colo.csv` | CSV 结果输出路径 |
+| `-sc` | `200` | TCP 扫描并发度 |
+| `-skip429` | `true` | 静默跳过 429 限流节点 |
+| `-url` | `https://speed.cloudflare.com/__down...` | 自定义下载测速 URL |
+| `-web` | `false` | 启动 Web UI 界面 |
 
 ---
 
