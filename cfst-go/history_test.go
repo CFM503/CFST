@@ -128,3 +128,97 @@ func TestRouteStoreAndPersistence(t *testing.T) {
 
 	_ = os.Remove(snapshotPath)
 }
+
+func TestPeakHourSelectionComparison(t *testing.T) {
+	store := NewRouteStore()
+
+	// Route A: Fast during day, but collapses at peak hour (PeakHourScore=40)
+	mA := RouteMetrics{
+		ID:            "route-A",
+		IP:            "1.1.1.1",
+		Port:          443,
+		Colo:          "HKG",
+		Tier:          TierActive,
+		Health:        HealthHealthy,
+		FinalScore:    92.0,
+		PeakHourScore: 40.0,
+		Confidence:    90.0,
+		P10Speed:      10.0,
+		LastTested:    time.Now(),
+	}
+
+	// Route B: Steady and reliable during peak hours (PeakHourScore=88)
+	mB := RouteMetrics{
+		ID:            "route-B",
+		IP:            "1.0.0.1",
+		Port:          443,
+		Colo:          "HKG",
+		Tier:          TierActive,
+		Health:        HealthHealthy,
+		FinalScore:    86.0,
+		PeakHourScore: 88.0,
+		Confidence:    90.0,
+		P10Speed:      25.0,
+		LastTested:    time.Now(),
+	}
+
+	store.UpsertRoute(mA)
+	store.UpsertRoute(mB)
+
+	// In Normal mode, Route A has higher FinalScore (92 vs 86)
+	GlobalScoreEngine.SetMode(ModeNormal)
+	bestNormal := store.GetBest(1, "")
+	if len(bestNormal) != 1 || bestNormal[0].IP != "1.1.1.1" {
+		t.Fatalf("expected Route A (1.1.1.1) in Normal mode, got %+v", bestNormal)
+	}
+
+	// Switch to Peak mode: Route B MUST outrank Route A due to superior peak hour resilience
+	GlobalScoreEngine.SetMode(ModePeak)
+	defer GlobalScoreEngine.SetMode(ModeNormal)
+
+	bestPeak := store.GetBest(1, "")
+	if len(bestPeak) != 1 || bestPeak[0].IP != "1.0.0.1" {
+		t.Fatalf("Peak Mode Requirement Violated: Route B (1.0.0.1, peak score 88) must be selected over Route A (1.1.1.1, peak score 40), got %+v", bestPeak)
+	}
+}
+
+func TestRouteStoreHealthFiltering(t *testing.T) {
+	store := NewRouteStore()
+
+	// Healthy route
+	store.UpsertRoute(RouteMetrics{
+		ID:         "route-healthy",
+		IP:         "10.0.0.1",
+		Port:       443,
+		Health:     HealthHealthy,
+		FinalScore: 75.0,
+		LastTested: time.Now(),
+	})
+
+	// Failed route (high historical score, but dead right now)
+	store.UpsertRoute(RouteMetrics{
+		ID:         "route-failed",
+		IP:         "10.0.0.2",
+		Port:       443,
+		Health:     HealthFailed,
+		FinalScore: 99.0,
+		LastTested: time.Now(),
+	})
+
+	// Failing route
+	store.UpsertRoute(RouteMetrics{
+		ID:         "route-failing",
+		IP:         "10.0.0.3",
+		Port:       443,
+		Health:     HealthFailing,
+		FinalScore: 95.0,
+		LastTested: time.Now(),
+	})
+
+	// GetBest must NEVER return FAILED or FAILING routes, even if their historical scores were 99!
+	best := store.GetBest(5, "")
+	if len(best) != 1 || best[0].IP != "10.0.0.1" {
+		t.Fatalf("expected only healthy route 10.0.0.1, got: %+v", best)
+	}
+}
+

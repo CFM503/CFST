@@ -8,8 +8,29 @@ import (
 	"time"
 )
 
+type ProbeProfileType string
+
+const (
+	ProfileCFST     ProbeProfileType = "CFST"
+	ProfileGOWAYWSS ProbeProfileType = "GOWAY-WSS"
+	ProfileCustom   ProbeProfileType = "CUSTOM"
+)
+
+// ProbeProfile defines target parameters for versatile network quality testing (CFST, GOWAY-WSS, CUSTOM).
+type ProbeProfile struct {
+	Type     ProbeProfileType `json:"type"`
+	IP       string           `json:"ip"`
+	Port     int              `json:"port"`
+	SNI      string           `json:"sni"`
+	Host     string           `json:"host"`
+	Path     string           `json:"path"`
+	TestURL  string           `json:"test_url"`
+	Protocol string           `json:"protocol"` // e.g. "wss", "tls", "https"
+}
+
 // ProbeConfig holds parameters controlling tiered background probing.
 type ProbeConfig struct {
+	Profile           ProbeProfile  `json:"profile"`
 	ActiveInterval    time.Duration `json:"active_interval"`    // High frequency for active routes
 	StandbyInterval   time.Duration `json:"standby_interval"`   // Medium frequency for standby routes
 	CandidateInterval time.Duration `json:"candidate_interval"` // Low frequency for candidate pool
@@ -27,6 +48,14 @@ type ProbeConfig struct {
 
 func DefaultProbeConfig() ProbeConfig {
 	return ProbeConfig{
+		Profile: ProbeProfile{
+			Type:     ProfileGOWAYWSS,
+			Port:     443,
+			Host:     "colo.4467107.xyz",
+			Path:     "/pyway",
+			TestURL:  "https://speed.cloudflare.com/__down?bytes=500000000",
+			Protocol: "wss",
+		},
 		ActiveInterval:    10 * time.Second,
 		StandbyInterval:   30 * time.Second,
 		CandidateInterval: 180 * time.Second,
@@ -45,17 +74,25 @@ func DefaultProbeConfig() ProbeConfig {
 
 // LayeredProbeResult contains metrics produced by a multi-layer probe pass.
 type LayeredProbeResult struct {
-	Success          bool
-	RTT              float64
-	PacketLoss       float64
-	Jitter           float64
-	HandshakeSuccess bool
-	SingleSpeed      float64
-	MinSpeed         float64
-	Stability        float64
-	LoadLatency      float64
-	Colo             string
-	Error            string
+	Success              bool
+	RTT                  float64
+	PacketLoss           float64
+	Jitter               float64
+	HandshakeSuccess     bool
+	SingleSpeed          float64
+	MinSpeed             float64
+	P10Speed             float64
+	MedianSpeed          float64
+	Stability            float64
+	CV                   float64
+	StallCount           int
+	ZeroSpeedIntervals   int
+	TotalStallDuration   float64
+	LongestStallDuration float64
+	StallRate            float64
+	LoadLatency          float64
+	Colo                 string
+	Error                string
 }
 
 // ProbeScheduler runs layered active background testing on managed routes.
@@ -193,12 +230,20 @@ func (ps *ProbeScheduler) ExecuteLayeredProbe(ctx context.Context, ip string, po
 			duration = 2
 		}
 
-		speed, minSpd, stab := SingleStreamTest(ctx, ip, port, duration, cfg.URL, cfg.SNI, nil)
-		res.SingleSpeed = speed
-		res.MinSpeed = minSpd
-		res.Stability = stab
+		sm := SingleStreamTestDetailed(ctx, ip, port, duration, cfg.URL, cfg.SNI, nil, res.RTT, res.Jitter, res.PacketLoss)
+		res.SingleSpeed = sm.AverageSpeed
+		res.MinSpeed = sm.MinSpeed
+		res.P10Speed = sm.P10Speed
+		res.MedianSpeed = sm.MedianSpeed
+		res.Stability = sm.Stability
+		res.CV = sm.CoefficientOfVariation
+		res.StallCount = sm.StallCount
+		res.ZeroSpeedIntervals = sm.ZeroSpeedIntervals
+		res.TotalStallDuration = sm.TotalStallDuration
+		res.LongestStallDuration = sm.LongestStallDuration
+		res.StallRate = sm.StallRate
 
-		if speed <= 0 && minSpd <= 0 {
+		if sm.AverageSpeed <= 0 && sm.MinSpeed <= 0 {
 			res.Error = "Speed test returned 0 MB/s"
 			return res
 		}
@@ -267,24 +312,32 @@ func (ps *ProbeScheduler) ProbeOnce(ctx context.Context, ip string, forceSpeed b
 
 	now := time.Now()
 	m := RouteMetrics{
-		ID:                 GenerateRouteID(ip, port),
-		IP:                 ip,
-		Port:               port,
-		Colo:               result.Colo,
-		Tier:               tier,
-		RTT:                result.RTT,
-		PacketLoss:         result.PacketLoss,
-		Jitter:             result.Jitter,
-		HandshakeSuccess:   result.HandshakeSuccess,
-		DownloadSpeed:      result.SingleSpeed,
-		SingleSpeed:        result.SingleSpeed,
-		MinSpeed:           result.MinSpeed,
-		Stability:          result.Stability,
-		LoadLatency:        result.LoadLatency,
-		LastTested:         now,
-		Timestamp:          now,
-		ConsecutiveFails:   0,
-		ConsecutiveSuccess: 0,
+		ID:                   GenerateRouteID(ip, port),
+		IP:                   ip,
+		Port:                 port,
+		Colo:                 result.Colo,
+		Tier:                 tier,
+		RTT:                  result.RTT,
+		PacketLoss:           result.PacketLoss,
+		Jitter:               result.Jitter,
+		HandshakeSuccess:     result.HandshakeSuccess,
+		DownloadSpeed:        result.SingleSpeed,
+		SingleSpeed:          result.SingleSpeed,
+		P10Speed:             result.P10Speed,
+		MedianSpeed:          result.MedianSpeed,
+		MinSpeed:             result.MinSpeed,
+		Stability:            result.Stability,
+		CV:                   result.CV,
+		StallCount:           result.StallCount,
+		ZeroSpeedIntervals:   result.ZeroSpeedIntervals,
+		TotalStallDuration:   result.TotalStallDuration,
+		LongestStallDuration: result.LongestStallDuration,
+		StallRate:            result.StallRate,
+		LoadLatency:          result.LoadLatency,
+		LastTested:           now,
+		Timestamp:            now,
+		ConsecutiveFails:     0,
+		ConsecutiveSuccess:   0,
 	}
 
 	if m.Colo == "" {
@@ -293,13 +346,22 @@ func (ps *ProbeScheduler) ProbeOnce(ctx context.Context, ip string, forceSpeed b
 	if exists {
 		m.ConsecutiveFails = rec.Metrics.ConsecutiveFails
 		m.ConsecutiveSuccess = rec.Metrics.ConsecutiveSuccess
+		m.ConsecutiveDegraded = rec.Metrics.ConsecutiveDegraded
 		m.Health = rec.Metrics.Health
 		// If speed test wasn't run on this cycle, inherit previous speeds
 		if !runSpeedTest {
 			m.DownloadSpeed = rec.Metrics.DownloadSpeed
 			m.SingleSpeed = rec.Metrics.SingleSpeed
+			m.P10Speed = rec.Metrics.P10Speed
+			m.MedianSpeed = rec.Metrics.MedianSpeed
 			m.MinSpeed = rec.Metrics.MinSpeed
 			m.Stability = rec.Metrics.Stability
+			m.CV = rec.Metrics.CV
+			m.StallCount = rec.Metrics.StallCount
+			m.ZeroSpeedIntervals = rec.Metrics.ZeroSpeedIntervals
+			m.TotalStallDuration = rec.Metrics.TotalStallDuration
+			m.LongestStallDuration = rec.Metrics.LongestStallDuration
+			m.StallRate = rec.Metrics.StallRate
 			m.LoadLatency = rec.Metrics.LoadLatency
 		}
 	}

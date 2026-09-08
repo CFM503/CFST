@@ -19,10 +19,19 @@ func TestRouteHealthStateMachine(t *testing.T) {
 	baselineSpeed := 50.0
 
 	// 1. Degraded test: speed drops from 50 to 20 (>30% drop)
+	// Anti-jitter debounce: requires 3 consecutive degraded probes before switching to DEGRADED
 	m.SingleSpeed = 20.0
 	m.UpdateHealth(true, baselineSpeed)
-	if m.Health != HealthDegraded {
-		t.Fatalf("expected DEGRADED on >30%% speed drop, got %s", m.Health)
+	if m.Health != HealthHealthy || m.ConsecutiveDegraded != 1 {
+		t.Fatalf("expected HEALTHY with 1 degraded count on 1st drop, got health=%s, count=%d", m.Health, m.ConsecutiveDegraded)
+	}
+	m.UpdateHealth(true, baselineSpeed)
+	if m.Health != HealthHealthy || m.ConsecutiveDegraded != 2 {
+		t.Fatalf("expected HEALTHY with 2 degraded count on 2nd drop, got health=%s, count=%d", m.Health, m.ConsecutiveDegraded)
+	}
+	m.UpdateHealth(true, baselineSpeed)
+	if m.Health != HealthDegraded || m.ConsecutiveDegraded != 3 {
+		t.Fatalf("expected DEGRADED on 3rd consecutive drop, got health=%s, count=%d", m.Health, m.ConsecutiveDegraded)
 	}
 
 	// 2. Failure detection: 1 failure -> FAILING
@@ -51,6 +60,8 @@ func TestRouteHealthStateMachine(t *testing.T) {
 
 	// 5. Recovery: 1st success after failure -> RECOVERING
 	m.SingleSpeed = 50.0
+	m.P10Speed = 48.0
+	m.MinSpeed = 45.0
 	m.PacketLoss = 0.0
 	m.Jitter = 2.0
 	m.UpdateHealth(true, baselineSpeed)
@@ -82,16 +93,24 @@ func TestDegradationByLossAndJitter(t *testing.T) {
 		HandshakeSuccess: true,
 		Health:           HealthHealthy,
 	}
+	// 3 consecutive to trigger DEGRADED
+	m.UpdateHealth(true, 50.0)
+	m.UpdateHealth(true, 50.0)
 	m.UpdateHealth(true, 50.0)
 	if m.Health != HealthDegraded {
-		t.Fatalf("expected DEGRADED on high packet loss, got %s", m.Health)
+		t.Fatalf("expected DEGRADED on high packet loss after 3 checks, got %s", m.Health)
 	}
 
+	// Reset to healthy
 	m.PacketLoss = 0.0
+	m.Health = HealthHealthy
+	m.ConsecutiveDegraded = 0
 	m.Jitter = 30.0 // >25ms threshold
 	m.UpdateHealth(true, 50.0)
+	m.UpdateHealth(true, 50.0)
+	m.UpdateHealth(true, 50.0)
 	if m.Health != HealthDegraded {
-		t.Fatalf("expected DEGRADED on high jitter, got %s", m.Health)
+		t.Fatalf("expected DEGRADED on high jitter after 3 checks, got %s", m.Health)
 	}
 }
 

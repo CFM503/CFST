@@ -34,6 +34,8 @@ func main() {
 	flag.IntVar(&cfg.FailedInterval, "failed-interval", cfg.FailedInterval, "Failed route recovery probe interval in seconds")
 	flag.StringVar(&cfg.ScoreMode, "mode", cfg.ScoreMode, "Scoring mode: normal or peak")
 	flag.StringVar(&cfg.StateFile, "state", cfg.StateFile, "State persistence JSON file path")
+	versionFlag := flag.Bool("v", false, "Show version and exit")
+	flag.BoolVar(versionFlag, "version", false, "Show version and exit")
 
 	webMode := false
 	webPort := "9876"
@@ -56,6 +58,11 @@ func main() {
 
 	flag.Bool("web", false, "Start Web UI server (-web <port>)")
 	flag.Parse()
+
+	if *versionFlag {
+		println("CFST v2.1.0 (GOWAY Route Quality Probe & Long-Term Stability Analyzer)")
+		return
+	}
 
 	if cfg.DaemonMode {
 		RunDaemon(cfg)

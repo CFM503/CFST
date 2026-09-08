@@ -171,3 +171,47 @@ func TestAPIConfig(t *testing.T) {
 		t.Fatalf("expected updated active interval 15s, got %v", GlobalProbeScheduler.GetConfig().ActiveInterval)
 	}
 }
+
+func TestAPISubroutes(t *testing.T) {
+	setupAPITestData()
+
+	// 1. GET /api/routes/162.159.192.1/history
+	reqHist := httptest.NewRequest(http.MethodGet, "/api/routes/162.159.192.1/history", nil)
+	wHist := httptest.NewRecorder()
+	handleAPIRoutes(wHist, reqHist)
+	if wHist.Result().StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for /history, got %d", wHist.Result().StatusCode)
+	}
+
+	var windows map[string]WindowStats
+	if err := json.NewDecoder(wHist.Body).Decode(&windows); err != nil {
+		t.Fatalf("failed to decode history windows: %v", err)
+	}
+	if _, exists := windows["5m"]; !exists {
+		t.Fatal("expected 5m window in history")
+	}
+
+	// 2. GET /api/routes/162.159.192.1/peak
+	reqPeak := httptest.NewRequest(http.MethodGet, "/api/routes/162.159.192.1/peak", nil)
+	wPeak := httptest.NewRecorder()
+	handleAPIRoutes(wPeak, reqPeak)
+	if wPeak.Result().StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for /peak, got %d", wPeak.Result().StatusCode)
+	}
+
+	var peakHours []HourStats
+	if err := json.NewDecoder(wPeak.Body).Decode(&peakHours); err != nil {
+		t.Fatalf("failed to decode peak hours: %v", err)
+	}
+	if len(peakHours) != 24 {
+		t.Fatalf("expected 24 hours in peak hours matrix, got %d", len(peakHours))
+	}
+
+	// 3. GET /api/routes/162.159.192.1/samples
+	reqSamples := httptest.NewRequest(http.MethodGet, "/api/routes/162.159.192.1/samples", nil)
+	wSamples := httptest.NewRecorder()
+	handleAPIRoutes(wSamples, reqSamples)
+	if wSamples.Result().StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for /samples, got %d", wSamples.Result().StatusCode)
+	}
+}

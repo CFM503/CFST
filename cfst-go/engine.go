@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -57,18 +58,22 @@ func parseCIDRCached(cidr string) *cidrInfo {
 }
 
 type NodeResult struct {
-	IP            string  `json:"ip"`
-	Port          int     `json:"port"`
-	TCPLatency    float64 `json:"tcp_latency"`
-	DownloadSpeed float64 `json:"download_speed"`
-	SingleSpeed   float64 `json:"single_speed"`
-	LoadLatency   float64 `json:"load_latency"`
-	Colo          string  `json:"colo"`
-	Score         float64 `json:"score"`
-	Jitter        float64 `json:"jitter"`
-	Stability     float64 `json:"stability"`
-	MinSpeed      float64 `json:"min_speed"`
-	PacketLoss    float64 `json:"packet_loss"`
+	IP                 string  `json:"ip"`
+	Port               int     `json:"port"`
+	TCPLatency         float64 `json:"tcp_latency"`
+	DownloadSpeed      float64 `json:"download_speed"`
+	SingleSpeed        float64 `json:"single_speed"`
+	LoadLatency        float64 `json:"load_latency"`
+	Colo               string  `json:"colo"`
+	Score              float64 `json:"score"`
+	Jitter             float64 `json:"jitter"`
+	Stability          float64 `json:"stability"`
+	MinSpeed           float64 `json:"min_speed"`
+	P10Speed           float64 `json:"p10_speed"`
+	MedianSpeed        float64 `json:"median_speed"`
+	StallCount         int     `json:"stall_count"`
+	ZeroSpeedIntervals int     `json:"zero_speed_intervals"`
+	PacketLoss         float64 `json:"packet_loss"`
 }
 
 func (n *NodeResult) CalcScore() {
@@ -77,7 +82,11 @@ func (n *NodeResult) CalcScore() {
 	if n.SingleSpeed > 0 {
 		effectiveSpeed = n.SingleSpeed
 	}
-	n.Score = GlobalScoreEngine.calcMetricScore(w, effectiveSpeed, n.MinSpeed, n.TCPLatency, n.Jitter, n.PacketLoss, n.Stability, true, n.Colo)
+	effectiveP10 := n.P10Speed
+	if effectiveP10 <= 0 && effectiveSpeed > 0 {
+		effectiveP10 = n.MinSpeed
+	}
+	n.Score = GlobalScoreEngine.calcMetricScore(w, effectiveSpeed, effectiveP10, n.MinSpeed, n.TCPLatency, n.Jitter, n.PacketLoss, n.Stability, true, n.Colo)
 }
 
 func randIPFromCIDR(cidr string) string {
@@ -97,18 +106,235 @@ func randIPFromCIDR(cidr string) string {
 	return net.IP(buf[:]).String()
 }
 
-// SingleStreamTest measures single-connection download speed.
-// Returns avgSpeed (MB/s), minSpeed (MB/s), stability (0-100).
-func SingleStreamTest(ctx context.Context, ip string, port int, duration int, testURL string, customSNI string,
-	progressCallback func(LiveProgress)) (avgSpeed, minSpeed, stability float64) {
+// SpeedIntervalSample represents one discrete interval observation.
+type SpeedIntervalSample struct {
+	Timestamp       time.Time `json:"timestamp"`
+	DeltaBytes      int64     `json:"delta_bytes"`
+	DeltaDuration   float64   `json:"delta_duration"`
+	IntervalSpeed   float64   `json:"interval_speed"`   // MB/s
+	CumulativeSpeed float64   `json:"cumulative_speed"` // MB/s
+	Elapsed         float64   `json:"elapsed"`          // seconds
+	TotalBytes      int64     `json:"total_bytes"`
+	IsStall         bool      `json:"is_stall"`
+}
+
+// SpeedMetrics contains comprehensive statistics derived from speed interval samples.
+type SpeedMetrics struct {
+	AverageSpeed           float64               `json:"avg_speed"`
+	MedianSpeed            float64               `json:"median_speed"`
+	P10Speed               float64               `json:"p10_speed"`
+	P25Speed               float64               `json:"p25_speed"`
+	MinSpeed               float64               `json:"min_speed"`
+	MaxSpeed               float64               `json:"max_speed"`
+	StdDev                 float64               `json:"std_dev"`
+	CoefficientOfVariation float64               `json:"cv"`
+	Stability              float64               `json:"stability"` // 0.0 - 100.0
+	ZeroSpeedIntervals     int                   `json:"zero_speed_intervals"`
+	StallCount             int                   `json:"stall_count"`
+	TotalStallDuration     float64               `json:"total_stall_duration"`
+	LongestStallDuration   float64               `json:"longest_stall_duration"`
+	StallRate              float64               `json:"stall_rate"` // TotalStallDuration / TotalDuration
+	Intervals              []SpeedIntervalSample `json:"intervals,omitempty"`
+}
+
+// calcPercentile computes the p-th percentile (p in [0.0, 1.0]) using linear interpolation on sorted data.
+func calcPercentile(sortedVals []float64, p float64) float64 {
+	if len(sortedVals) == 0 {
+		return 0
+	}
+	if len(sortedVals) == 1 || p <= 0 {
+		return sortedVals[0]
+	}
+	if p >= 1.0 {
+		return sortedVals[len(sortedVals)-1]
+	}
+	idx := p * float64(len(sortedVals)-1)
+	lower := int(math.Floor(idx))
+	upper := int(math.Ceil(idx))
+	if lower == upper {
+		return sortedVals[lower]
+	}
+	weight := idx - float64(lower)
+	return sortedVals[lower]*(1.0-weight) + sortedVals[upper]*weight
+}
+
+// CalcCompositeStability computes multi-dimensional stability (0 - 100):
+// SpeedConsistency * 0.35 + FloorStability * 0.25 + NoStallRatio * 0.20 + LatencyConsistency * 0.10 + LossConsistency * 0.10
+func CalcCompositeStability(sm *SpeedMetrics, tcpRTT, jitter, packetLoss float64) float64 {
+	if sm == nil {
+		return 0
+	}
+
+	// 1. SpeedConsistency: based on CV
+	speedConsistency := 100.0 - sm.CoefficientOfVariation*100.0
+	if speedConsistency < 0 {
+		speedConsistency = 0
+	} else if speedConsistency > 100.0 {
+		speedConsistency = 100.0
+	}
+
+	// 2. FloorStability: P10 / AverageSpeed ratio (guarantees anti-buffering floor)
+	floorStability := 0.0
+	if sm.AverageSpeed > 0.001 {
+		floorStability = (sm.P10Speed / sm.AverageSpeed) * 100.0
+		if floorStability < 0 {
+			floorStability = 0
+		} else if floorStability > 100.0 {
+			floorStability = 100.0
+		}
+	}
+
+	// 3. NoStallRatio: ratio of non-stall duration
+	noStallRatio := (1.0 - sm.StallRate) * 100.0
+	if noStallRatio < 0 {
+		noStallRatio = 0
+	} else if noStallRatio > 100.0 {
+		noStallRatio = 100.0
+	}
+
+	// 4. LatencyConsistency: jitter compared to RTT
+	latencyConsistency := 100.0
+	if tcpRTT > 0 {
+		latencyConsistency = 100.0 - (jitter/(tcpRTT+1.0))*100.0
+		if latencyConsistency < 0 {
+			latencyConsistency = 0
+		} else if latencyConsistency > 100.0 {
+			latencyConsistency = 100.0
+		}
+	}
+
+	// 5. LossConsistency: packet loss percentage
+	lossConsistency := (1.0 - packetLoss) * 100.0
+	if lossConsistency < 0 {
+		lossConsistency = 0
+	} else if lossConsistency > 100.0 {
+		lossConsistency = 100.0
+	}
+
+	composite := speedConsistency*0.35 +
+		floorStability*0.25 +
+		noStallRatio*0.20 +
+		latencyConsistency*0.10 +
+		lossConsistency*0.10
+
+	if math.IsNaN(composite) || math.IsInf(composite, 0) || composite < 0 {
+		composite = 0
+	} else if composite > 100.0 {
+		composite = 100.0
+	}
+	return math.Round(composite*10) / 10
+}
+
+// ProcessIntervalSamples processes collected intervals into comprehensive SpeedMetrics.
+// Crucially, zero speed intervals are NEVER discarded.
+func ProcessIntervalSamples(intervals []SpeedIntervalSample, totalBytes int64, totalDuration float64, tcpRTT, jitter, packetLoss float64) SpeedMetrics {
+	sm := SpeedMetrics{
+		Intervals: intervals,
+	}
+	if totalDuration <= 0.01 {
+		return sm
+	}
+
+	finalMB := float64(totalBytes) / 1024.0 / 1024.0
+	sm.AverageSpeed = finalMB / totalDuration
+
+	if len(intervals) == 0 {
+		sm.MinSpeed = 0
+		sm.MedianSpeed = sm.AverageSpeed
+		sm.P10Speed = sm.AverageSpeed
+		sm.P25Speed = sm.AverageSpeed
+		sm.MaxSpeed = sm.AverageSpeed
+		sm.Stability = CalcCompositeStability(&sm, tcpRTT, jitter, packetLoss)
+		return sm
+	}
+
+	speeds := make([]float64, len(intervals))
+	var sum float64
+	minSpd := math.MaxFloat64
+	maxSpd := 0.0
+
+	curConsecutiveStalls := 0
+	for i, it := range intervals {
+		s := it.IntervalSpeed
+		speeds[i] = s
+		sum += s
+		if s < minSpd {
+			minSpd = s
+		}
+		if s > maxSpd {
+			maxSpd = s
+		}
+
+		if it.IsStall {
+			sm.ZeroSpeedIntervals++
+			sm.TotalStallDuration += it.DeltaDuration
+			curConsecutiveStalls++
+			curStallDur := float64(curConsecutiveStalls) * it.DeltaDuration
+			if curStallDur > sm.LongestStallDuration {
+				sm.LongestStallDuration = curStallDur
+			}
+		} else {
+			if curConsecutiveStalls > 0 {
+				sm.StallCount++
+				curConsecutiveStalls = 0
+			}
+		}
+	}
+	if curConsecutiveStalls > 0 {
+		sm.StallCount++
+	}
+
+	if totalDuration > 0 {
+		sm.StallRate = sm.TotalStallDuration / totalDuration
+		if sm.StallRate > 1.0 {
+			sm.StallRate = 1.0
+		}
+	}
+
+	if minSpd == math.MaxFloat64 {
+		minSpd = 0
+	}
+	sm.MinSpeed = minSpd
+	sm.MaxSpeed = maxSpd
+
+	// Mean and CV over all intervals (including 0s)
+	mean := sum / float64(len(speeds))
+	if len(speeds) > 1 && mean > 0.001 {
+		var variance float64
+		for _, s := range speeds {
+			diff := s - mean
+			variance += diff * diff
+		}
+		variance /= float64(len(speeds))
+		sm.StdDev = math.Sqrt(variance)
+		sm.CoefficientOfVariation = sm.StdDev / mean
+	} else if mean <= 0.001 {
+		sm.CoefficientOfVariation = 1.0
+	}
+
+	// Percentiles on sorted copy
+	sortedSpeeds := make([]float64, len(speeds))
+	copy(sortedSpeeds, speeds)
+	sort.Float64s(sortedSpeeds)
+
+	sm.P10Speed = calcPercentile(sortedSpeeds, 0.10)
+	sm.P25Speed = calcPercentile(sortedSpeeds, 0.25)
+	sm.MedianSpeed = calcPercentile(sortedSpeeds, 0.50)
+
+	sm.Stability = CalcCompositeStability(&sm, tcpRTT, jitter, packetLoss)
+	return sm
+}
+
+// SingleStreamTestDetailed runs true 1s interval sampling and returns full SpeedMetrics.
+func SingleStreamTestDetailed(ctx context.Context, ip string, port int, duration int, testURL string, customSNI string,
+	progressCallback func(LiveProgress), tcpRTT, jitter, packetLoss float64) SpeedMetrics {
 
 	parsedURL, err := url.Parse(testURL)
 	if err != nil {
-		return 0, 0, 0
+		return SpeedMetrics{}
 	}
 	host := parsedURL.Hostname()
 
-	// Set SNI to the actual domain so CF routes correctly
 	sni := host
 	if customSNI != "" {
 		sni = customSNI
@@ -126,7 +352,7 @@ func SingleStreamTest(ctx context.Context, ip string, port int, duration int, te
 
 	req, err := newCFRequestWithContext(downloadCtx, "GET", testURL)
 	if err != nil {
-		return 0, 0, 0
+		return SpeedMetrics{}
 	}
 	req.Host = host
 	req.Header.Set("Connection", "keep-alive")
@@ -145,41 +371,63 @@ func SingleStreamTest(ctx context.Context, ip string, port int, duration int, te
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, 0, 0
+		return SpeedMetrics{}
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return 0, 0, 0
+		return SpeedMetrics{}
 	}
 
 	startGlobal := time.Now()
 	var totalBytes int64
-	sampleInterval := 2 * time.Second
-	var samples []float64
+	sampleInterval := 1 * time.Second
+	var intervals []SpeedIntervalSample
 	var sampleMu sync.Mutex
 
 	done := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(sampleInterval)
 		defer ticker.Stop()
+		prevBytes := int64(0)
+		prevTime := startGlobal
+
 		for {
 			select {
-			case <-ticker.C:
-				b := atomic.LoadInt64(&totalBytes)
-				mb := float64(b) / 1024.0 / 1024.0
-				sampleMu.Lock()
-				samples = append(samples, mb)
-				sampleMu.Unlock()
-				elapsed := time.Since(startGlobal).Seconds()
-				if progressCallback != nil {
-					progressCallback(LiveProgress{
-						IP:       ip,
-						Bytes:    b,
-						Speed:    mb / elapsed,
-						Elapsed:  elapsed,
-						Duration: float64(duration),
+			case now := <-ticker.C:
+				curBytes := atomic.LoadInt64(&totalBytes)
+				deltaBytes := curBytes - prevBytes
+				dt := now.Sub(prevTime).Seconds()
+				if dt > 0.05 {
+					spd := (float64(deltaBytes) / 1024.0 / 1024.0) / dt
+					cumSpd := (float64(curBytes) / 1024.0 / 1024.0) / now.Sub(startGlobal).Seconds()
+					isStall := (spd <= 0.01)
+
+					sampleMu.Lock()
+					intervals = append(intervals, SpeedIntervalSample{
+						Timestamp:       now,
+						DeltaBytes:      deltaBytes,
+						DeltaDuration:   dt,
+						IntervalSpeed:   spd,
+						CumulativeSpeed: cumSpd,
+						Elapsed:         now.Sub(startGlobal).Seconds(),
+						TotalBytes:      curBytes,
+						IsStall:         isStall,
 					})
+					sampleMu.Unlock()
+
+					prevBytes = curBytes
+					prevTime = now
+
+					if progressCallback != nil {
+						progressCallback(LiveProgress{
+							IP:       ip,
+							Bytes:    curBytes,
+							Speed:    cumSpd,
+							Elapsed:  now.Sub(startGlobal).Seconds(),
+							Duration: float64(duration),
+						})
+					}
 				}
 			case <-downloadCtx.Done():
 				return
@@ -203,71 +451,60 @@ func SingleStreamTest(ctx context.Context, ip string, port int, duration int, te
 	downloadBufPool.Put(bufPtr)
 	close(done)
 
-	finalMB := float64(atomic.LoadInt64(&totalBytes)) / 1024.0 / 1024.0
-	sampleMu.Lock()
-	samples = append(samples, finalMB)
-	sampleMu.Unlock()
-
 	realTime := time.Since(startGlobal).Seconds()
 	if realTime < 0.1 {
-		return 0, 0, 0
+		return SpeedMetrics{}
 	}
 
-	avgSpeed = finalMB / realTime
-
-	if len(samples) < 2 {
-		return avgSpeed, avgSpeed, 100.0
-	}
-
-	var intervalSpeeds []float64
-	for i := 1; i < len(samples); i++ {
-		dt := sampleInterval.Seconds()
-		if i == len(samples)-1 {
-			elapsed := realTime - float64(i-1)*sampleInterval.Seconds()
-			if elapsed > 0.1 {
-				dt = elapsed
+	// Final interval drain if not recorded
+	finalBytes := atomic.LoadInt64(&totalBytes)
+	sampleMu.Lock()
+	if len(intervals) > 0 {
+		lastIt := intervals[len(intervals)-1]
+		remainDt := realTime - lastIt.Elapsed
+		if remainDt >= 0.2 {
+			remainBytes := finalBytes - lastIt.TotalBytes
+			if remainBytes < 0 {
+				remainBytes = 0
 			}
+			spd := (float64(remainBytes) / 1024.0 / 1024.0) / remainDt
+			intervals = append(intervals, SpeedIntervalSample{
+				Timestamp:       time.Now(),
+				DeltaBytes:      remainBytes,
+				DeltaDuration:   remainDt,
+				IntervalSpeed:   spd,
+				CumulativeSpeed: (float64(finalBytes) / 1024.0 / 1024.0) / realTime,
+				Elapsed:         realTime,
+				TotalBytes:      finalBytes,
+				IsStall:         spd <= 0.01,
+			})
 		}
-		speed := (samples[i] - samples[i-1]) / dt
-		if speed > 0 {
-			intervalSpeeds = append(intervalSpeeds, speed)
-		}
+	} else if realTime > 0.05 {
+		spd := (float64(finalBytes) / 1024.0 / 1024.0) / realTime
+		intervals = append(intervals, SpeedIntervalSample{
+			Timestamp:       time.Now(),
+			DeltaBytes:      finalBytes,
+			DeltaDuration:   realTime,
+			IntervalSpeed:   spd,
+			CumulativeSpeed: spd,
+			Elapsed:         realTime,
+			TotalBytes:      finalBytes,
+			IsStall:         spd <= 0.01,
+		})
 	}
+	intervalsCopy := make([]SpeedIntervalSample, len(intervals))
+	copy(intervalsCopy, intervals)
+	sampleMu.Unlock()
 
-	if len(intervalSpeeds) == 0 {
-		return avgSpeed, avgSpeed, 100.0
-	}
+	return ProcessIntervalSamples(intervalsCopy, finalBytes, realTime, tcpRTT, jitter, packetLoss)
+}
 
-	minSpeed = intervalSpeeds[0]
-	var sum float64
-	for _, s := range intervalSpeeds {
-		if s < minSpeed {
-			minSpeed = s
-		}
-		sum += s
-	}
-
-	mean := sum / float64(len(intervalSpeeds))
-	if mean < 0.01 {
-		return avgSpeed, minSpeed, 0.0
-	}
-	var variance float64
-	for _, s := range intervalSpeeds {
-		diff := s - mean
-		variance += diff * diff
-	}
-	variance /= float64(len(intervalSpeeds))
-	stddev := math.Sqrt(variance)
-	cv := stddev / mean
-	stability = 100.0 - cv*100.0
-	if stability < 0 {
-		stability = 0
-	}
-	if stability > 100 {
-		stability = 100
-	}
-
-	return avgSpeed, minSpeed, stability
+// SingleStreamTest measures single-connection download speed (backward-compatible wrapper).
+// Returns avgSpeed (MB/s), minSpeed (MB/s), stability (0-100).
+func SingleStreamTest(ctx context.Context, ip string, port int, duration int, testURL string, customSNI string,
+	progressCallback func(LiveProgress)) (avgSpeed, minSpeed, stability float64) {
+	sm := SingleStreamTestDetailed(ctx, ip, port, duration, testURL, customSNI, progressCallback, 0, 0, 0)
+	return sm.AverageSpeed, sm.MinSpeed, sm.Stability
 }
 
 // MeasureLoadLatency measures TCP latency while a download is saturating the connection.

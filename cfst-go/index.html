@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CFST v2.0.1</title>
+    <title>CFST v2.1.0 - GOWAY Route Quality Probe & Stability Analyzer</title>
     <!-- Google Fonts for modern typography -->
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
@@ -280,8 +280,8 @@
         <div class="glass-panel">
             <div class="header">
                 <div style="display: flex; align-items: baseline; gap: 12px;">
-                    <h1>✨ CFST Ultimate</h1>
-                    <span style="color: var(--text-dim); font-size: 1.1rem; font-weight: 600;">v2.0.1</span>
+                    <h1>✨ CFST Probe</h1>
+                    <span style="color: var(--text-dim); font-size: 1.1rem; font-weight: 600;">v2.1.0 (GOWAY Route Quality Probe)</span>
                 </div>
                 <button id="startBtn">
                     <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -412,11 +412,14 @@
                     <tr>
                         <th>IP Address</th>
                         <th>Colo</th>
+                        <th>Rec</th>
+                        <th>P10 (MB/s)</th>
+                        <th>Min (MB/s)</th>
+                        <th>Avg (MB/s)</th>
                         <th>Latency</th>
                         <th>Jitter</th>
-                        <th>Speed</th>
-                        <th>MinSpeed</th>
-                        <th>LoadLat</th>
+                        <th>Loss</th>
+                        <th>Stalls</th>
                         <th>Stability</th>
                         <th>Score</th>
                     </tr>
@@ -541,21 +544,48 @@
                     tdColo.className = 'val-colo';
                     tdColo.textContent = res.colo;
 
+                    const tdRec = document.createElement('td');
+                    const recVal = res.recommendation || (res.score >= 80 ? 'BEST' : res.score >= 65 ? 'GOOD' : 'USABLE');
+                    const recColors = {
+                        'BEST': '#22c55e',
+                        'GOOD': '#3b82f6',
+                        'USABLE': '#eab308',
+                        'DEGRADED': '#f97316',
+                        'AVOID': '#ef4444',
+                        'FAILED': '#dc2626'
+                    };
+                    tdRec.innerHTML = `<span style="display:inline-block;padding:2px 8px;border-radius:6px;font-size:0.75rem;font-weight:700;color:white;background:${recColors[recVal]||'#64748b'};">${recVal}</span>`;
+
+                    const tdP10 = document.createElement('td');
+                    tdP10.style.fontWeight = '600';
+                    const p10Val = res.p10_speed !== undefined ? res.p10_speed : (res.min_speed || 0);
+                    tdP10.textContent = p10Val.toFixed(2);
+
+                    const tdMin = document.createElement('td');
+                    tdMin.textContent = (res.min_speed || 0).toFixed(2);
+
+                    const tdSpeed = document.createElement('td');
+                    tdSpeed.className = speedClass;
+                    tdSpeed.textContent = res.download_speed.toFixed(2);
+
                     const tdLat = document.createElement('td');
                     tdLat.textContent = res.tcp_latency.toFixed(1) + ' ms';
 
                     const tdJitter = document.createElement('td');
                     tdJitter.textContent = (res.jitter || 0).toFixed(1) + ' ms';
 
-                    const tdSpeed = document.createElement('td');
-                    tdSpeed.className = speedClass;
-                    tdSpeed.textContent = res.download_speed.toFixed(2) + ' MB/s';
+                    const tdLoss = document.createElement('td');
+                    tdLoss.textContent = ((res.packet_loss || 0) * 100).toFixed(0) + '%';
 
-                    const tdMin = document.createElement('td');
-                    tdMin.textContent = (res.min_speed || 0).toFixed(2) + ' MB/s';
-
-                    const tdLoad = document.createElement('td');
-                    tdLoad.textContent = (res.load_latency || 0).toFixed(1) + ' ms';
+                    const tdStalls = document.createElement('td');
+                    const stalls = res.stall_count || 0;
+                    if (stalls > 0) {
+                        tdStalls.style.color = 'var(--red)';
+                        tdStalls.textContent = `${stalls} (${(res.total_stall_duration || 0).toFixed(1)}s)`;
+                    } else {
+                        tdStalls.style.color = 'var(--green)';
+                        tdStalls.textContent = 'None';
+                    }
 
                     const tdStab = document.createElement('td');
                     tdStab.textContent = (res.stability || 0).toFixed(0) + '%';
@@ -567,11 +597,14 @@
 
                     tr.appendChild(tdIp);
                     tr.appendChild(tdColo);
+                    tr.appendChild(tdRec);
+                    tr.appendChild(tdP10);
+                    tr.appendChild(tdMin);
+                    tr.appendChild(tdSpeed);
                     tr.appendChild(tdLat);
                     tr.appendChild(tdJitter);
-                    tr.appendChild(tdSpeed);
-                    tr.appendChild(tdMin);
-                    tr.appendChild(tdLoad);
+                    tr.appendChild(tdLoss);
+                    tr.appendChild(tdStalls);
                     tr.appendChild(tdStab);
                     tr.appendChild(tdScore);
                     resultsBody.appendChild(tr);
@@ -642,9 +675,9 @@
             if (scannedResults.length === 0) return;
             // Build CSV matching CLI output format
             const bom = '\uFEFF';
-            const header = 'IP,Colo,Latency,Jitter,Speed_MB,MinSpeed_MB,LoadLatency,Stability,Score';
+            const header = 'IP,Colo,Latency,Jitter,Speed_MB,P10Speed_MB,MinSpeed_MB,Stalls,Loss,Stability,Score,Recommendation';
             const rows = scannedResults.map(r =>
-                `${r.ip},${r.colo},${r.tcp_latency.toFixed(1)},${(r.jitter||0).toFixed(1)},${r.download_speed.toFixed(2)},${(r.min_speed||0).toFixed(2)},${(r.load_latency||0).toFixed(1)},${(r.stability||0).toFixed(0)},${r.score.toFixed(1)}`
+                `${r.ip},${r.colo},${r.tcp_latency.toFixed(1)},${(r.jitter||0).toFixed(1)},${r.download_speed.toFixed(2)},${(r.p10_speed||0).toFixed(2)},${(r.min_speed||0).toFixed(2)},${r.stall_count||0},${((r.packet_loss||0)*100).toFixed(0)}%,${(r.stability||0).toFixed(0)},${r.score.toFixed(1)},${r.recommendation||'GOOD'}`
             );
             const csvContent = bom + header + '\n' + rows.join('\n') + '\n';
             const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8' });

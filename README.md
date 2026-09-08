@@ -1,10 +1,12 @@
 # CFST - Cloudflare Route Quality Probe & SpeedTest
 
-> v2.0.1 | Go Edition
+> v2.1.0 | Go Edition
 
-CFST 已从一次性 Cloudflare IP 测速工具全面升级为**长期运行的线路质量检测器 (Route Quality Probe)**。
+CFST 已从一次性 Cloudflare IP 测速工具全面重构升级为 **GOWAY 线路质量长期探针 + 稳定性分析 + 高峰期选路数据源 (Route Quality Probe & Stability Analyzer)**。
 
-专为流媒体、高速连接与科学选路场景打造，作为测量层无缝对接 **GoPass 控制器** 与 **GOWAY 隧道**。
+核心设计哲学：**稳定性与保底速度 (P10) > 峰值瞬时速度**。杜绝瞬时抽水型峰值节点影响排名，为流媒体、高速隧道与科学选路提供最具韧性的前置线路决策依据。
+
+作为测量层无缝对接 **GoPass 控制器** 与 **GOWAY 隧道**。
 
 ---
 
@@ -22,10 +24,13 @@ CFST 已从一次性 Cloudflare IP 测速工具全面升级为**长期运行的�
 |   - Standby (中频)          +---> [Layered Probe: L1~L5]       |
 |   - Candidate (低频)        |          |                       |
 |   - Failed (恢复探测)        |          v                       |
-|                             +---> [EWMA & History (5m~24h)]    |
-|                             |     [Peak Hour Matrix (00~23)]   |
-|                             |     [Health State Machine]       |
-|                             |     [Dynamic Score: Inst/ST/LT]  |
+|                             +---> [1s Interval Sampling]       |
+|                             |     [Anti-Buffering Floor: P10]  |
+|                             |     [Stall & Zero-Speed Detect]  |
+|                             |     [EWMA & History (5m~24h)]    |
+|                             |     [24h Peak Hour Matrix (0~23)]|
+|                             |     [5-State Debounced Health]   |
+|                             |     [Multi-Horizon Scoring Engine]
 +-----------------------------+----------------------------------+
                               |
                      RouteMetrics (JSON API)
@@ -43,86 +48,47 @@ CFST 已从一次性 Cloudflare IP 测速工具全面升级为**长期运行的�
 +----------------------------------------------------------------+
 ```
 
-- **CFST 职责**：**只负责测量**。探测网络状态，计算健康度与评分，通过本地 REST API 输出统一 `RouteMetrics`。
-- **GoPass 职责**：读取 RouteMetrics，执行策略判定与线路切换控制。
+- **CFST 职责**：**只负责测量**。执行真 1 秒粒度分片采样、卡顿率统计、计算健康度状态机与多时域综合评分，通过本地 REST API 输出结构化 `RouteMetrics`。
+- **GoPass 职责**：读取 RouteMetrics，根据策略执行最优线路选择与动态故障切换。
 - **GOWAY 职责**：底层纯粹的高性能通信与转发隧道。
 
 ---
 
-## 核心特性
+## 核心特性 (v2.1.0)
 
-- 🎯 **统一 RouteMetrics** — 结构化输出 IP、Port、Colo、RTT、丢包率、抖动、单流速度、最低速度、稳定性、负载延迟、握手状态、健康状态及三维评分。
-- 🕒 **解决“瞬时高速节点”** — 创新采用三维时域评分：
-  - `InstantScore`：当前测量得分（占比 40%）
-  - `ShortTermScore`：最近 5~15 分钟 EWMA 得分（占比 35%）
-  - `LongTermScore`：数小时长期表现及晚高峰加权得分（占比 25%）
-- 📈 **EWMA 指数加权移动平均** — 对速度、延迟、丢包率、抖动、稳定性进行双半衰期平滑，避免瞬时波动干扰选路。
-- 🌙 **24小时 Peak Hour 矩阵** — 实时统计 00:00~23:00 每小时的表现与失败率，自动学习“晚高峰掉速节点”并动态调整评分。
-- 🛡️ **退化与健康状态机 (Route Health)** — 严格区分单次测量成功与线路健康，支持 5 态生命周期：
-  `HEALTHY` ➔ `DEGRADED` ➔ `FAILING` ➔ `FAILED` ➔ `RECOVERING`。
-- ⚡ **分层主动探测 (Layered Probe Pipeline)** —
-  - Layer 1: TCP Ping（延迟与丢包）
-  - Layer 2: WSS Handshake（GOWAY 兼容性握手）
-  - Layer 3: Quick Speed（2~3秒快速测速）
-  - Layer 4: Full Speed Test（深度吞吐测试）
-  - Layer 5: Load Latency（负载延迟测试）
-  由浅入深逐层过滤，严格限制带宽并发（默认最多 1 个测速任务并发），防止探针影响真实用户流量。
-- 🔄 **分级探测调度 (Tiered Scheduler)** —
-  - `Active` 线路：高频轻量保活与质量监测（默认 10s）
-  - `Standby` 备用线路：中频探活（默认 30s）
-  - `Candidate` 候选池：低频轮询（默认 180s）
-  - `Failed` 故障线路：恢复探测（默认 60s）
-- 🔌 **GoPass 专用本地 REST API** — 监听 `127.0.0.1:9876`，提供结构化 JSON 数据，无须解析文本或 CSV。
-- 📦 **100% 兼容现有工具生态** — 保留原有 CLI 交互模式、Web UI 界面与 `result_colo.csv` 输出。
-
----
-
-## 快速开始
-
-### 1. 长期探针模式 (Daemon Mode，推荐用于 GoPass 对接)
-
-```bash
-# 启动后台常驻线路质量检测器与本地 API
-cfst.exe -daemon
-
-# 自定义探针频率与监听地址
-cfst.exe -daemon -api-addr 127.0.0.1:9876 -active-interval 10 -standby-interval 30 -mode peak
-```
-
-### 2. 传统一次性测速模式 (CLI)
-
-```bash
-# 默认扫描 3000 个 IP，筛选后测速并生成 result_colo.csv
-cfst.exe
-
-# 自定义参数扫描
-cfst.exe -max 5000 -topn 100 -dlc 3 -dn 20
-```
-
-### 3. Web UI 浏览器可视化模式
-
-```bash
-# 启动 Web 服务
-cfst.exe -web
-
-# 浏览器访问 http://127.0.0.1:9876
-```
+- ⏱️ **真 1 秒分片采样与真实 MinSpeed** — 测速过程中每秒记录离散采样数据（`SpeedIntervalSample`），**绝不丢弃 0 MB/s 区间**；若发生断流卡顿，真实反映 `MinSpeed = 0`，消除传统测速器将最低速虚高成非零值的致命缺陷。
+- 🛡️ **抗缓冲地板速度 (P10 / P25 / Median)** — 专门针对 4K/8K 视频和直播场景，采用 10 分位数速度（P10）作为防缓冲地板基准，即使峰值达到 100 MB/s，若 P10 低至 2 MB/s 也将被重罚。
+- ⚠️ **卡顿检测 (Stall Detection)** — 显式追踪断流次数（`StallCount`）、累计停滞时长（`TotalStallDuration`）、最长单次停滞时长（`LongestStallDuration`）以及断流占比（`StallRate`）。
+- 📊 **复合稳定性指数 (Composite Stability Index)** —
+  $$\text{Stability} = 0.35 \times \text{SpeedConsistency} + 0.25 \times \text{FloorStability} + 0.20 \times \text{NoStallRatio} + 0.10 \times \text{LatencyConsistency} + 0.10 \times \text{LossConsistency}$$
+- 🌙 **多时域评分引擎 (Multi-Horizon Scoring)** —
+  - 正常时段：`FinalScore = Instant*0.20 + ShortTerm*0.30 + LongTerm*0.25 + PeakHour*0.15 + Conf*0.10`
+  - 晚高峰时段：`FinalScore = Instant*0.10 + ShortTerm*0.25 + LongTerm*0.25 + PeakHour*0.25 + Conf*0.15`
+  - 确保平稳稳定的 55 MB/s 节点得分显著高于偶发抽水 100 MB/s 且伴随断流的节点。
+- 🔄 **防抖去抖健康状态机 (5-State Debounced Health)** —
+  严格支持 `HEALTHY` ➔ `DEGRADED` ➔ `FAILING` ➔ `FAILED` ➔ `RECOVERING`。采用连续 3 次判定防抖机制，杜绝偶发网络波动导致频繁翻转。
+- 🧭 **智能选路建议体系 (Recommendations)** — 输出 `BEST`、`GOOD`、`USABLE`、`DEGRADED`、`AVOID`、`FAILED` 等级并附带诊断原因列表。
+- 📉 **EWMA 故障压制与衰减** — 线路发生探测失败时，EWMA 立即施加失败压力（`RecordFailure`），指数级衰减历史速度，防止离线节点残留虚高评分。
+- 💾 **原子化安全持久化** — 支持 Windows 文件系统安全的临时文件写入、`.bak` 轮转备份与双重恢复机制。
 
 ---
 
 ## GoPass 对接 REST API
 
-CFST 在后台运行时默认监听 `127.0.0.1:9876`，提供以下接口供 GoPass 控制器调用：
+CFST 默认监听 `127.0.0.1:9876`，提供以下高可靠接口供 GoPass 控制器调用：
 
 | 接口 | 方法 | 说明 |
 |---|---|---|
-| `/api/health` | GET | 获取探针运行状态、运行时间、线路健康数统计 |
-| `/api/routes` | GET | 获取所有受控线路的 `RouteMetrics`（支持 `?tier=`, `?health=`, `?colo=` 过滤） |
-| `/api/routes/best` | GET | 获取综合得分最高且健康的最优线路（支持 `?limit=N`，默认前 5） |
-| `/api/routes/metrics` | GET | 轻量级指标摘要数组（适配 GoPass 极速高频轮询） |
-| `/api/routes/{ip}` | GET | 获取指定 IP 的详细时域滑动窗口 (5m~24h)、EWMA 与 Peak Hour 矩阵 |
+| `/api/health` | GET | 获取探针状态、运行时间、版本号、各层级健康统计 |
+| `/api/routes` | GET | 获取所有受控线路的 `RouteMetrics`（支持 `?tier=`, `?health=`, `?colo=`, `?limit=` 过滤） |
+| `/api/routes/best` | GET | 获取经过健康过滤、高峰期修正与置信度平滑后的 Top 线路列表 |
+| `/api/routes/metrics` | GET | 极轻量指标摘要数组（供 GoPass 极速高频秒级轮询） |
+| `/api/routes/{ip}` | GET | 获取指定 IP 的详细信息与评分拆解 |
+| `/api/routes/{ip}/history` | GET | 获取指定 IP 的 5m / 15m / 1h / 6h / 24h 滑动窗口统计 |
+| `/api/routes/{ip}/peak` | GET | 获取指定 IP 的 24 小时 Peak Hour 矩阵与每小时表现 |
+| `/api/routes/{ip}/samples` | GET | 获取指定 IP 最近采样的历史原始样本列表 |
 | `/api/routes/tier` | POST | GoPass 通知 CFST 更新线路层级（`{"ip": "x.x.x.x", "tier": "ACTIVE"}`） |
-| `/api/probe` | POST | 触发指定 IP 的即时探测（`{"ip": "x.x.x.x", "speed_test": true}`） |
+| `/api/probe` | POST | 触发指定 IP 的即时按需探测（`{"ip": "x.x.x.x", "speed_test": true}`） |
 | `/api/config` | GET / POST | 查看或动态切换运行模式（normal/peak）与探针间隔 |
 
 ### 统一输出结构 RouteMetrics 示例
@@ -135,51 +101,54 @@ CFST 在后台运行时默认监听 `127.0.0.1:9876`，提供以下接口供 GoP
   "colo": "HKG",
   "tier": "ACTIVE",
   "health": "HEALTHY",
+  "recommendation": "BEST",
+  "recommendation_reasons": [
+    "Rock-solid throughput without stalls",
+    "High floor speed: P10 52.8 MB/s",
+    "Zero packet loss & minimal jitter"
+  ],
+  "stability_grade": "STABLE",
+  "speed": {
+    "avg": 65.2,
+    "median": 64.0,
+    "p10": 52.8,
+    "min": 48.0
+  },
+  "stalls": {
+    "count": 0,
+    "rate": 0.0,
+    "total_duration": 0.0
+  },
   "rtt": 42.5,
-  "packet_loss": 0.0,
   "jitter": 2.1,
-  "download_speed": 68.4,
-  "single_speed": 65.2,
-  "min_speed": 52.8,
+  "packet_loss": 0.0,
   "stability": 95.4,
-  "load_latency": 55.2,
-  "handshake_success": true,
   "instant_score": 93.2,
   "short_term_score": 91.0,
   "long_term_score": 88.6,
+  "peak_hour_score": 89.2,
+  "confidence": 92.5,
   "final_score": 91.3,
-  "ewma": {
-    "speed": 64.8,
-    "latency": 43.1,
-    "loss": 0.0,
-    "jitter": 2.3,
-    "stability": 94.8
-  },
   "consecutive_failures": 0,
   "consecutive_successes": 15,
-  "last_tested": "2026-09-07T22:45:00+08:00",
-  "timestamp": "2026-09-07T22:45:00+08:00"
+  "last_tested": "2026-09-08T09:40:00+08:00"
 }
 ```
 
 ---
 
-## 动态综合评分公式
+## 动态综合评分权重分布
 
-$$\text{FinalScore} = \text{InstantScore} \times 0.40 + \text{ShortTermScore} \times 0.35 + \text{LongTermScore} \times 0.25$$
-
-### 维度权重分布（支持 API 动态调整）
-
-| 指标 | Normal 模式 | Peak 模式 (晚高峰) | 说明 |
+| 指标 | Normal 模式 | Peak 模式 (晚高峰) | 设计意图 |
 |---|---|---|---|
-| **单流速度 (SingleSpeed)** | 25% | 15% | 单连接下载带宽（cap 15 MB/s） |
-| **保底速度 (MinSpeed)** | 10% | 10% | 瞬时最低速度，保障视频不出现断流缓冲 |
-| **稳定性 (Stability)** | 25% | 30% | 速度变异系数，数值越高速度越平稳 |
-| **丢包率 (PacketLoss)** | 15% | 25% | 丢包严重度惩罚（20% 丢包即得 0 分） |
-| **延迟抖动 (Jitter)** | 10% | 10% | RTT 方差标准差（>10ms 阶梯扣分） |
-| **TCP 延迟 (RTT)** | 10% | 5% | 基础往返时延 |
-| **WSS 握手 (Handshake)** | 5% | 5% | GOWAY 兼容性判定 |
-| **Colo 奖励** | +5.0 | +3.0 | 优质数据中心直接加分 |
+| **单流速度 (Speed)** | 20% | 15% | 单连接吞吐，设定 15 MB/s (~120 Mbps) 饱和上限 |
+| **抗缓冲地板速度 (P10)** | 20% | 25% | **核心保底项**，设定 12 MB/s 上限，权重与峰速等同或更高 |
+| **真实最低速度 (MinSpeed)** | 10% | 10% | 断流即为 0 分，杜绝卡顿节点 |
+| **复合稳定性 (Stability)** | 20% | 25% | 结合变异系数、卡顿率与时延波动的综合韧性 |
+| **丢包率 (PacketLoss)** | 10% | 10% | 阶梯惩罚，严重丢包时急速归零 |
+| **延迟抖动 (Jitter)** | 10% | 10% | 评估队列堆积与缓冲膨胀 |
+| **TCP 延迟 (RTT)** | 5% | 2.5% | 基础往返时延 |
+| **WSS 握手 (Handshake)** | 5% | 2.5% | GOWAY 协议兼容性 |
 
 ---
 

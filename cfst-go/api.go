@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -52,16 +53,16 @@ func handleAPIHealth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status":          "ok",
-		"service":         "CFST Route Quality Probe",
-		"version":         "v2.0.1",
-		"uptime_seconds":  int64(time.Since(appStartTime).Seconds()),
-		"score_mode":      GlobalScoreEngine.GetMode(),
-		"total_routes":    len(all),
-		"healthy_routes":  healthyCount,
-		"active_routes":   activeCount,
-		"standby_routes":  standbyCount,
-		"timestamp":       time.Now().Format(time.RFC3339),
+		"status":         "ok",
+		"service":        "CFST Route Quality Probe",
+		"version":        "v2.1.0",
+		"uptime_seconds": int64(time.Since(appStartTime).Seconds()),
+		"score_mode":     GlobalScoreEngine.GetMode(),
+		"total_routes":   len(all),
+		"healthy_routes": healthyCount,
+		"active_routes":  activeCount,
+		"standby_routes": standbyCount,
+		"timestamp":      time.Now().Format(time.RFC3339),
 	})
 }
 
@@ -69,10 +70,37 @@ func handleAPIRoutes(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/routes")
 	path = strings.TrimPrefix(path, "/")
 
-	// Sub-route handling: /api/routes/{id_or_ip}
+	// Sub-route handling: /api/routes/{ip}/[history|peak|samples]
 	if path != "" && path != "best" && path != "metrics" && path != "tier" {
-		handleAPIRouteDetail(w, r, path)
-		return
+		parts := strings.Split(path, "/")
+		ip := parts[0]
+		sub := ""
+		if len(parts) > 1 {
+			sub = parts[1]
+		}
+
+		rec, exists := GlobalRouteStore.Get(ip)
+		if !exists {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "Route not found"})
+			return
+		}
+
+		switch sub {
+		case "history":
+			windows := GlobalRouteStore.GetHistoryWindows(ip)
+			writeJSON(w, http.StatusOK, windows)
+			return
+		case "peak":
+			peakHours := GlobalRouteStore.GetPeakHours(ip)
+			writeJSON(w, http.StatusOK, peakHours)
+			return
+		case "samples":
+			writeJSON(w, http.StatusOK, rec.Samples)
+			return
+		default:
+			handleAPIRouteDetail(w, r, ip)
+			return
+		}
 	}
 
 	if r.Method != http.MethodGet {
@@ -135,21 +163,42 @@ func handleAPIBestRoutes(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, best)
 }
 
+type SpeedSummary struct {
+	Avg    float64 `json:"avg"`
+	Median float64 `json:"median"`
+	P10    float64 `json:"p10"`
+	Min    float64 `json:"min"`
+}
+
+type StallSummary struct {
+	Count         int     `json:"count"`
+	Rate          float64 `json:"rate"`
+	TotalDuration float64 `json:"total_duration"`
+}
+
 // Lightweight metrics summary for fast GoPass controller polling
 type RouteMetricSummary struct {
-	ID          string      `json:"id"`
-	IP          string      `json:"ip"`
-	Port        int         `json:"port"`
-	Colo        string      `json:"colo"`
-	Tier        RouteTier   `json:"tier"`
-	Health      RouteHealth `json:"health"`
-	RTT         float64     `json:"rtt"`
-	PacketLoss  float64     `json:"packet_loss"`
-	Jitter      float64     `json:"jitter"`
-	SingleSpeed float64     `json:"single_speed"`
-	MinSpeed    float64     `json:"min_speed"`
-	FinalScore  float64     `json:"final_score"`
-	Timestamp   time.Time   `json:"timestamp"`
+	ID             string              `json:"id"`
+	IP             string              `json:"ip"`
+	Port           int                 `json:"port"`
+	Colo           string              `json:"colo"`
+	Tier           RouteTier           `json:"tier"`
+	Health         RouteHealth         `json:"health"`
+	StabilityGrade StabilityGrade      `json:"stability_grade"`
+	Recommendation RouteRecommendation `json:"recommendation"`
+	Reasons        []string            `json:"reasons,omitempty"`
+	RTT            float64             `json:"rtt"`
+	PacketLoss     float64             `json:"packet_loss"`
+	Jitter         float64             `json:"jitter"`
+	SingleSpeed    float64             `json:"single_speed"`
+	MinSpeed       float64             `json:"min_speed"`
+	P10Speed       float64             `json:"p10_speed"`
+	Confidence     float64             `json:"confidence"`
+	PeakHourScore  float64             `json:"peak_hour_score"`
+	FinalScore     float64             `json:"final_score"`
+	Speed          SpeedSummary        `json:"speed"`
+	Stalls         StallSummary        `json:"stalls"`
+	Timestamp      time.Time           `json:"timestamp"`
 }
 
 func handleAPIMetricsSummary(w http.ResponseWriter, r *http.Request) {
@@ -161,20 +210,50 @@ func handleAPIMetricsSummary(w http.ResponseWriter, r *http.Request) {
 	all := GlobalRouteStore.GetAll()
 	summaries := make([]RouteMetricSummary, len(all))
 	for i, m := range all {
+		effectiveSpeed := m.SingleSpeed
+		if effectiveSpeed <= 0 {
+			effectiveSpeed = m.DownloadSpeed
+		}
+		median := m.MedianSpeed
+		if median <= 0 {
+			median = effectiveSpeed
+		}
+		p10 := m.P10Speed
+		if p10 <= 0 {
+			p10 = m.MinSpeed
+		}
+
 		summaries[i] = RouteMetricSummary{
-			ID:          m.ID,
-			IP:          m.IP,
-			Port:        m.Port,
-			Colo:        m.Colo,
-			Tier:        m.Tier,
-			Health:      m.Health,
-			RTT:         m.RTT,
-			PacketLoss:  m.PacketLoss,
-			Jitter:      m.Jitter,
-			SingleSpeed: m.SingleSpeed,
-			MinSpeed:    m.MinSpeed,
-			FinalScore:  m.FinalScore,
-			Timestamp:   m.Timestamp,
+			ID:             m.ID,
+			IP:             m.IP,
+			Port:           m.Port,
+			Colo:           m.Colo,
+			Tier:           m.Tier,
+			Health:         m.Health,
+			StabilityGrade: m.StabilityGrade,
+			Recommendation: m.Recommendation,
+			Reasons:        m.RecommendationReasons,
+			RTT:            m.RTT,
+			PacketLoss:     m.PacketLoss,
+			Jitter:         m.Jitter,
+			SingleSpeed:    m.SingleSpeed,
+			MinSpeed:       m.MinSpeed,
+			P10Speed:       p10,
+			Confidence:     m.Confidence,
+			PeakHourScore:  m.PeakHourScore,
+			FinalScore:     m.FinalScore,
+			Speed: SpeedSummary{
+				Avg:    math.Round(effectiveSpeed*10) / 10,
+				Median: math.Round(median*10) / 10,
+				P10:    math.Round(p10*10) / 10,
+				Min:    math.Round(m.MinSpeed*10) / 10,
+			},
+			Stalls: StallSummary{
+				Count:         m.StallCount,
+				Rate:          math.Round(m.StallRate*1000) / 1000,
+				TotalDuration: math.Round(m.TotalStallDuration*10) / 10,
+			},
+			Timestamp: m.Timestamp,
 		}
 	}
 	writeJSON(w, http.StatusOK, summaries)
@@ -190,12 +269,40 @@ func handleAPIRouteDetail(w http.ResponseWriter, r *http.Request, idOrIP string)
 	windows := GlobalRouteStore.GetHistoryWindows(idOrIP)
 	peakHours := GlobalRouteStore.GetPeakHours(idOrIP)
 
+	effectiveSpeed := rec.Metrics.SingleSpeed
+	if effectiveSpeed <= 0 {
+		effectiveSpeed = rec.Metrics.DownloadSpeed
+	}
+	median := rec.Metrics.MedianSpeed
+	if median <= 0 {
+		median = effectiveSpeed
+	}
+	p10 := rec.Metrics.P10Speed
+	if p10 <= 0 {
+		p10 = rec.Metrics.MinSpeed
+	}
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"metrics":    rec.Metrics,
-		"ewma_short": rec.EWMA.ShortSnapshot(),
-		"ewma_long":  rec.EWMA.LongSnapshot(),
-		"history":    windows,
-		"peak_hours": peakHours,
+		"metrics":           rec.Metrics,
+		"recommendation":    rec.Metrics.Recommendation,
+		"stability_grade":   rec.Metrics.StabilityGrade,
+		"confidence":        rec.Metrics.Confidence,
+		"final_score":       rec.Metrics.FinalScore,
+		"speed": SpeedSummary{
+			Avg:    math.Round(effectiveSpeed*10) / 10,
+			Median: math.Round(median*10) / 10,
+			P10:    math.Round(p10*10) / 10,
+			Min:    math.Round(rec.Metrics.MinSpeed*10) / 10,
+		},
+		"stalls": StallSummary{
+			Count:         rec.Metrics.StallCount,
+			Rate:          math.Round(rec.Metrics.StallRate*1000) / 1000,
+			TotalDuration: math.Round(rec.Metrics.TotalStallDuration*10) / 10,
+		},
+		"ewma_short":        rec.EWMA.ShortSnapshot(),
+		"ewma_long":         rec.EWMA.LongSnapshot(),
+		"history":           windows,
+		"peak_hours":        peakHours,
 	})
 }
 

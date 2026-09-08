@@ -1,6 +1,40 @@
 # Changelog
 
-## v2.0.1 (2026-09-07)
+## v2.1.0 (2026-09-08)
+
+### Major Architecture Upgrade: GOWAY Route Quality Probe & Stability Analyzer
+- **True 1-Second Interval Sampling (`engine.go`)**:
+  - Implemented `SpeedIntervalSample` and `SpeedMetrics` tracking discrete 1s download intervals.
+  - **Fixed critical bug**: Never drops 0 MB/s intervals (`speed > 0` filter removed).
+  - True `MinSpeed` accurately records 0 MB/s when a stall occurs.
+  - Added anti-buffering percentiles: `P10Speed`, `P25Speed`, `MedianSpeed`, `MaxSpeed`, `StdDev`, `CoefficientOfVariation`.
+  - Introduced stall metrics: `StallCount`, `TotalStallDuration`, `ZeroSpeedIntervals`, `LongestStallDuration`, and `StallRate`.
+- **Composite Stability Formula**:
+  - Replaced naive ratio with multi-dimensional stability index:
+    $\text{Stability} = 0.35 \times \text{SpeedConsistency} + 0.25 \times \text{FloorStability} + 0.20 \times \text{NoStallRatio} + 0.10 \times \text{LatencyConsistency} + 0.10 \times \text{LossConsistency}$.
+- **Multi-Horizon Scoring Engine (`score.go`)**:
+  - Rebalanced component weights: Speed 20%, P10 20%, MinSpeed 10%, Stability 20%, PacketLoss 10%, Jitter 10%, Latency 5%, Handshake 5%.
+  - Peak mode component weights: Speed 15%, P10 25%, MinSpeed 10%, Stability 25%, PacketLoss 10%, Jitter 10%, Latency 2.5%, Handshake 2.5%.
+  - Horizon weights for Normal mode: Instant 20%, Short-term 30%, Long-term 25%, Peak-hour 15%, Confidence 10%.
+  - Horizon weights for Peak mode: Instant 10%, Short-term 25%, Long-term 25%, Peak-hour 25%, Confidence 15%.
+  - Guarantees rock-solid 55 MB/s node outranks 100 MB/s peak node with stalls.
+- **Degradation & Health State Machine (`metrics.go`)**:
+  - Added anti-jitter debouncing: requires 3 consecutive degraded occurrences to switch to `DEGRADED`, and 3 consecutive successes to restore `HEALTHY`.
+  - Added `StabilityGrade` (`STABLE`, `FLUCTUATING`, `DEGRADED`, `UNSTABLE`, `FAILED`).
+  - Added `RouteRecommendation` (`BEST`, `GOOD`, `USABLE`, `DEGRADED`, `AVOID`, `FAILED`) and human/machine-readable `recommendation_reasons`.
+- **EWMA Failure Pressure & Decay (`ewma.go`)**:
+  - Added `RecordFailure(now)`: applies failure degradation pressure, forcing exponential decay of EWMA speeds so dead routes immediately lose top ranking.
+- **Route Selection & Atomic Persistence (`history.go`)**:
+  - Upgraded `GetBest`: filters out `FAILED`/`FAILING`, applies 25% discount to `DEGRADED` and 30% to `RECOVERING`, prioritizes `PeakHourScore` during peak hours, and resolves ties using multi-level tie-breaking (`EffectiveScore` > `P10Speed` > `Jitter` > `PacketLoss` > `RTT`).
+  - Fixed nested lock deadlock bug in `RouteStore`.
+  - Added atomic Windows-safe snapshot saving with `.tmp` write, `.bak` rotation, and backward-compatible schema loading.
+- **REST API Subroutes & Enriched Payload (`api.go`)**:
+  - Subroutes: `/api/routes/{ip}/history`, `/api/routes/{ip}/peak`, `/api/routes/{ip}/samples`.
+  - Enriched JSON payloads with `speed.p10`, `speed.median`, `speed.avg`, `speed.min`, `stalls`, `stability_grade`, `recommendation`, `reasons`.
+- **Web UI & CLI Upgrades (`index.html`, `scanner.go`, `main.go`)**:
+  - Updated to v2.1.0, displaying P10 speed, stall counts, recommendation badges, and CSV export with P10 columns.
+  - Added `-v` / `-version` flag in CLI.
+
 
 ### Enhancements
 - **EWMA MinSpeed Integration**: Added `MinSpeed` tracking into both short-term and long-term EWMA snapshots (`RouteEWMATracker`), providing direct buffer-underrun indicators for continuous video streaming scenarios.

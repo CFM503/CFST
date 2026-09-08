@@ -15,7 +15,7 @@ import (
 // RunDaemon initializes and runs CFST as a continuous Route Quality Probe daemon.
 func RunDaemon(cfg Config) {
 	fmt.Println("============================================================")
-	fmt.Println("   CFST Route Quality Probe v2.0.1 (Continuous Daemon Mode)")
+	fmt.Println("   CFST Route Quality Probe v2.1.0 (Continuous Daemon Mode)")
 	fmt.Printf("   Listening on: http://%s\n", cfg.APIAddr)
 	fmt.Printf("   Score Mode:   %s\n", cfg.ScoreMode)
 	fmt.Printf("   Intervals:    Active: %ds | Standby: %ds | Candidate: %ds | Failed: %ds\n",
@@ -25,6 +25,14 @@ func RunDaemon(cfg Config) {
 	GlobalScoreEngine.SetMode(ScoreMode(cfg.ScoreMode))
 
 	probeCfg := ProbeConfig{
+		Profile: ProbeProfile{
+			Type:     ProfileGOWAYWSS,
+			Port:     cfg.Port,
+			Host:     cfg.WSSHost,
+			Path:     "/pyway",
+			TestURL:  cfg.URL,
+			Protocol: "wss",
+		},
 		ActiveInterval:    time.Duration(cfg.ActiveInterval) * time.Second,
 		StandbyInterval:   time.Duration(cfg.StandbyInterval) * time.Second,
 		CandidateInterval: time.Duration(cfg.CandidateInterval) * time.Second,

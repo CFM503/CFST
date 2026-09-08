@@ -404,9 +404,9 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 						t, len(candidates), cand.IP, int(totalSkipped.Load())))
 				}
 
-				speed, minSpd, stab := SingleStreamTest(ctx, cand.IP, cfg.Port, cfg.Duration, cfg.URL, cfg.SNI, progressLive)
+				sm := SingleStreamTestDetailed(ctx, cand.IP, cfg.Port, cfg.Duration, cfg.URL, cfg.SNI, progressLive, cand.TCPLatency, cand.Jitter, cand.PacketLoss)
 
-				if speed == 0 && minSpd == 0 && stab == 0 {
+				if sm.AverageSpeed == 0 && sm.MinSpeed == 0 && sm.Stability == 0 {
 					totalSkipped.Add(1)
 					workerCooldownMs = min(workerCooldownMs*2, 5000)
 					if cfg.Skip429 {
@@ -426,10 +426,14 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 					if !cfg.SkipLoadLatency {
 						cand.LoadLatency = MeasureLoadLatency(cand.IP, cfg.Port)
 					}
-					cand.DownloadSpeed = speed
-					cand.SingleSpeed = speed
-					cand.MinSpeed = minSpd
-					cand.Stability = stab
+					cand.DownloadSpeed = sm.AverageSpeed
+					cand.SingleSpeed = sm.AverageSpeed
+					cand.P10Speed = sm.P10Speed
+					cand.MedianSpeed = sm.MedianSpeed
+					cand.MinSpeed = sm.MinSpeed
+					cand.Stability = sm.Stability
+					cand.StallCount = sm.StallCount
+					cand.ZeroSpeedIntervals = sm.ZeroSpeedIntervals
 					cand.CalcScore()
 
 					select {
@@ -438,7 +442,7 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 						return
 					}
 
-					if speed >= cfg.StopThreshold {
+					if sm.AverageSpeed >= cfg.StopThreshold {
 						if fastCount.Add(1) >= 5 {
 							if fastExitHost != nil {
 								fastExitHost()
@@ -462,7 +466,7 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 }
 
 func RunCLI(cfg Config) {
-	fmt.Printf("Cloudflare SpeedTest v2.0.1 (Route Quality Probe - Go Edition)\n\n")
+	fmt.Printf("Cloudflare SpeedTest v2.1.0 (Route Quality Probe - Go Edition)\n\n")
 
 	ips := GenerateIPs(cfg.MaxScan, cfg.Unique, cfg.IPFile)
 	fmt.Printf("🔍 Scanning %d IPs (concurrency: %d)...\n", len(ips), cfg.ScanConcurrent)
@@ -578,26 +582,26 @@ func RunCLI(cfg Config) {
 
 	fmt.Printf("\n🚀 Download Test (%ds duration, %d parallel)\n", cfg.Duration, cfg.DLConc)
 	if cfg.SkipLoadLatency {
-		fmt.Printf("%-16s %-6s %-9s %-9s %-13s %-12s %-8s %-6s\n",
-			"IP", "Colo", "Latency", "Jitter", "Speed", "MinSpd", "Stable", "Score")
-		fmt.Println("--------------------------------------------------------------------------")
+		fmt.Printf("%-16s %-6s %-9s %-9s %-12s %-11s %-11s %-8s %-6s\n",
+			"IP", "Colo", "Latency", "Jitter", "Speed", "P10", "MinSpd", "Stable", "Score")
+		fmt.Println("------------------------------------------------------------------------------------------------")
 	} else {
-		fmt.Printf("%-16s %-6s %-9s %-9s %-13s %-12s %-9s %-8s %-6s\n",
-			"IP", "Colo", "Latency", "Jitter", "Speed", "MinSpd", "LoadLat", "Stable", "Score")
-		fmt.Println("-------------------------------------------------------------------------------------------")
+		fmt.Printf("%-16s %-6s %-9s %-9s %-12s %-11s %-11s %-9s %-8s %-6s\n",
+			"IP", "Colo", "Latency", "Jitter", "Speed", "P10", "MinSpd", "LoadLat", "Stable", "Score")
+		fmt.Println("-------------------------------------------------------------------------------------------------------------")
 	}
 
 	results := runParallelDownloadTest(ctx, candidates, cfg, func(res NodeResult) {
 		if res.Colo != "429" || !cfg.Skip429 {
-			fmt.Printf("\r%-130s\r", "")
+			fmt.Printf("\r%-140s\r", "")
 			if cfg.SkipLoadLatency {
-				fmt.Printf("%-16s %-6s %6.1fms  %5.1fms  %6.2f MB/s  %5.2f MB/s  %4.0f%%   %5.1f\n",
+				fmt.Printf("%-16s %-6s %6.1fms  %5.1fms  %5.2f MB/s  %5.2f MB/s  %5.2f MB/s  %4.0f%%   %5.1f\n",
 					res.IP, res.Colo, res.TCPLatency, res.Jitter,
-					res.DownloadSpeed, res.MinSpeed, res.Stability, res.Score)
+					res.DownloadSpeed, res.P10Speed, res.MinSpeed, res.Stability, res.Score)
 			} else {
-				fmt.Printf("%-16s %-6s %6.1fms  %5.1fms  %6.2f MB/s  %5.2f MB/s  %6.1fms  %4.0f%%   %5.1f\n",
+				fmt.Printf("%-16s %-6s %6.1fms  %5.1fms  %5.2f MB/s  %5.2f MB/s  %5.2f MB/s  %6.1fms  %4.0f%%   %5.1f\n",
 					res.IP, res.Colo, res.TCPLatency, res.Jitter,
-					res.DownloadSpeed, res.MinSpeed, res.LoadLatency, res.Stability, res.Score)
+					res.DownloadSpeed, res.P10Speed, res.MinSpeed, res.LoadLatency, res.Stability, res.Score)
 			}
 		}
 	}, nil, func(p LiveProgress) {
@@ -648,7 +652,7 @@ func saveCSV(path string, results []NodeResult) {
 	w := csv.NewWriter(f)
 	defer w.Flush()
 
-	w.Write([]string{"IP", "Colo", "Latency", "Jitter", "SgSpeed_MB", "Speed_MB", "MinSpeed_MB", "LoadLatency", "Stability", "Score"})
+	w.Write([]string{"IP", "Colo", "Latency", "Jitter", "SgSpeed_MB", "Speed_MB", "P10Speed_MB", "MinSpeed_MB", "LoadLatency", "Stability", "Score"})
 	for _, r := range results {
 		w.Write([]string{
 			r.IP, r.Colo,
@@ -656,6 +660,7 @@ func saveCSV(path string, results []NodeResult) {
 			fmt.Sprintf("%.1f", r.Jitter),
 			fmt.Sprintf("%.2f", r.SingleSpeed),
 			fmt.Sprintf("%.2f", r.DownloadSpeed),
+			fmt.Sprintf("%.2f", r.P10Speed),
 			fmt.Sprintf("%.2f", r.MinSpeed),
 			fmt.Sprintf("%.1f", r.LoadLatency),
 			fmt.Sprintf("%.0f", r.Stability),
