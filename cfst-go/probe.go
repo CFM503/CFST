@@ -378,17 +378,20 @@ type LayeredProbeResult struct {
 
 // ProbeScheduler runs layered active background testing on managed routes.
 type ProbeScheduler struct {
-	mu           sync.RWMutex
-	store        *RouteStore
-	cfg          ProbeConfig
-	speedSem     chan struct{} // limits concurrent bandwidth-heavy speed tests
-	probeSem     chan struct{} // limits lightweight concurrent pings/handshakes
-	cycleCount   sync.Map      // route IP -> int64 cycle count
-	inFlight     sync.Map      // route IP -> struct{} per-IP probe concurrency de-duplication
-	running      atomic.Bool
-	stopCh       chan struct{}
-	probeTrigger chan string
-	probeExec    func(ctx context.Context, target ResolvedProbeTarget, cfg ProbeConfig, runL3 bool, runFullSpeed bool) LayeredProbeResult
+	mu               sync.RWMutex
+	store            *RouteStore
+	cfg              ProbeConfig
+	speedSem         chan struct{} // limits concurrent bandwidth-heavy speed tests
+	probeSem         chan struct{} // limits lightweight concurrent pings/handshakes
+	cycleCount       sync.Map      // route IP -> int64 cycle count
+	inFlight         sync.Map      // route IP -> struct{} per-IP probe concurrency de-duplication
+	running          atomic.Bool
+	stopCh           chan struct{}
+	probeTrigger     chan string
+	probeExec        func(ctx context.Context, target ResolvedProbeTarget, cfg ProbeConfig, runL3 bool, runFullSpeed bool) LayeredProbeResult
+	nowFunc          func() time.Time
+	onStartGoroutine func()
+	onExitGoroutine  func()
 }
 
 var GlobalProbeScheduler = NewProbeScheduler(GlobalRouteStore, DefaultProbeConfig())
@@ -621,8 +624,9 @@ func (ps *ProbeScheduler) ProbeOnce(ctx context.Context, ip string, forceSpeed b
 	// 1. In-flight per-IP probe de-duplication:
 	// Only one ProbeOnce can run per IP at any time.
 	if _, loaded := ps.inFlight.LoadOrStore(ip, struct{}{}); loaded {
-		if rec, exists := ps.store.Get(ip); exists {
-			return &rec.Metrics, nil
+		if m, exists := ps.store.GetMetrics(ip); exists {
+			snapshot := m
+			return &snapshot, nil
 		}
 		return nil, fmt.Errorf("probe already in progress for %s", ip)
 	}
@@ -634,13 +638,13 @@ func (ps *ProbeScheduler) ProbeOnce(ctx context.Context, ip string, forceSpeed b
 	port := cfg.Port
 	tier := TierCandidate
 	existingColo := ""
-	rec, exists := ps.store.Get(ip)
+	recM, exists := ps.store.GetMetrics(ip)
 	if exists {
-		if rec.Metrics.Port > 0 {
-			port = rec.Metrics.Port
+		if recM.Port > 0 {
+			port = recM.Port
 		}
-		tier = rec.Metrics.Tier
-		existingColo = rec.Metrics.Colo
+		tier = recM.Tier
+		existingColo = recM.Colo
 	}
 
 	// 3. Determine if speed test is scheduled using snapshot cfg
@@ -713,6 +717,9 @@ func (ps *ProbeScheduler) ProbeOnce(ctx context.Context, ip string, forceSpeed b
 	}
 
 	now := time.Now()
+	if ps.nowFunc != nil {
+		now = ps.nowFunc()
+	}
 	m := RouteMetrics{
 		ID:                   GenerateRouteID(ip, port),
 		IP:                   ip,
@@ -747,10 +754,10 @@ func (ps *ProbeScheduler) ProbeOnce(ctx context.Context, ip string, forceSpeed b
 		m.Colo = existingColo
 	}
 	if exists {
-		m.ConsecutiveFails = rec.Metrics.ConsecutiveFails
-		m.ConsecutiveSuccess = rec.Metrics.ConsecutiveSuccess
-		m.ConsecutiveDegraded = rec.Metrics.ConsecutiveDegraded
-		m.Health = rec.Metrics.Health
+		m.ConsecutiveFails = recM.ConsecutiveFails
+		m.ConsecutiveSuccess = recM.ConsecutiveSuccess
+		m.ConsecutiveDegraded = recM.ConsecutiveDegraded
+		m.Health = recM.Health
 		// If full speed test wasn't run on this cycle, handle speeds
 		if !runFullSpeed {
 			if runL3 {
@@ -760,43 +767,44 @@ func (ps *ProbeScheduler) ProbeOnce(ctx context.Context, ip string, forceSpeed b
 				if result.LoadLatency > 0 {
 					m.LoadLatency = result.LoadLatency
 				} else {
-					m.LoadLatency = rec.Metrics.LoadLatency
+					m.LoadLatency = recM.LoadLatency
 				}
 				// Preserve existing P10/Median/Min/Stability/CV/Stall from previous history
-				m.P10Speed = rec.Metrics.P10Speed
-				m.MedianSpeed = rec.Metrics.MedianSpeed
-				m.MinSpeed = rec.Metrics.MinSpeed
-				m.Stability = rec.Metrics.Stability
-				m.CV = rec.Metrics.CV
-				m.StallCount = rec.Metrics.StallCount
-				m.ZeroSpeedIntervals = rec.Metrics.ZeroSpeedIntervals
-				m.TotalStallDuration = rec.Metrics.TotalStallDuration
-				m.LongestStallDuration = rec.Metrics.LongestStallDuration
-				m.StallRate = rec.Metrics.StallRate
+				m.P10Speed = recM.P10Speed
+				m.MedianSpeed = recM.MedianSpeed
+				m.MinSpeed = recM.MinSpeed
+				m.Stability = recM.Stability
+				m.CV = recM.CV
+				m.StallCount = recM.StallCount
+				m.ZeroSpeedIntervals = recM.ZeroSpeedIntervals
+				m.TotalStallDuration = recM.TotalStallDuration
+				m.LongestStallDuration = recM.LongestStallDuration
+				m.StallRate = recM.StallRate
 			} else {
-				m.DownloadSpeed = rec.Metrics.DownloadSpeed
-				m.SingleSpeed = rec.Metrics.SingleSpeed
-				m.P10Speed = rec.Metrics.P10Speed
-				m.MedianSpeed = rec.Metrics.MedianSpeed
-				m.MinSpeed = rec.Metrics.MinSpeed
-				m.Stability = rec.Metrics.Stability
-				m.CV = rec.Metrics.CV
-				m.StallCount = rec.Metrics.StallCount
-				m.ZeroSpeedIntervals = rec.Metrics.ZeroSpeedIntervals
-				m.TotalStallDuration = rec.Metrics.TotalStallDuration
-				m.LongestStallDuration = rec.Metrics.LongestStallDuration
-				m.StallRate = rec.Metrics.StallRate
-				m.LoadLatency = rec.Metrics.LoadLatency
+				m.DownloadSpeed = recM.DownloadSpeed
+				m.SingleSpeed = recM.SingleSpeed
+				m.P10Speed = recM.P10Speed
+				m.MedianSpeed = recM.MedianSpeed
+				m.MinSpeed = recM.MinSpeed
+				m.Stability = recM.Stability
+				m.CV = recM.CV
+				m.StallCount = recM.StallCount
+				m.ZeroSpeedIntervals = recM.ZeroSpeedIntervals
+				m.TotalStallDuration = recM.TotalStallDuration
+				m.LongestStallDuration = recM.LongestStallDuration
+				m.StallRate = recM.StallRate
+				m.LoadLatency = recM.LoadLatency
 			}
 		}
 	}
 
 	ps.store.RecordProbeResult(m, result.Success)
-	updated, _ := ps.store.Get(ip)
-	if updated != nil {
-		return &updated.Metrics, nil
+	if updated, exists := ps.store.GetMetrics(ip); exists {
+		snapshot := updated
+		return &snapshot, nil
 	}
-	return &m, nil
+	snapshot := m
+	return &snapshot, nil
 }
 
 // Start launches the background probing daemon.
@@ -806,17 +814,26 @@ func (ps *ProbeScheduler) Start(ctx context.Context) {
 		ps.mu.Unlock()
 		return // already running
 	}
-	ps.stopCh = make(chan struct{})
+	stopCh := make(chan struct{})
+	ps.stopCh = stopCh
 	ps.mu.Unlock()
 
-	go func() {
+	go func(stopCh <-chan struct{}) {
+		if ps.onStartGoroutine != nil {
+			ps.onStartGoroutine()
+		}
+		defer func() {
+			if ps.onExitGoroutine != nil {
+				ps.onExitGoroutine()
+			}
+		}()
+
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
 
 		for {
 			select {
-			case <-ps.stopCh:
-				ps.running.Store(false)
+			case <-stopCh:
 				return
 			case <-ctx.Done():
 				ps.running.Store(false)
@@ -829,7 +846,7 @@ func (ps *ProbeScheduler) Start(ctx context.Context) {
 				ps.evaluateAndSchedule(ctx, now)
 			}
 		}
-	}()
+	}(stopCh)
 }
 
 // Stop cleanly terminates the probe scheduler.
@@ -837,7 +854,9 @@ func (ps *ProbeScheduler) Stop() {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 	if ps.running.Swap(false) {
-		close(ps.stopCh)
+		if ps.stopCh != nil {
+			close(ps.stopCh)
+		}
 	}
 }
 

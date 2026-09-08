@@ -1,5 +1,25 @@
 # Changelog
 
+## v2.1.6 (2026-09-08)
+
+### Release: Final Probe Lifecycle Hardening & Windows 11 x64 Release
+- **Fixed `stopCh` Lifecycle Race (`probe.go`, `discovery.go`)**:
+  - Bound local `stopCh` channel parameters directly into `go func(stopCh <-chan struct{})` for both `ProbeScheduler` and `DiscoveryManager`.
+  - Goroutine select loops listen strictly to `case <-stopCh:`, eliminating dynamic evaluation races when restarting components (`Start -> Stop -> Start`).
+- **Hardened In-Flight Probe Result Isolation (`probe.go`, `history.go`, `api.go`)**:
+  - Added `RouteStore.GetMetrics()` and `RouteStore.GetSamples()` returning thread-safe snapshot value copies.
+  - Eliminated internal `*RouteRecord.Metrics` pointer leaks in `ProbeOnce` and HTTP API routes (`/api/routes/{ip}`, `/api/routes/{ip}/samples`), ensuring zero data races under concurrent reading and probing.
+- **Genuine Candidate L3 Integration Coverage (`probe_test.go`)**:
+  - Rewrote `TestCandidateL3ObservationAndPromotion` to execute production `scheduler.ProbeOnce` directly with `nowFunc` time simulation across 300+ seconds.
+  - Candidate promotion to Standby is driven 100% by production `RecordProbeResult`, `EWMA`, `ScoreEngine`, and `EvaluateTierTransitionsLocked`.
+- **Full Goroutine Lifecycle Race Tests (`probe_test.go`, `discovery_test.go`)**:
+  - Added `TestProbeSchedulerRestartNoRace` and `TestDiscoveryManagerRestartNoRace` with `onStartGoroutine` and `onExitGoroutine` hooks to verify real background worker startup, teardown, and clean recreation.
+- **Legacy Snapshot Backwards Compatibility (`history.go`, `history_test.go`)**:
+  - Added `TestLegacySnapshotWithoutDurationSeconds` verifying that older JSON snapshots missing `duration_seconds` load cleanly and safely use the 10.0s fallback in `AddSample()`.
+  - Bumped `SnapshotContainer.Version` to `"2.1.6"`.
+- **Targeted Windows 11 x64 Release (`.github/workflows/release.yml`)**:
+  - Configured GitHub Actions to test on Linux runner (`go test`, `go test -race`, `go vet`) and build Windows 11 x64 binary (`CFST-windows-amd64.exe` with `CGO_ENABLED=0`).
+
 ## v2.1.5 (2026-09-08)
 
 ### Release: Harden Candidate Discovery and Probe Lifecycle

@@ -1,10 +1,10 @@
 # CFST - Cloudflare Route Quality Probe & SpeedTest
 
-> v2.1.5 | Go Edition
+> v2.1.6 | Go Edition
 
 CFST 已从一次性 Cloudflare IP 测速工具全面重构升级为 **GOWAY 线路质量长期探针 + 稳定性分析 + 高峰期选路数据源 (Route Quality Probe & Stability Analyzer)**。
 
-核心设计哲学：**稳定性与保底速度 (P10) > 峰值瞬时速度**。杜绝瞬时抽水型峰值节点影响排名，为流媒体、高速隧道与科学选路提供最具韧性的前置线路决策依据。v2.1.5 强化了 Candidate L3 低带宽探测指标流转、Discovery 线程安全更新与启动即刻发现、真实并发竞态防重测试、连续失速时间精准累加与组件重启安全。
+核心设计哲学：**稳定性与保底速度 (P10) > 峰值瞬时速度**。杜绝瞬时抽水型峰值节点影响排名，为流媒体、高速隧道与科学选路提供最具韧性的前置线路决策依据。v2.1.6 彻底消除了调度器与发现模块的 stop channel 生命周期竞态，杜绝内部路由指标指针泄漏，补齐了真实的 Candidate L3 晋升全流程测试与生命周期重启测试。
 
 作为测量层无缝对接 **GoPass 控制器** 与 **GOWAY 隧道**。
 

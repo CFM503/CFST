@@ -621,6 +621,30 @@ func (s *RouteStore) Get(idOrIP string) (*RouteRecord, bool) {
 	return rec, ok
 }
 
+// GetMetrics returns a thread-safe snapshot copy of RouteMetrics, preventing pointer leakage.
+func (s *RouteStore) GetMetrics(idOrIP string) (RouteMetrics, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rec, ok := s.routes[idOrIP]
+	if !ok || rec == nil {
+		return RouteMetrics{}, false
+	}
+	return rec.Metrics, true
+}
+
+// GetSamples returns a thread-safe copy of historical measurement samples.
+func (s *RouteStore) GetSamples(idOrIP string) []MeasurementSample {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rec, ok := s.routes[idOrIP]
+	if !ok || rec == nil {
+		return nil
+	}
+	samples := make([]MeasurementSample, len(rec.Samples))
+	copy(samples, rec.Samples)
+	return samples
+}
+
 // UpdateRouteColo safely updates the Colo for an existing route under lock if it was previously empty.
 func (s *RouteStore) UpdateRouteColo(ip, colo string) bool {
 	s.mu.Lock()
@@ -1008,7 +1032,7 @@ func (s *RouteStore) SaveSnapshot(path string) error {
 	s.mu.RUnlock()
 
 	container := SnapshotContainer{
-		Version:   "2.1.5",
+		Version:   "2.1.6",
 		Timestamp: time.Now(),
 		Routes:    uniqueRecords,
 	}

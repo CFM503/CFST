@@ -24,14 +24,16 @@ type DiscoveryStatus struct {
 
 // DiscoveryManager orchestrates periodic background discovery of Cloudflare edge IPs.
 type DiscoveryManager struct {
-	mu         sync.RWMutex
-	status     DiscoveryStatus
-	store      *RouteStore
-	sched      *ProbeScheduler
-	running    atomic.Bool
-	inProgress atomic.Bool
-	stopCh     chan struct{}
-	scanFunc   func(ctx context.Context, ips []string, port int, concurrent int, profile ProbeProfile, progress func(done, total, valid int)) ([]NodeResult, int, int)
+	mu               sync.RWMutex
+	status           DiscoveryStatus
+	store            *RouteStore
+	sched            *ProbeScheduler
+	running          atomic.Bool
+	inProgress       atomic.Bool
+	stopCh           chan struct{}
+	scanFunc         func(ctx context.Context, ips []string, port int, concurrent int, profile ProbeProfile, progress func(done, total, valid int)) ([]NodeResult, int, int)
+	onStartGoroutine func()
+	onExitGoroutine  func()
 }
 
 var GlobalDiscoveryManager = NewDiscoveryManager(GlobalRouteStore, GlobalProbeScheduler)
@@ -66,7 +68,8 @@ func (dm *DiscoveryManager) Start(ctx context.Context) {
 		dm.mu.Unlock()
 		return // already running
 	}
-	dm.stopCh = make(chan struct{})
+	stopCh := make(chan struct{})
+	dm.stopCh = stopCh
 	dm.mu.Unlock()
 
 	// 1. Trigger immediate initial discovery pass asynchronously on startup
@@ -78,7 +81,16 @@ func (dm *DiscoveryManager) Start(ctx context.Context) {
 	}()
 
 	// 2. Periodic background discovery loop
-	go func() {
+	go func(stopCh <-chan struct{}) {
+		if dm.onStartGoroutine != nil {
+			dm.onStartGoroutine()
+		}
+		defer func() {
+			if dm.onExitGoroutine != nil {
+				dm.onExitGoroutine()
+			}
+		}()
+
 		cfg := dm.sched.GetConfig()
 		interval := cfg.DiscoveryInterval
 		if interval <= 0 {
@@ -90,8 +102,7 @@ func (dm *DiscoveryManager) Start(ctx context.Context) {
 
 		for {
 			select {
-			case <-dm.stopCh:
-				dm.running.Store(false)
+			case <-stopCh:
 				return
 			case <-ctx.Done():
 				dm.running.Store(false)
@@ -109,7 +120,7 @@ func (dm *DiscoveryManager) Start(ctx context.Context) {
 				}
 			}
 		}
-	}()
+	}(stopCh)
 }
 
 // Stop cleanly halts the background discovery worker.
@@ -117,7 +128,9 @@ func (dm *DiscoveryManager) Stop() {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 	if dm.running.Swap(false) {
-		close(dm.stopCh)
+		if dm.stopCh != nil {
+			close(dm.stopCh)
+		}
 	}
 }
 

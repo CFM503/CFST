@@ -442,3 +442,90 @@ func TestDiscoveryManagerRestart(t *testing.T) {
 		t.Fatalf("expected discovery manager to be stopped after final Stop()")
 	}
 }
+
+func TestDiscoveryManagerRestartNoRace(t *testing.T) {
+	store := NewRouteStore()
+	cfg := DefaultProbeConfig()
+	cfg.DiscoveryEnabled = false // disable immediate active scan for lifecycle test
+	sched := NewProbeScheduler(store, cfg)
+	dm := NewDiscoveryManager(store, sched)
+
+	dm.scanFunc = func(ctx context.Context, ips []string, port int, concurrent int, profile ProbeProfile, progress func(done, total, valid int)) ([]NodeResult, int, int) {
+		return nil, 0, 0
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 1. Goroutine 1 lifecycle
+	started1 := make(chan struct{})
+	exited1 := make(chan struct{})
+
+	dm.onStartGoroutine = func() {
+		close(started1)
+	}
+	dm.onExitGoroutine = func() {
+		close(exited1)
+	}
+
+	dm.Start(ctx)
+
+	select {
+	case <-started1:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for discovery goroutine 1 to start")
+	}
+
+	if !dm.running.Load() {
+		t.Fatalf("expected discovery manager to be running")
+	}
+
+	// 2. Stop and verify clean exit
+	dm.Stop()
+
+	select {
+	case <-exited1:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for discovery goroutine 1 to exit")
+	}
+
+	if dm.running.Load() {
+		t.Fatalf("expected discovery manager to be stopped")
+	}
+
+	// 3. Goroutine 2 lifecycle
+	started2 := make(chan struct{})
+	exited2 := make(chan struct{})
+
+	dm.onStartGoroutine = func() {
+		close(started2)
+	}
+	dm.onExitGoroutine = func() {
+		close(exited2)
+	}
+
+	dm.Start(ctx)
+
+	select {
+	case <-started2:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for discovery goroutine 2 to start")
+	}
+
+	if !dm.running.Load() {
+		t.Fatalf("expected discovery manager to be running again")
+	}
+
+	// 4. Final Stop
+	dm.Stop()
+
+	select {
+	case <-exited2:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for discovery goroutine 2 to exit")
+	}
+
+	if dm.running.Load() {
+		t.Fatalf("expected discovery manager to be stopped after second restart")
+	}
+}

@@ -586,44 +586,47 @@ func TestCandidateL3ObservationAndPromotion(t *testing.T) {
 	})
 
 	baseTime := time.Now().Add(-6 * time.Minute)
+	currentTestTime := baseTime
 
-	// Simulate 4 successive L3 probe cycles over 6 minutes (> 300s observation duration)
-	for i := 0; i < 4; i++ {
-		probeTime := baseTime.Add(time.Duration(i*100) * time.Second)
-		scheduler.probeExec = func(ctx context.Context, target ResolvedProbeTarget, cfg ProbeConfig, runL3 bool, runFullSpeed bool) LayeredProbeResult {
-			return LayeredProbeResult{
-				Success:          true,
-				RTT:              25.0,
-				PacketLoss:       0.0,
-				Jitter:           1.5,
-				HandshakeSuccess: true,
-				SingleSpeed:      22.0,
-				DownloadSpeed:    22.0,
-				Colo:             "HKG",
-				L3Executed:       true,
-			}
-		}
-
-		rec, _ := store.Get(candidateIP)
-		rec.Metrics.LastTested = probeTime
-
-		m := rec.Metrics
-		m.LastTested = probeTime
-		m.SingleSpeed = 22.0
-		m.DownloadSpeed = 22.0
-		m.RTT = 25.0
-		m.PacketLoss = 0.0
-		m.Jitter = 1.5
-		m.HandshakeSuccess = true
-		m.Colo = "HKG"
-
-		store.RecordProbeResult(m, true)
+	scheduler.nowFunc = func() time.Time {
+		return currentTestTime
 	}
 
-	rec, _ := store.Get(candidateIP)
-	if rec.Metrics.Tier != TierStandby {
-		t.Fatalf("expected Candidate to promote to Standby based on real L3 observations, got tier %s (Score=%.1f, Confidence=%.1f, Obs=%.1f, Samples=%d)",
-			rec.Metrics.Tier, rec.Metrics.FinalScore, rec.Metrics.Confidence, rec.Metrics.ObservationDuration, len(rec.Samples))
+	scheduler.probeExec = func(ctx context.Context, target ResolvedProbeTarget, cfg ProbeConfig, runL3 bool, runFullSpeed bool) LayeredProbeResult {
+		return LayeredProbeResult{
+			Success:          true,
+			RTT:              25.0,
+			PacketLoss:       0.0,
+			Jitter:           1.5,
+			HandshakeSuccess: true,
+			SingleSpeed:      22.0,
+			DownloadSpeed:    22.0,
+			Colo:             "HKG",
+			L3Executed:       true,
+		}
+	}
+
+	ctx := context.Background()
+
+	// Execute 4 real ProbeOnce calls advancing mock observation time across 300+ seconds
+	for i := 0; i < 4; i++ {
+		currentTestTime = baseTime.Add(time.Duration(i*100) * time.Second)
+		res, err := scheduler.ProbeOnce(ctx, candidateIP, false)
+		if err != nil {
+			t.Fatalf("ProbeOnce failed on cycle %d: %v", i, err)
+		}
+		if res == nil {
+			t.Fatalf("ProbeOnce returned nil result on cycle %d", i)
+		}
+	}
+
+	m, exists := store.GetMetrics(candidateIP)
+	if !exists {
+		t.Fatalf("expected candidate route in store")
+	}
+	if m.Tier != TierStandby {
+		t.Fatalf("expected Candidate to promote to Standby based on real L3 observations and production scoring, got tier %s (Score=%.1f, Confidence=%.1f, Obs=%.1f)",
+			m.Tier, m.FinalScore, m.Confidence, m.ObservationDuration)
 	}
 }
 
@@ -657,5 +660,88 @@ func TestProbeSchedulerRestart(t *testing.T) {
 	scheduler.Stop()
 	if scheduler.running.Load() {
 		t.Fatalf("expected scheduler to be stopped after final Stop()")
+	}
+}
+
+func TestProbeSchedulerRestartNoRace(t *testing.T) {
+	store := NewRouteStore()
+	cfg := DefaultProbeConfig()
+	scheduler := NewProbeScheduler(store, cfg)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 1. Setup synchronization channels to track goroutine lifecycle
+	started1 := make(chan struct{})
+	exited1 := make(chan struct{})
+
+	scheduler.onStartGoroutine = func() {
+		close(started1)
+	}
+	scheduler.onExitGoroutine = func() {
+		close(exited1)
+	}
+
+	scheduler.Start(ctx)
+
+	// Wait for goroutine 1 to be fully running
+	select {
+	case <-started1:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for goroutine 1 to start")
+	}
+
+	if !scheduler.running.Load() {
+		t.Fatalf("expected scheduler to be running")
+	}
+
+	// 2. Stop scheduler and wait for goroutine 1 to exit cleanly
+	scheduler.Stop()
+
+	select {
+	case <-exited1:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for goroutine 1 to exit")
+	}
+
+	if scheduler.running.Load() {
+		t.Fatalf("expected scheduler to be stopped")
+	}
+
+	// 3. Setup synchronization for goroutine 2
+	started2 := make(chan struct{})
+	exited2 := make(chan struct{})
+
+	scheduler.onStartGoroutine = func() {
+		close(started2)
+	}
+	scheduler.onExitGoroutine = func() {
+		close(exited2)
+	}
+
+	scheduler.Start(ctx)
+
+	// Wait for goroutine 2 to be fully running
+	select {
+	case <-started2:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for goroutine 2 to start")
+	}
+
+	if !scheduler.running.Load() {
+		t.Fatalf("expected scheduler to be running again")
+	}
+
+	// 4. Cleanly stop again
+	scheduler.Stop()
+
+	select {
+	case <-exited2:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for goroutine 2 to exit")
+	}
+
+	if scheduler.running.Load() {
+		t.Fatalf("expected scheduler to be stopped after second restart")
 	}
 }

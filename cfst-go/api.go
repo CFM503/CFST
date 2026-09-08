@@ -58,7 +58,7 @@ func handleAPIHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":         "ok",
 		"service":        "CFST Route Quality Probe",
-		"version":        "v2.1.5",
+		"version":        "v2.1.6",
 		"uptime_seconds": int64(time.Since(appStartTime).Seconds()),
 		"score_mode":     GlobalScoreEngine.GetMode(),
 		"profile":        cfg.Profile.Type,
@@ -89,8 +89,7 @@ func handleAPIRoutes(w http.ResponseWriter, r *http.Request) {
 			sub = parts[1]
 		}
 
-		rec, exists := GlobalRouteStore.Get(ip)
-		if !exists {
+		if _, exists := GlobalRouteStore.Get(ip); !exists {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "Route not found"})
 			return
 		}
@@ -105,7 +104,8 @@ func handleAPIRoutes(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, peakHours)
 			return
 		case "samples":
-			writeJSON(w, http.StatusOK, rec.Samples)
+			samples := GlobalRouteStore.GetSamples(ip)
+			writeJSON(w, http.StatusOK, samples)
 			return
 		default:
 			handleAPIRouteDetail(w, r, ip)
@@ -276,38 +276,39 @@ func handleAPIRouteDetail(w http.ResponseWriter, r *http.Request, idOrIP string)
 		return
 	}
 
+	metrics, _ := GlobalRouteStore.GetMetrics(idOrIP)
 	windows := GlobalRouteStore.GetHistoryWindows(idOrIP)
 	peakHours := GlobalRouteStore.GetPeakHours(idOrIP)
 
-	effectiveSpeed := rec.Metrics.SingleSpeed
+	effectiveSpeed := metrics.SingleSpeed
 	if effectiveSpeed <= 0 {
-		effectiveSpeed = rec.Metrics.DownloadSpeed
+		effectiveSpeed = metrics.DownloadSpeed
 	}
-	median := rec.Metrics.MedianSpeed
+	median := metrics.MedianSpeed
 	if median <= 0 {
 		median = effectiveSpeed
 	}
-	p10 := rec.Metrics.P10Speed
+	p10 := metrics.P10Speed
 	if p10 <= 0 {
-		p10 = rec.Metrics.MinSpeed
+		p10 = metrics.MinSpeed
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"metrics":         rec.Metrics,
-		"recommendation":  rec.Metrics.Recommendation,
-		"stability_grade": rec.Metrics.StabilityGrade,
-		"confidence":      rec.Metrics.Confidence,
-		"final_score":     rec.Metrics.FinalScore,
+		"metrics":         metrics,
+		"recommendation":  metrics.Recommendation,
+		"stability_grade": metrics.StabilityGrade,
+		"confidence":      metrics.Confidence,
+		"final_score":     metrics.FinalScore,
 		"speed": SpeedSummary{
 			Avg:    math.Round(effectiveSpeed*10) / 10,
 			Median: math.Round(median*10) / 10,
 			P10:    math.Round(p10*10) / 10,
-			Min:    math.Round(rec.Metrics.MinSpeed*10) / 10,
+			Min:    math.Round(metrics.MinSpeed*10) / 10,
 		},
 		"stalls": StallSummary{
-			Count:         rec.Metrics.StallCount,
-			Rate:          math.Round(rec.Metrics.StallRate*1000) / 1000,
-			TotalDuration: math.Round(rec.Metrics.TotalStallDuration*10) / 10,
+			Count:         metrics.StallCount,
+			Rate:          math.Round(metrics.StallRate*1000) / 1000,
+			TotalDuration: math.Round(metrics.TotalStallDuration*10) / 10,
 		},
 		"ewma_short": rec.EWMA.ShortSnapshot(),
 		"ewma_long":  rec.EWMA.LongSnapshot(),
@@ -411,7 +412,7 @@ func handleAPIConfig(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		cfg := GlobalProbeScheduler.GetConfig()
 		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"version":                "v2.1.5",
+			"version":                "v2.1.6",
 			"score_mode":             GlobalScoreEngine.GetMode(),
 			"profile":                cfg.Profile,
 			"profile_type":           cfg.Profile.Type,

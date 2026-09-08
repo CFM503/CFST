@@ -69,7 +69,7 @@ func RunDaemon(cfg Config) {
 	GlobalScoreEngine.SetMode(ScoreMode(cfg.ScoreMode))
 
 	fmt.Println("============================================================")
-	fmt.Println("   CFST Route Quality Probe v2.1.5 (Continuous Daemon Mode)")
+	fmt.Println("   CFST Route Quality Probe v2.1.6 (Continuous Daemon Mode)")
 	fmt.Printf("   Listening on: http://%s\n", cfg.APIAddr)
 	fmt.Printf("   Score Mode:   %s\n", cfg.ScoreMode)
 	fmt.Printf("   Intervals:    Active: %ds | Standby: %ds | Candidate: %ds | Failed: %ds\n",

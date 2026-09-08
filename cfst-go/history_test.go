@@ -431,3 +431,73 @@ func TestStaleRouteProtection(t *testing.T) {
 	}
 }
 
+func TestLegacySnapshotWithoutDurationSeconds(t *testing.T) {
+	// JSON snapshot from v2.1.0/v2.1.4 before duration_seconds field was introduced
+	legacyJSON := `{
+		"version": "2.1.4",
+		"timestamp": "2026-09-08T10:00:00Z",
+		"routes": {
+			"1.1.1.1": {
+				"metrics": {
+					"id": "route-1-1-1-1-443",
+					"ip": "1.1.1.1",
+					"port": 443,
+					"colo": "HKG",
+					"tier": "STANDBY",
+					"health": "HEALTHY",
+					"final_score": 85.0
+				},
+				"samples": [
+					{
+						"timestamp": "2026-09-08T09:50:00Z",
+						"speed": 25.0,
+						"p10_speed": 20.0,
+						"min_speed": 18.0,
+						"rtt": 30.0,
+						"packet_loss": 0.0,
+						"jitter": 2.0,
+						"stability": 90.0,
+						"stall_count": 1,
+						"total_stall_duration": 2.0,
+						"success": true
+					}
+				]
+			}
+		}
+	}`
+
+	tmpDir := t.TempDir()
+	snapshotPath := filepath.Join(tmpDir, "legacy_snapshot.json")
+	if err := os.WriteFile(snapshotPath, []byte(legacyJSON), 0644); err != nil {
+		t.Fatalf("failed to write legacy snapshot: %v", err)
+	}
+
+	store := NewRouteStore()
+	if err := store.LoadSnapshot(snapshotPath); err != nil {
+		t.Fatalf("failed to load legacy snapshot: %v", err)
+	}
+
+	rec, exists := store.Get("1.1.1.1")
+	if !exists {
+		t.Fatalf("expected 1.1.1.1 in loaded store")
+	}
+	if len(rec.Samples) != 1 {
+		t.Fatalf("expected 1 sample, got %d", len(rec.Samples))
+	}
+
+	// Unmarshaled DurationSeconds must be 0
+	if rec.Samples[0].DurationSeconds != 0.0 {
+		t.Fatalf("expected unmarshaled DurationSeconds to be 0, got %.2f", rec.Samples[0].DurationSeconds)
+	}
+
+	// When AddSample processes a sample with DurationSeconds <= 0, it safely uses the 10.0s fallback
+	sample := rec.Samples[0]
+	testRec := NewRouteRecord(rec.Metrics)
+	testRec.AddSample(sample)
+
+	// In 10s fallback, total_stall_duration (2.0s) / 10.0s = 0.20 stall rate
+	snap := testRec.EWMA.ShortSnapshot()
+	if snap.StallRate <= 0 {
+		t.Fatalf("expected non-zero stall rate using legacy fallback, got %.2f", snap.StallRate)
+	}
+}
