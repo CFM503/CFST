@@ -1,6 +1,6 @@
 # CFST - Cloudflare Route Quality Probe & SpeedTest
 
-> v2.1.8 | Go Edition
+> v2.1.9-dev | Go Edition
 
 CFST 已从一次性 Cloudflare IP 测速工具全面重构升级为 **GOWAY 线路质量长期探针 + 稳定性分析 + 高峰期选路数据源 (Route Quality Probe & Stability Analyzer)**。
 

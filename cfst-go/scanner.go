@@ -34,6 +34,7 @@ type Config struct {
 	FilterMode      string
 	SNI             string
 	WSSHost         string
+	WSSPath         string
 	Profile         string // "CFST" (default), "GOWAY-WSS", "CUSTOM"
 
 	// Route Quality Probe daemon options
@@ -67,7 +68,8 @@ func DefaultConfig() Config {
 		Skip429:            true,
 		QuickDuration:      3,
 		FilterMode:         "speed",
-		WSSHost:            "colo.4467107.xyz",
+		WSSHost:            "",
+		WSSPath:            "/pyway",
 		Profile:            "CFST",
 		DaemonMode:         false,
 		APIAddr:            "127.0.0.1:9876",
@@ -88,7 +90,11 @@ func DefaultConfig() Config {
 func (cfg Config) GetProbeProfile() ProbeProfile {
 	switch strings.ToUpper(strings.TrimSpace(cfg.Profile)) {
 	case "GOWAY-WSS", "GOWAY_WSS", "WSS":
-		return NewProfileGOWAYWSS(cfg.WSSHost, "/pyway", cfg.SNI, cfg.Port)
+		path := cfg.WSSPath
+		if path == "" {
+			path = "/pyway"
+		}
+		return NewProfileGOWAYWSS(cfg.WSSHost, path, cfg.SNI, cfg.Port)
 	case "CUSTOM":
 		return NewProfileCustom(cfg.URL, cfg.SNI, cfg.Port)
 	default:
@@ -205,6 +211,7 @@ func ScanRoutesWithProfileDetailed(ctx context.Context, ips []string, port int, 
 
 			// Layer 2: Profile-driven check
 			var detectedColo string
+			var wssRes WSSHandshakeResult
 			switch profile.Type {
 			case ProfileCFST:
 				// TCP Ping + HTTPSConnectivityCheck (Cloudflare Official, strictly NO WSS)
@@ -218,9 +225,9 @@ func ScanRoutesWithProfileDetailed(ctx context.Context, ips []string, port int, 
 				detectedColo = colo
 
 			case ProfileGOWAYWSS:
-				// TCP Ping + WSSHandshakeCheck using Profile fields
-				ok := WSSHandshakeCheck(ip, targetPort, profile.SNI, profile.Host, profile.Path, 3*time.Second)
-				if !ok {
+				// TCP Ping + WSSHandshakeCheckDetailed using Profile fields
+				wssRes = WSSHandshakeCheckDetailed(ip, targetPort, profile.SNI, profile.Host, profile.Path, 3*time.Second)
+				if !wssRes.Success {
 					if progressCallback != nil && (d%10 == 0 || d == int32(total)) {
 						progressCallback(int(d), total, int(validCount.Load()))
 					}
@@ -229,8 +236,8 @@ func ScanRoutesWithProfileDetailed(ctx context.Context, ips []string, port int, 
 
 			case ProfileCustom:
 				if profile.Protocol == "wss" {
-					ok := WSSHandshakeCheck(ip, targetPort, profile.SNI, profile.Host, profile.Path, 3*time.Second)
-					if !ok {
+					wssRes = WSSHandshakeCheckDetailed(ip, targetPort, profile.SNI, profile.Host, profile.Path, 3*time.Second)
+					if !wssRes.Success {
 						if progressCallback != nil && (d%10 == 0 || d == int32(total)) {
 							progressCallback(int(d), total, int(validCount.Load()))
 						}
@@ -250,15 +257,27 @@ func ScanRoutesWithProfileDetailed(ctx context.Context, ips []string, port int, 
 
 			l2ValidCount.Add(1)
 
-			mu.Lock()
-			validNodes = append(validNodes, NodeResult{
+			node := NodeResult{
 				IP:         ip,
 				Port:       targetPort,
 				TCPLatency: avgLat,
 				Jitter:     jitter,
 				PacketLoss: loss,
 				Colo:       detectedColo,
-			})
+			}
+			if profile.Type == ProfileGOWAYWSS || (profile.Type == ProfileCustom && profile.Protocol == "wss") {
+				node.GOWAYWSSCompatible = wssRes.Success
+				node.GOWAYWSSLatency = wssRes.Latency
+				node.GOWAYWSSErrorStage = wssRes.ErrorStage
+				node.GOWAYWSSHTTPStatus = wssRes.HTTPStatus
+				node.GOWAYWSSErrorMessage = wssRes.ErrorMessage
+				node.GOWAYWSSSNISent = wssRes.SNISent
+				node.GOWAYWSSHostSent = wssRes.HostSent
+				node.GOWAYWSSPathSent = wssRes.PathSent
+			}
+
+			mu.Lock()
+			validNodes = append(validNodes, node)
 			mu.Unlock()
 			validCount.Add(1)
 
@@ -660,7 +679,7 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 }
 
 func RunCLI(cfg Config) {
-	fmt.Printf("Cloudflare SpeedTest v2.1.8 (Route Quality Probe - Go Edition)\n\n")
+	fmt.Printf("Cloudflare SpeedTest v2.1.9-dev (Route Quality Probe - Go Edition)\n\n")
 
 	ips := GenerateIPs(cfg.MaxScan, cfg.Unique, cfg.IPFile)
 	fmt.Printf("🔍 Scanning %d IPs (concurrency: %d)...\n", len(ips), cfg.ScanConcurrent)

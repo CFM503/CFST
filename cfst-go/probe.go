@@ -50,14 +50,8 @@ func NewProfileGOWAYWSS(host, path, sni string, port int) ProbeProfile {
 	if port <= 0 {
 		port = 443
 	}
-	if host == "" {
-		host = "colo.4467107.xyz"
-	}
 	if path == "" {
 		path = "/pyway"
-	}
-	if sni == "" {
-		sni = host
 	}
 	return ProbeProfile{
 		Type:     ProfileGOWAYWSS,
@@ -171,12 +165,6 @@ func NormalizeProbeConfig(cfg *ProbeConfig) {
 		cfg.WSSHost = ""
 
 	case ProfileGOWAYWSS:
-		if cfg.Profile.Host == "" {
-			cfg.Profile.Host = "colo.4467107.xyz"
-		}
-		if cfg.Profile.SNI == "" {
-			cfg.Profile.SNI = cfg.Profile.Host
-		}
 		if cfg.Profile.Path == "" {
 			cfg.Profile.Path = "/pyway"
 		}
@@ -503,10 +491,10 @@ func (ps *ProbeScheduler) ExecuteLayeredProbeWithSnapshot(ctx context.Context, t
 
 	case ProfileGOWAYWSS:
 		// ProfileGOWAYWSS: GOWAY WSS Handshake with configurable Host, SNI, and Path from Profile.
-		ok := WSSHandshakeCheck(target.IP, target.Port, target.SNI, target.Host, target.Path, 3*time.Second)
-		if !ok {
+		wssRes := WSSHandshakeCheckDetailed(target.IP, target.Port, target.SNI, target.Host, target.Path, 3*time.Second)
+		if !wssRes.Success {
 			res.HandshakeSuccess = false
-			res.Error = "GOWAY WSS handshake failed (e.g. 403 or TLS error)"
+			res.Error = fmt.Sprintf("GOWAY WSS handshake failed (%s: %s)", wssRes.ErrorStage, wssRes.ErrorMessage)
 			return res
 		}
 		res.HandshakeSuccess = true
@@ -514,10 +502,10 @@ func (ps *ProbeScheduler) ExecuteLayeredProbeWithSnapshot(ctx context.Context, t
 	case ProfileCustom:
 		// ProfileCustom: Protocol-driven check
 		if target.Protocol == "wss" {
-			ok := WSSHandshakeCheck(target.IP, target.Port, target.SNI, target.Host, target.Path, 3*time.Second)
-			if !ok {
+			wssRes := WSSHandshakeCheckDetailed(target.IP, target.Port, target.SNI, target.Host, target.Path, 3*time.Second)
+			if !wssRes.Success {
 				res.HandshakeSuccess = false
-				res.Error = "Custom WSS handshake failed"
+				res.Error = fmt.Sprintf("Custom WSS handshake failed (%s: %s)", wssRes.ErrorStage, wssRes.ErrorMessage)
 				return res
 			}
 			res.HandshakeSuccess = true

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
@@ -74,6 +75,15 @@ type NodeResult struct {
 	StallCount         int     `json:"stall_count"`
 	ZeroSpeedIntervals int     `json:"zero_speed_intervals"`
 	PacketLoss         float64 `json:"packet_loss"`
+	// GOWAY WSS compatibility gate (ProfileGOWAYWSS)
+	GOWAYWSSCompatible   bool    `json:"goway_wss_compatible,omitempty"`
+	GOWAYWSSLatency      float64 `json:"goway_wss_latency,omitempty"`
+	GOWAYWSSErrorStage   string  `json:"goway_wss_error_stage,omitempty"`
+	GOWAYWSSHTTPStatus   int     `json:"goway_wss_http_status,omitempty"`
+	GOWAYWSSErrorMessage string  `json:"goway_wss_error_message,omitempty"`
+	GOWAYWSSSNISent      string  `json:"goway_wss_sni_sent,omitempty"`
+	GOWAYWSSHostSent     string  `json:"goway_wss_host_sent,omitempty"`
+	GOWAYWSSPathSent     string  `json:"goway_wss_path_sent,omitempty"`
 }
 
 func (n *NodeResult) CalcScore() {
@@ -700,41 +710,80 @@ func TCPPing(ip string, port int, timeout time.Duration) float64 {
 	return lat
 }
 
-// WSSHandshakeCheck simulates goway's WebSocket upgrade handshake over TLS using target parameters.
-// Returns true if the server responds with 101 Switching Protocols.
-func WSSHandshakeCheck(ip string, port int, sni string, host string, path string, timeout time.Duration) bool {
-	if host == "" {
-		host = sni
+// WSSHandshakeResult records the outcome and diagnostics of a GOWAY WSS compatibility check.
+type WSSHandshakeResult struct {
+	Success         bool    `json:"success"`
+	TCPSuccess      bool    `json:"tcp_success"`
+	TLSHandshake    bool    `json:"tls_handshake"`
+	HTTPStatus      int     `json:"http_status"`
+	Latency         float64 `json:"latency"`
+	ErrorStage      string  `json:"error_stage,omitempty"`
+	ErrorMessage    string  `json:"error_message,omitempty"`
+	SNISent         string  `json:"sni_sent,omitempty"`
+	HostSent        string  `json:"host_sent,omitempty"`
+	PathSent        string  `json:"path_sent,omitempty"`
+}
+
+// WSSHandshakeCheckDetailed validates GOWAY WSS compatibility stage by stage:
+// Config check -> TCP connect -> TLS handshake with SNI -> HTTP Upgrade with Host/Path -> HTTP 101 Switching Protocols.
+// Parameters are strictly independent with no mutual fallbacks.
+func WSSHandshakeCheckDetailed(ip string, port int, sni string, host string, path string, timeout time.Duration) WSSHandshakeResult {
+	res := WSSHandshakeResult{
+		SNISent:  sni,
+		HostSent: host,
+		PathSent: path,
 	}
-	if sni == "" {
-		sni = host
+
+	// 1. Config Validation Stage:
+	// IP, Port, SNI, Host, Path must all be present and valid.
+	// Host and SNI must NOT fall back to each other.
+	if ip == "" || port <= 0 || port > 65535 || strings.TrimSpace(sni) == "" || strings.TrimSpace(host) == "" || strings.TrimSpace(path) == "" {
+		res.ErrorStage = "config"
+		res.ErrorMessage = "missing required WSS parameter"
+		return res
 	}
-	if path == "" {
-		path = "/pyway"
-	}
+
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
+	res.PathSent = path
+
 	if timeout <= 0 {
 		timeout = 3 * time.Second
 	}
 
-	addr := net.JoinHostPort(ip, fmt.Sprintf("%d", port))
+	start := time.Now()
+
+	// 2. TCP Stage
+	addr := net.JoinHostPort(ip, strconv.Itoa(port))
 	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
-		return false
+		res.ErrorStage = "tcp"
+		res.ErrorMessage = err.Error()
+		return res
 	}
 	defer conn.Close()
+	res.TCPSuccess = true
 
-	tlsConf := &tls.Config{InsecureSkipVerify: true, ServerName: sni}
+	// 3. TLS Stage
+	tlsConf := &tls.Config{
+		InsecureSkipVerify: true,
+		ServerName:         sni,
+	}
 	tlsConn := tls.Client(conn, tlsConf)
 	if err := tlsConn.SetDeadline(time.Now().Add(timeout)); err != nil {
-		return false
+		res.ErrorStage = "tls"
+		res.ErrorMessage = err.Error()
+		return res
 	}
 	if err := tlsConn.Handshake(); err != nil {
-		return false
+		res.ErrorStage = "tls"
+		res.ErrorMessage = err.Error()
+		return res
 	}
+	res.TLSHandshake = true
 
+	// 4. HTTP Request Stage
 	req := fmt.Sprintf("GET %s HTTP/1.1\r\n", path) +
 		fmt.Sprintf("Host: %s\r\n", host) +
 		"Upgrade: websocket\r\n" +
@@ -743,17 +792,57 @@ func WSSHandshakeCheck(ip string, port int, sni string, host string, path string
 		"Sec-WebSocket-Version: 13\r\n" +
 		"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n" +
 		"\r\n"
+
 	if _, err := tlsConn.Write([]byte(req)); err != nil {
-		return false
+		res.ErrorStage = "http"
+		res.ErrorMessage = fmt.Sprintf("failed to send HTTP upgrade request: %v", err)
+		return res
 	}
 
-	buf := make([]byte, 512)
-	n, err := tlsConn.Read(buf)
-	if err != nil || n == 0 {
-		return false
+	reader := bufio.NewReader(tlsConn)
+	statusLine, err := reader.ReadString('\n')
+	if err != nil {
+		res.ErrorStage = "http"
+		res.ErrorMessage = fmt.Sprintf("failed to read HTTP status line: %v", err)
+		return res
 	}
-	resp := string(buf[:n])
-	return strings.Contains(resp, "101")
+
+	res.Latency = float64(time.Since(start).Microseconds()) / 1000.0
+	if res.Latency <= 0 {
+		res.Latency = 0.001
+	}
+
+	// 5. HTTP Status Validation Stage
+	trimmed := strings.TrimRight(statusLine, "\r\n")
+	parts := strings.SplitN(trimmed, " ", 3)
+	if len(parts) < 2 {
+		res.ErrorStage = "status"
+		res.ErrorMessage = fmt.Sprintf("malformed HTTP status line: %q", trimmed)
+		return res
+	}
+
+	statusCode, err := strconv.Atoi(parts[1])
+	if err != nil {
+		res.ErrorStage = "status"
+		res.ErrorMessage = fmt.Sprintf("invalid HTTP status code %q in status line: %q", parts[1], trimmed)
+		return res
+	}
+	res.HTTPStatus = statusCode
+
+	if statusCode == 101 {
+		res.Success = true
+		return res
+	}
+
+	res.ErrorStage = "status"
+	res.ErrorMessage = fmt.Sprintf("expected HTTP 101, got status %d (%s)", statusCode, trimmed)
+	return res
+}
+
+// WSSHandshakeCheck simulates goway's WebSocket upgrade handshake over TLS using target parameters.
+// Returns true if the server responds with 101 Switching Protocols.
+func WSSHandshakeCheck(ip string, port int, sni string, host string, path string, timeout time.Duration) bool {
+	return WSSHandshakeCheckDetailed(ip, port, sni, host, path, timeout).Success
 }
 
 // HTTPSConnectivityCheck performs low-bandwidth L2 HTTPS/TLS reachability verification,
