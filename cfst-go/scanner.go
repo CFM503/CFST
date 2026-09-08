@@ -471,6 +471,25 @@ func detectColoBatch(ctx context.Context, candidates []NodeResult, port int, con
 	return bestColo, coloGroups
 }
 
+// resolveSpeedTestTarget returns the target used for the HTTP download-speed phase.
+//
+// Important:
+// GOWAY-WSS / CUSTOM-WSS profiles are only used for the WSS compatibility gate.
+// After WSS compatibility has already been established, the speed-quality phase
+// MUST use the Cloudflare official HTTPS download target instead of the GOWAY WSS target.
+func resolveSpeedTestTarget(cfg Config, ip string) ResolvedProbeTarget {
+	profile := cfg.GetProbeProfile()
+	isWSS := profile.Type == ProfileGOWAYWSS || (profile.Type == ProfileCustom && strings.EqualFold(profile.Protocol, "wss"))
+	if isWSS {
+		profile = NewProfileCFST()
+	}
+	return ResolveProbeTarget(
+		ProbeConfig{Profile: profile},
+		ip,
+		profile.Port,
+	)
+}
+
 // runQuickFilter runs short download tests against cfg.URL to rank candidates by speed.
 // Used as a pre-filter in custom URL mode instead of Colo detection.
 func runQuickFilter(ctx context.Context, candidates []NodeResult, cfg Config, topN int,
@@ -500,7 +519,7 @@ func runQuickFilter(ctx context.Context, candidates []NodeResult, cfg Config, to
 		go func(idx int, ip string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			target := ResolveProbeTarget(ProbeConfig{Profile: cfg.GetProbeProfile()}, ip, cfg.Port)
+			target := resolveSpeedTestTarget(cfg, ip)
 			sm := SingleStreamTestDetailed(ctx, target, cfg.QuickDuration, nil, 0, 0, 0)
 			results[idx] = quickResult{idx: idx, speed: sm.AverageSpeed}
 			d := doneCount.Add(1)
@@ -614,7 +633,7 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 						t, len(candidates), cand.IP, int(totalSkipped.Load())))
 				}
 
-				candTarget := ResolveProbeTarget(ProbeConfig{Profile: cfg.GetProbeProfile()}, cand.IP, cfg.Port)
+				candTarget := resolveSpeedTestTarget(cfg, cand.IP)
 				sm := SingleStreamTestDetailed(ctx, candTarget, cfg.Duration, progressLive, cand.TCPLatency, cand.Jitter, cand.PacketLoss)
 
 				if sm.AverageSpeed == 0 && sm.MinSpeed == 0 && sm.Stability == 0 {
