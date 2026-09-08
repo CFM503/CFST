@@ -1,10 +1,10 @@
 # CFST - Cloudflare Route Quality Probe & SpeedTest
 
-> v2.1.0 | Go Edition
+> v2.1.1 | Go Edition
 
 CFST 已从一次性 Cloudflare IP 测速工具全面重构升级为 **GOWAY 线路质量长期探针 + 稳定性分析 + 高峰期选路数据源 (Route Quality Probe & Stability Analyzer)**。
 
-核心设计哲学：**稳定性与保底速度 (P10) > 峰值瞬时速度**。杜绝瞬时抽水型峰值节点影响排名，为流媒体、高速隧道与科学选路提供最具韧性的前置线路决策依据。
+核心设计哲学：**稳定性与保底速度 (P10) > 峰值瞬时速度**。杜绝瞬时抽水型峰值节点影响排名，为流媒体、高速隧道与科学选路提供最具韧性的前置线路决策依据。v2.1.1 强化了长期低带宽探针调度、Profile 标准化、真 24h 时序记忆、置信度时间门控与陈旧节点保护机制。
 
 作为测量层无缝对接 **GoPass 控制器** 与 **GOWAY 隧道**。
 
@@ -70,6 +70,37 @@ CFST 已从一次性 Cloudflare IP 测速工具全面重构升级为 **GOWAY 线
 - 🧭 **智能选路建议体系 (Recommendations)** — 输出 `BEST`、`GOOD`、`USABLE`、`DEGRADED`、`AVOID`、`FAILED` 等级并附带诊断原因列表。
 - 📉 **EWMA 故障压制与衰减** — 线路发生探测失败时，EWMA 立即施加失败压力（`RecordFailure`），指数级衰减历史速度，防止离线节点残留虚高评分。
 - 💾 **原子化安全持久化** — 支持 Windows 文件系统安全的临时文件写入、`.bak` 轮转备份与双重恢复机制。
+
+---
+
+## 长期低带宽探针与稳定性强化 (v2.1.1)
+
+- 🌐 **Probe Profile 规范化与标准化** —
+  - `ProfileCFST`: 默认官方探测配置，测速目标为 Cloudflare 官方测速端点 `https://speed.cloudflare.com/__down?bytes=500000000`。
+  - `ProfileGOWAYWSS`: 针对 GOWAY 前端节点的 WSS 握手与连通性验证（支持自定义 SNI / Host / Path）。
+  - `ProfileCustom`: 用户自定义 VPS / 反代测速目标。
+  - `/api/health` 与 `/api/config` 完整返回生效的 profile 详情（`profile_type`、`test_url`、`sni`、`host`、`path`、`protocol`）。
+- 📡 **四级分层探针与低流量调度 (Low-Bandwidth Scheduling)** —
+  - **L1 (TCP Ping)**：极低开销（SYN/ACK，数百字节）。
+  - **L2 (WSS Handshake)**：低开销（TLS + HTTP 101 Handshake，1~2KB）。
+  - **L3 (轻量 HTTP 测速探针)**：小块测速（~100KB 或短时 TTFB 单次请求），测试 HTTP 状态码与 Colo，验证公网连通性而不浪费带宽。
+  - **L4 (全量测速校准)**：受严格周期节流控制：
+    - **Active 线路**：L1/L2 每 10s 探测，L3 每 3 个周期 (~30s) 轻量测速，L4 全量测速每 60 个周期 (~10m) 校准一次。
+    - **Standby 线路**：L1/L2 每 30s 探测，L3 每 6 个周期轻量测速，L4 每 120 个周期 (~60m) 校准一次。
+    - **Candidate 候选池**：仅跑 L1/L2 基础质量监测。
+    - **Failed 故障线路**：**只允许跑 L1/L2 复活检测，绝对不跑测速**，彻底消除故障死循环带来的流量浪费。
+- ⏳ **置信度时间跨度门控 (Observation Span Gating)** —
+  - 杜绝 2 分钟内 12 个样本置信度飙到 80%~90% 的激进现象。
+  - 置信度计算严格受**时间跨度 (Span)**、样本总数、成功率、高峰期覆盖与近期测试新鲜度综合制约。2 分钟 12 次采样置信度严格限制在 50% 以下；持续观察数小时以上且跨高峰期的优质线路方可达到高置信度。
+- 🎯 **SpeedDropPercent 顺序修正** —
+  - 采集新样本时，在将数据写入 EWMA 之前先截取历史长期基准 `baselineP10`，再计算跌速百分比 `SpeedDropPercent`。确保 50MB/s 突降至 30MB/s 能准确记录为 40% 跌幅，而不是立即被平滑稀释。
+- 📅 **24h Peak Hour 矩阵跨天 EWMA 衰减** —
+  - 针对 Peak Hour (00..23) 统计，若距离上次更新超过 12 小时，自动引入跨天指数衰减，并通过 $\alpha=0.35$ EWMA 加权吸收新样本，确保当日高峰期真实表现占主导。
+- 🗄️ **真 24 小时样本留存** —
+  - 样本容量上限提升至 10,000 条，配合以最新时间为锚点的严格 24 小时时间剪裁，确保 `/api/routes/{ip}/history` 真实涵盖完整 24 小时数据。
+- 🛡️ **Stale Route 陈旧线路保护** —
+  - Active 线路超过 5 分钟未测、普通线路超过 15 分钟未测即打上 `is_stale = true` 标签，分数与置信度直接折半。
+  - 超过 60 分钟未测的线路**严禁进入 `GetBest()` 推荐列表**，防止历史残留数据误导路由决策。
 
 ---
 

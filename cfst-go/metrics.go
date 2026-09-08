@@ -90,6 +90,9 @@ type RouteMetrics struct {
 	ConsecutiveFails      int                 `json:"consecutive_failures"`
 	ConsecutiveSuccess    int                 `json:"consecutive_successes"`
 	ConsecutiveDegraded   int                 `json:"consecutive_degraded"`
+	IsStale               bool                `json:"is_stale"`
+	ObservationDuration   float64             `json:"observation_duration_sec"` // Total seconds between first and last sample
+	LastSuccess           time.Time           `json:"last_success,omitempty"`
 	LastTested            time.Time           `json:"last_tested"`
 	Timestamp             time.Time           `json:"timestamp"`
 }

@@ -52,12 +52,20 @@ func handleAPIHealth(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	cfg := GlobalProbeScheduler.GetConfig()
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":         "ok",
 		"service":        "CFST Route Quality Probe",
-		"version":        "v2.1.0",
+		"version":        "v2.1.1",
 		"uptime_seconds": int64(time.Since(appStartTime).Seconds()),
 		"score_mode":     GlobalScoreEngine.GetMode(),
+		"profile":        cfg.Profile.Type,
+		"profile_type":   cfg.Profile.Type,
+		"test_url":       cfg.Profile.TestURL,
+		"sni":            cfg.Profile.SNI,
+		"host":           cfg.Profile.Host,
+		"path":           cfg.Profile.Path,
+		"protocol":       cfg.Profile.Protocol,
 		"total_routes":   len(all),
 		"healthy_routes": healthyCount,
 		"active_routes":  activeCount,
@@ -381,22 +389,39 @@ func handleAPIProbe(w http.ResponseWriter, r *http.Request) {
 }
 
 type ConfigUpdateRequest struct {
-	Mode              *ScoreMode `json:"mode,omitempty"`
-	ActiveIntervalSec *int       `json:"active_interval_sec,omitempty"`
-	StandbyIntervalSec *int      `json:"standby_interval_sec,omitempty"`
+	Mode               *ScoreMode        `json:"mode,omitempty"`
+	ProfileType        *ProbeProfileType `json:"profile_type,omitempty"`
+	TestURL            *string           `json:"test_url,omitempty"`
+	SNI                *string           `json:"sni,omitempty"`
+	Host               *string           `json:"host,omitempty"`
+	Path               *string           `json:"path,omitempty"`
+	ActiveIntervalSec  *int              `json:"active_interval_sec,omitempty"`
+	StandbyIntervalSec *int              `json:"standby_interval_sec,omitempty"`
+	L3ProbeCycle       *int              `json:"l3_probe_cycle,omitempty"`
+	FullSpeedCycle     *int              `json:"full_speed_cycle,omitempty"`
 }
 
 func handleAPIConfig(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		cfg := GlobalProbeScheduler.GetConfig()
 		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"version":                "v2.1.1",
 			"score_mode":             GlobalScoreEngine.GetMode(),
+			"profile":                cfg.Profile,
+			"profile_type":           cfg.Profile.Type,
+			"test_url":               cfg.Profile.TestURL,
+			"sni":                    cfg.Profile.SNI,
+			"host":                   cfg.Profile.Host,
+			"path":                   cfg.Profile.Path,
+			"protocol":               cfg.Profile.Protocol,
 			"active_interval_sec":    int(cfg.ActiveInterval.Seconds()),
 			"standby_interval_sec":   int(cfg.StandbyInterval.Seconds()),
 			"candidate_interval_sec": int(cfg.CandidateInterval.Seconds()),
 			"failed_interval_sec":    int(cfg.FailedInterval.Seconds()),
 			"max_concurrent":         cfg.MaxConcurrent,
 			"max_speed_tests":        cfg.MaxSpeedTests,
+			"l3_probe_cycle":         cfg.L3ProbeCycle,
+			"full_speed_cycle":       cfg.FullSpeedCycle,
 		})
 		return
 	}
@@ -416,11 +441,39 @@ func handleAPIConfig(w http.ResponseWriter, r *http.Request) {
 		}
 
 		cfg := GlobalProbeScheduler.GetConfig()
+		if req.ProfileType != nil {
+			switch *req.ProfileType {
+			case ProfileCFST:
+				cfg.Profile = NewProfileCFST()
+			case ProfileGOWAYWSS:
+				cfg.Profile = NewProfileGOWAYWSS("", "", "", 443)
+			case ProfileCustom:
+				cfg.Profile = NewProfileCustom("", "", 443)
+			}
+		}
+		if req.TestURL != nil {
+			cfg.Profile.TestURL = *req.TestURL
+		}
+		if req.SNI != nil {
+			cfg.Profile.SNI = *req.SNI
+		}
+		if req.Host != nil {
+			cfg.Profile.Host = *req.Host
+		}
+		if req.Path != nil {
+			cfg.Profile.Path = *req.Path
+		}
 		if req.ActiveIntervalSec != nil && *req.ActiveIntervalSec > 0 {
 			cfg.ActiveInterval = time.Duration(*req.ActiveIntervalSec) * time.Second
 		}
 		if req.StandbyIntervalSec != nil && *req.StandbyIntervalSec > 0 {
 			cfg.StandbyInterval = time.Duration(*req.StandbyIntervalSec) * time.Second
+		}
+		if req.L3ProbeCycle != nil && *req.L3ProbeCycle > 0 {
+			cfg.L3ProbeCycle = *req.L3ProbeCycle
+		}
+		if req.FullSpeedCycle != nil && *req.FullSpeedCycle > 0 {
+			cfg.FullSpeedCycle = *req.FullSpeedCycle
 		}
 		GlobalProbeScheduler.UpdateConfig(cfg)
 

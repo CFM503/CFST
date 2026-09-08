@@ -222,3 +222,212 @@ func TestRouteStoreHealthFiltering(t *testing.T) {
 	}
 }
 
+func TestConfidenceTimeSpanGating(t *testing.T) {
+	now := time.Now()
+	recShort := NewRouteRecord(RouteMetrics{IP: "1.1.1.1", Port: 443})
+
+	// 12 samples over 2 minutes (every 10s)
+	for i := 0; i < 12; i++ {
+		ts := now.Add(time.Duration(i*10) * time.Second)
+		recShort.AddSample(MeasurementSample{
+			Timestamp: ts,
+			Speed:     50.0,
+			P10Speed:  45.0,
+			RTT:       20.0,
+			Success:   true,
+		})
+	}
+	confShort := recShort.CalcConfidence(now.Add(120 * time.Second))
+	if confShort >= 50.0 {
+		t.Fatalf("Confidence gating failed: 12 samples over 2 minutes must have confidence < 50%%, got %.2f%%", confShort)
+	}
+
+	recLong := NewRouteRecord(RouteMetrics{IP: "1.0.0.1", Port: 443})
+	// 12 samples over 4 hours (e.g. every 20 minutes)
+	for i := 0; i < 12; i++ {
+		ts := now.Add(time.Duration(i*20) * time.Minute)
+		recLong.AddSample(MeasurementSample{
+			Timestamp: ts,
+			Speed:     50.0,
+			P10Speed:  45.0,
+			RTT:       20.0,
+			Success:   true,
+		})
+	}
+	confLong := recLong.CalcConfidence(now.Add(220 * time.Minute))
+	if confLong <= 70.0 {
+		t.Fatalf("Confidence gating failed: 12 samples over 4 hours should have confidence > 70%%, got %.2f%%", confLong)
+	}
+}
+
+func TestSpeedDropBaselineOrder(t *testing.T) {
+	store := NewRouteStore()
+	ip := "2.2.2.2"
+
+	// Establish stable baseline around 50 MB/s
+	now := time.Now()
+	for i := 0; i < 10; i++ {
+		m := RouteMetrics{
+			IP:               ip,
+			Port:             443,
+			SingleSpeed:      50.0,
+			P10Speed:         50.0,
+			RTT:              20.0,
+			HandshakeSuccess: true,
+			LastTested:       now.Add(time.Duration(i) * time.Minute),
+		}
+		store.RecordProbeResult(m, true)
+	}
+
+	rec, ok := store.Get(ip)
+	if !ok {
+		t.Fatal("route record not found")
+	}
+	baseline := rec.EWMA.LongSnapshot().P10Speed
+	if baseline < 45.0 {
+		t.Fatalf("expected established baseline around 50 MB/s, got %.2f", baseline)
+	}
+
+	// Now a sudden probe with speed 30 MB/s comes in
+	suddenDropMetric := RouteMetrics{
+		IP:               ip,
+		Port:             443,
+		SingleSpeed:      30.0,
+		P10Speed:         30.0,
+		RTT:              20.0,
+		HandshakeSuccess: true,
+		LastTested:       now.Add(11 * time.Minute),
+	}
+	store.RecordProbeResult(suddenDropMetric, true)
+
+	recAfter, _ := store.Get(ip)
+	// Baseline was ~50, new sample was 30 -> drop should be ~40%
+	if recAfter.Metrics.SpeedDropPercent < 35.0 || recAfter.Metrics.SpeedDropPercent > 45.0 {
+		t.Fatalf("expected speed drop percent around 40%%, got %.2f%% (baseline was %.2f)", recAfter.Metrics.SpeedDropPercent, baseline)
+	}
+}
+
+func TestPeakHourEWMAHistoricalDecay(t *testing.T) {
+	rec := NewRouteRecord(RouteMetrics{IP: "3.3.3.3", Port: 443})
+
+	// Yesterday at 20:00 (peak hour), bad network (speed 10 MB/s, loss 0.20)
+	yesterdayPeak := time.Date(2026, 9, 7, 20, 0, 0, 0, time.Local)
+	rec.AddSample(MeasurementSample{
+		Timestamp:  yesterdayPeak,
+		Speed:      10.0,
+		PacketLoss: 0.20,
+		Success:    true,
+	})
+
+	hsYesterday := rec.PeakHours[20]
+	if hsYesterday.AvgSpeed != 10.0 {
+		t.Fatalf("expected yesterday avg speed 10, got %.2f", hsYesterday.AvgSpeed)
+	}
+
+	// Today at 20:00 (> 12 hours later), excellent network (speed 90 MB/s, loss 0.0)
+	todayPeak := time.Date(2026, 9, 8, 20, 0, 0, 0, time.Local)
+	rec.AddSample(MeasurementSample{
+		Timestamp:  todayPeak,
+		Speed:      90.0,
+		PacketLoss: 0.0,
+		Success:    true,
+	})
+
+	hsToday := rec.PeakHours[20]
+	// If it decayed and applied EWMA (alpha = 0.35 on new data, decayed old * 0.70):
+	// Decayed old speed was 10.0 * 0.7 = 7.0
+	// Updated speed = 0.35 * 90.0 + 0.65 * 7.0 = 31.5 + 4.55 = 36.05
+	// Rather than a simple average (10+90)/2 = 50 with equal weights forever
+	if hsToday.AvgSpeed <= 10.0 || hsToday.AvgSpeed >= 90.0 {
+		t.Fatalf("expected smoothed EWMA speed reflecting decay, got %.2f", hsToday.AvgSpeed)
+	}
+	if hsToday.LastUpdated != todayPeak {
+		t.Fatalf("expected LastUpdated to be updated to todayPeak, got %v", hsToday.LastUpdated)
+	}
+}
+
+func TestHistory24hRetention(t *testing.T) {
+	rec := NewRouteRecord(RouteMetrics{IP: "4.4.4.4", Port: 443})
+	now := time.Now()
+
+	// Add sample from 26 hours ago (outside 24h)
+	rec.AddSample(MeasurementSample{
+		Timestamp: now.Add(-26 * time.Hour),
+		Speed:     20.0,
+		Success:   true,
+	})
+
+	// Add sample from 20 hours ago (inside 24h)
+	rec.AddSample(MeasurementSample{
+		Timestamp: now.Add(-20 * time.Hour),
+		Speed:     60.0,
+		Success:   true,
+	})
+
+	// Add sample from 1 hour ago
+	rec.AddSample(MeasurementSample{
+		Timestamp: now.Add(-1 * time.Hour),
+		Speed:     80.0,
+		Success:   true,
+	})
+
+	// The sample from 26h ago should have been pruned by 24h cutoff
+	if len(rec.Samples) != 2 {
+		t.Fatalf("expected 2 samples retained within 24 hours, got %d", len(rec.Samples))
+	}
+	if rec.Samples[0].Speed != 60.0 {
+		t.Fatalf("expected oldest retained sample to be 60.0 MB/s, got %.2f", rec.Samples[0].Speed)
+	}
+}
+
+func TestStaleRouteProtection(t *testing.T) {
+	store := NewRouteStore()
+	now := time.Now()
+
+	// Route 1: Tested 2 minutes ago, active, score 80
+	store.UpsertRoute(RouteMetrics{
+		IP:         "5.5.5.1",
+		Port:       443,
+		Tier:       TierActive,
+		Health:     HealthHealthy,
+		FinalScore: 80.0,
+		Confidence: 80.0,
+		LastTested: now.Add(-2 * time.Minute),
+	})
+
+	// Route 2: Tested 70 minutes ago, excellent historical score 95
+	store.UpsertRoute(RouteMetrics{
+		IP:         "5.5.5.2",
+		Port:       443,
+		Tier:       TierStandby,
+		Health:     HealthHealthy,
+		FinalScore: 95.0,
+		Confidence: 90.0,
+		LastTested: now.Add(-70 * time.Minute),
+	})
+
+	// Route 3: Tested 20 minutes ago (stale for standby, but < 60m)
+	store.UpsertRoute(RouteMetrics{
+		IP:         "5.5.5.3",
+		Port:       443,
+		Tier:       TierStandby,
+		Health:     HealthHealthy,
+		FinalScore: 85.0,
+		Confidence: 80.0,
+		LastTested: now.Add(-20 * time.Minute),
+	})
+
+	best := store.GetBest(10, "")
+	// Route 2 (> 60m) must be completely excluded from GetBest
+	for _, r := range best {
+		if r.IP == "5.5.5.2" {
+			t.Fatalf("Route 5.5.5.2 was untested for >60m and must NOT be in GetBest()")
+		}
+	}
+
+	// Route 1 (recent, not stale) should beat Route 3 (stale, penalized 50%)
+	if len(best) == 0 || best[0].IP != "5.5.5.1" {
+		t.Fatalf("Expected fresh route 5.5.5.1 to rank #1, got: %+v", best)
+	}
+}
+

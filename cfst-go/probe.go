@@ -19,13 +19,67 @@ const (
 // ProbeProfile defines target parameters for versatile network quality testing (CFST, GOWAY-WSS, CUSTOM).
 type ProbeProfile struct {
 	Type     ProbeProfileType `json:"type"`
-	IP       string           `json:"ip"`
+	IP       string           `json:"ip,omitempty"`
 	Port     int              `json:"port"`
 	SNI      string           `json:"sni"`
 	Host     string           `json:"host"`
 	Path     string           `json:"path"`
 	TestURL  string           `json:"test_url"`
-	Protocol string           `json:"protocol"` // e.g. "wss", "tls", "https"
+	Protocol string           `json:"protocol"` // e.g. "https", "wss"
+}
+
+// NewProfileCFST returns Cloudflare Official probe profile (default).
+func NewProfileCFST() ProbeProfile {
+	return ProbeProfile{
+		Type:     ProfileCFST,
+		Port:     443,
+		SNI:      "speed.cloudflare.com",
+		Host:     "speed.cloudflare.com",
+		Path:     "/__down",
+		TestURL:  "https://speed.cloudflare.com/__down?bytes=500000000",
+		Protocol: "https",
+	}
+}
+
+// NewProfileGOWAYWSS returns GOWAY WSS Handshake probe profile.
+func NewProfileGOWAYWSS(host, path, sni string, port int) ProbeProfile {
+	if port <= 0 {
+		port = 443
+	}
+	if host == "" {
+		host = "colo.4467107.xyz"
+	}
+	if path == "" {
+		path = "/pyway"
+	}
+	if sni == "" {
+		sni = host
+	}
+	return ProbeProfile{
+		Type:     ProfileGOWAYWSS,
+		Port:     port,
+		SNI:      sni,
+		Host:     host,
+		Path:     path,
+		TestURL:  "https://speed.cloudflare.com/__down?bytes=500000000",
+		Protocol: "wss",
+	}
+}
+
+// NewProfileCustom returns custom user-configured VPS URL probe profile.
+func NewProfileCustom(customURL, sni string, port int) ProbeProfile {
+	if port <= 0 {
+		port = 443
+	}
+	return ProbeProfile{
+		Type:     ProfileCustom,
+		Port:     port,
+		SNI:      sni,
+		Host:     sni,
+		Path:     "/",
+		TestURL:  customURL,
+		Protocol: "https",
+	}
 }
 
 // ProbeConfig holds parameters controlling tiered background probing.
@@ -39,7 +93,9 @@ type ProbeConfig struct {
 	MaxSpeedTests     int           `json:"max_speed_tests"`    // Strict limit (usually 1) for concurrent speed tests
 	QuickDuration     int           `json:"quick_duration"`     // Duration in seconds for L3 quick speed test
 	FullDuration      int           `json:"full_duration"`      // Duration in seconds for L4 full speed test
-	SpeedTestCycle    int           `json:"speed_test_cycle"`   // Perform speed test every N cycles on Active/Standby
+	L3ProbeCycle      int           `json:"l3_probe_cycle"`     // Lightweight HTTP check every N cycles (e.g. 3)
+	FullSpeedCycle    int           `json:"full_speed_cycle"`   // Full speed test calibration cycle (e.g. 60)
+	SpeedTestCycle    int           `json:"speed_test_cycle"`   // Legacy alias for FullSpeedCycle
 	WSSHost           string        `json:"wss_host"`
 	SNI               string        `json:"sni"`
 	URL               string        `json:"url"`
@@ -47,15 +103,9 @@ type ProbeConfig struct {
 }
 
 func DefaultProbeConfig() ProbeConfig {
+	prof := NewProfileCFST()
 	return ProbeConfig{
-		Profile: ProbeProfile{
-			Type:     ProfileGOWAYWSS,
-			Port:     443,
-			Host:     "colo.4467107.xyz",
-			Path:     "/pyway",
-			TestURL:  "https://speed.cloudflare.com/__down?bytes=500000000",
-			Protocol: "wss",
-		},
+		Profile:           prof,
 		ActiveInterval:    10 * time.Second,
 		StandbyInterval:   30 * time.Second,
 		CandidateInterval: 180 * time.Second,
@@ -64,11 +114,13 @@ func DefaultProbeConfig() ProbeConfig {
 		MaxSpeedTests:     1,
 		QuickDuration:     3,
 		FullDuration:      10,
-		SpeedTestCycle:    6, // every 6th cycle on Active/Standby (approx 1-3 mins)
+		L3ProbeCycle:      3,  // L3 lightweight 100KB probe every 3 cycles (~30s on Active)
+		FullSpeedCycle:    60, // L4 full speed calibration every 60 cycles (~10m on Active)
+		SpeedTestCycle:    60,
 		WSSHost:           "colo.4467107.xyz",
-		SNI:               "",
-		URL:               "https://speed.cloudflare.com/__down?bytes=500000000",
-		Port:              443,
+		SNI:               prof.SNI,
+		URL:               prof.TestURL,
+		Port:              prof.Port,
 	}
 }
 
@@ -93,6 +145,8 @@ type LayeredProbeResult struct {
 	LoadLatency          float64
 	Colo                 string
 	Error                string
+	L3Executed           bool
+	L4Executed           bool
 }
 
 // ProbeScheduler runs layered active background testing on managed routes.
@@ -117,6 +171,12 @@ func NewProbeScheduler(store *RouteStore, cfg ProbeConfig) *ProbeScheduler {
 	if cfg.MaxConcurrent < 1 {
 		cfg.MaxConcurrent = 2
 	}
+	if cfg.L3ProbeCycle < 1 {
+		cfg.L3ProbeCycle = 3
+	}
+	if cfg.FullSpeedCycle < 1 {
+		cfg.FullSpeedCycle = 60
+	}
 	return &ProbeScheduler{
 		store:        store,
 		cfg:          cfg,
@@ -139,8 +199,8 @@ func (ps *ProbeScheduler) GetConfig() ProbeConfig {
 	return ps.cfg
 }
 
-// ExecuteLayeredProbe executes L1 to L5 sequentially on an IP.
-func (ps *ProbeScheduler) ExecuteLayeredProbe(ctx context.Context, ip string, port int, runSpeedTest bool, fullSpeed bool) LayeredProbeResult {
+// ExecuteLayeredProbe executes L1 to L5 sequentially on an IP, strictly minimizing bandwidth usage.
+func (ps *ProbeScheduler) ExecuteLayeredProbe(ctx context.Context, ip string, port int, runL3 bool, runFullSpeed bool) LayeredProbeResult {
 	cfg := ps.GetConfig()
 	res := LayeredProbeResult{Success: false}
 
@@ -210,9 +270,24 @@ func (ps *ProbeScheduler) ExecuteLayeredProbe(ctx context.Context, ip string, po
 	}
 
 	// -------------------------------------------------------------
-	// Layer 3 & Layer 4: Speed Tests (Bandwidth-throttled)
+	// Layer 3: Lightweight HTTP / HTTPS Probe (~100KB payload)
 	// -------------------------------------------------------------
-	if runSpeedTest {
+	if runL3 && !runFullSpeed {
+		l3Res := LightweightHTTPProbe(ctx, ip, port, cfg.URL, cfg.SNI)
+		if !l3Res.Success {
+			res.Error = "L3 HTTP probe failed: " + l3Res.Error
+			return res
+		}
+		if l3Res.Colo != "" {
+			res.Colo = l3Res.Colo
+		}
+		res.L3Executed = true
+	}
+
+	// -------------------------------------------------------------
+	// Layer 4: Full Speed Test (Bandwidth-throttled calibration)
+	// -------------------------------------------------------------
+	if runFullSpeed {
 		// Acquire speed semaphore to strictly prevent bandwidth congestion
 		select {
 		case ps.speedSem <- struct{}{}:
@@ -222,12 +297,9 @@ func (ps *ProbeScheduler) ExecuteLayeredProbe(ctx context.Context, ip string, po
 			return res
 		}
 
-		duration := cfg.QuickDuration
-		if fullSpeed {
-			duration = cfg.FullDuration
-		}
+		duration := cfg.FullDuration
 		if duration < 2 {
-			duration = 2
+			duration = 5
 		}
 
 		sm := SingleStreamTestDetailed(ctx, ip, port, duration, cfg.URL, cfg.SNI, nil, res.RTT, res.Jitter, res.PacketLoss)
@@ -242,6 +314,7 @@ func (ps *ProbeScheduler) ExecuteLayeredProbe(ctx context.Context, ip string, po
 		res.TotalStallDuration = sm.TotalStallDuration
 		res.LongestStallDuration = sm.LongestStallDuration
 		res.StallRate = sm.StallRate
+		res.L4Executed = true
 
 		if sm.AverageSpeed <= 0 && sm.MinSpeed <= 0 {
 			res.Error = "Speed test returned 0 MB/s"
@@ -249,12 +322,12 @@ func (ps *ProbeScheduler) ExecuteLayeredProbe(ctx context.Context, ip string, po
 		}
 
 		// Detect Colo if unknown
-		res.Colo = GetColo(ip, port)
+		if res.Colo == "" {
+			res.Colo = GetColo(ip, port)
+		}
 
-		// -------------------------------------------------------------
-		// Layer 5: Load Latency (optional, only on full tests)
-		// -------------------------------------------------------------
-		if fullSpeed && !isCustomURL(cfg.URL) {
+		// Layer 5: Load Latency (optional)
+		if !isCustomURL(cfg.URL) {
 			res.LoadLatency = MeasureLoadLatency(ip, port)
 		}
 	}
@@ -264,6 +337,13 @@ func (ps *ProbeScheduler) ExecuteLayeredProbe(ctx context.Context, ip string, po
 }
 
 // ProbeOnce executes a probe pass for a single route and updates the store.
+func (ps *ProbeScheduler) incCycle(ip string) int64 {
+	val, _ := ps.cycleCount.LoadOrStore(ip, int64(0))
+	cycle := val.(int64) + 1
+	ps.cycleCount.Store(ip, cycle)
+	return cycle
+}
+
 func (ps *ProbeScheduler) ProbeOnce(ctx context.Context, ip string, forceSpeed bool) (*RouteMetrics, error) {
 	rec, exists := ps.store.Get(ip)
 	port := ps.cfg.Port
@@ -277,38 +357,56 @@ func (ps *ProbeScheduler) ProbeOnce(ctx context.Context, ip string, forceSpeed b
 
 	// Determine if speed test is scheduled
 	cfg := ps.GetConfig()
-	val, _ := ps.cycleCount.LoadOrStore(ip, int64(0))
-	cycle := val.(int64) + 1
-	ps.cycleCount.Store(ip, cycle)
+	cycle := ps.incCycle(ip)
 
-	runSpeedTest := forceSpeed
-	fullSpeed := false
-	if !runSpeedTest {
+	runL3 := false
+	runFullSpeed := false
+	if forceSpeed {
+		runL3 = true
+		runFullSpeed = true
+	} else {
+		l3Cycle := cfg.L3ProbeCycle
+		if l3Cycle < 1 {
+			l3Cycle = 3
+		}
+		fullCycle := cfg.FullSpeedCycle
+		if fullCycle < 1 {
+			fullCycle = 60
+		}
+
 		switch tier {
 		case TierActive:
-			// Active route: prioritize low-overhead L1/L2, periodically test speed
-			if cycle%int64(cfg.SpeedTestCycle) == 0 {
-				runSpeedTest = true
-				fullSpeed = false // quick speed test on active route to avoid eating bandwidth
+			// Active route: L1/L2 every cycle (10s)
+			// L3 lightweight 100KB check every L3ProbeCycle (default 3 cycles = ~30s)
+			if cycle%int64(l3Cycle) == 0 {
+				runL3 = true
+			}
+			// L4 full speed calibration only every FullSpeedCycle (default 60 cycles = ~10m)
+			if cycle%int64(fullCycle) == 0 {
+				runFullSpeed = true
 			}
 		case TierStandby:
-			if cycle%int64(cfg.SpeedTestCycle) == 0 {
-				runSpeedTest = true
-				fullSpeed = true // standby route can test full speed
+			// Standby route: lower frequency
+			if cycle%int64(l3Cycle*2) == 0 {
+				runL3 = true
+			}
+			if cycle%int64(fullCycle*2) == 0 {
+				runFullSpeed = true
 			}
 		case TierCandidate:
-			// Candidates test speed occasionally
-			if cycle%int64(cfg.SpeedTestCycle*2) == 0 {
-				runSpeedTest = true
-				fullSpeed = false
+			// Candidate: low frequency
+			if cycle%int64(l3Cycle*4) == 0 {
+				runL3 = true
 			}
+			runFullSpeed = false
 		case TierFailed:
-			// Failed routes only do L1/L2 recovery checks, no speed test
-			runSpeedTest = false
+			// Failed routes: ONLY L1/L2 recovery checks, ZERO speed tests!
+			runL3 = false
+			runFullSpeed = false
 		}
 	}
 
-	result := ps.ExecuteLayeredProbe(ctx, ip, port, runSpeedTest, fullSpeed)
+	result := ps.ExecuteLayeredProbe(ctx, ip, port, runL3, runFullSpeed)
 
 	now := time.Now()
 	m := RouteMetrics{
@@ -348,8 +446,8 @@ func (ps *ProbeScheduler) ProbeOnce(ctx context.Context, ip string, forceSpeed b
 		m.ConsecutiveSuccess = rec.Metrics.ConsecutiveSuccess
 		m.ConsecutiveDegraded = rec.Metrics.ConsecutiveDegraded
 		m.Health = rec.Metrics.Health
-		// If speed test wasn't run on this cycle, inherit previous speeds
-		if !runSpeedTest {
+		// If full speed test wasn't run on this cycle, inherit previous speeds
+		if !runFullSpeed {
 			m.DownloadSpeed = rec.Metrics.DownloadSpeed
 			m.SingleSpeed = rec.Metrics.SingleSpeed
 			m.P10Speed = rec.Metrics.P10Speed

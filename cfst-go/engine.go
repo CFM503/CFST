@@ -851,3 +851,104 @@ type LiveProgress struct {
 	Elapsed  float64 `json:"elapsed"`
 	Duration float64 `json:"duration"`
 }
+
+// LightweightHTTPProbeResult contains the outcome of an L3 low-bandwidth HTTP/HTTPS probe.
+type LightweightHTTPProbeResult struct {
+	Success    bool    `json:"success"`
+	StatusCode int     `json:"status_code"`
+	TTFB       float64 `json:"ttfb_ms"`
+	Speed      float64 `json:"speed_mb"`
+	BytesRead  int64   `json:"bytes_read"`
+	Colo       string  `json:"colo"`
+	Error      string  `json:"error,omitempty"`
+}
+
+// LightweightHTTPProbe performs a minimal-overhead HTTP check (e.g. 100KB or range request)
+// to verify HTTP reachability, TTFB, and CDN Colo without consuming excessive bandwidth.
+func LightweightHTTPProbe(ctx context.Context, ip string, port int, testURL, customSNI string) LightweightHTTPProbeResult {
+	res := LightweightHTTPProbeResult{}
+	parsedURL, err := url.Parse(testURL)
+	if err != nil {
+		res.Error = err.Error()
+		return res
+	}
+	host := parsedURL.Hostname()
+	sni := host
+	if customSNI != "" {
+		sni = customSNI
+	} else if strings.Contains(testURL, "speed.cloudflare.com") {
+		sni = "speed.cloudflare.com"
+	}
+
+	client := makeHTTPClient(ip, port, sni)
+	if tr, ok := client.Transport.(*http.Transport); ok {
+		defer tr.CloseIdleConnections()
+	}
+
+	// For Cloudflare official speed test, request a small 100KB chunk instead of 500MB
+	probeURL := testURL
+	if strings.Contains(testURL, "speed.cloudflare.com/__down") {
+		probeURL = "https://speed.cloudflare.com/__down?bytes=100000"
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+
+	req, err := newCFRequestWithContext(reqCtx, "GET", probeURL)
+	if err != nil {
+		res.Error = err.Error()
+		return res
+	}
+	req.Host = host
+	req.Header.Set("Connection", "close")
+	// If custom URL, request range to keep bandwidth small
+	if !strings.Contains(testURL, "speed.cloudflare.com") {
+		req.Header.Set("Range", "bytes=0-102399")
+	}
+
+	t0 := time.Now()
+	resp, err := client.Do(req)
+	if err != nil {
+		res.Error = err.Error()
+		return res
+	}
+	defer resp.Body.Close()
+
+	res.TTFB = float64(time.Since(t0).Microseconds()) / 1000.0
+	res.StatusCode = resp.StatusCode
+
+	// Extract Colo from cf-ray header if present
+	cfRay := resp.Header.Get("cf-ray")
+	if cfRay != "" {
+		parts := strings.Split(cfRay, "-")
+		if len(parts) >= 2 {
+			res.Colo = strings.ToUpper(parts[len(parts)-1])
+		}
+	}
+
+	if resp.StatusCode >= 400 {
+		res.Error = fmt.Sprintf("HTTP %d", resp.StatusCode)
+		return res
+	}
+
+	// Read small body limited to 256KB
+	lr := io.LimitReader(resp.Body, 256*1024)
+	buf := make([]byte, 32*1024)
+	var bytesRead int64
+	for {
+		n, rErr := lr.Read(buf)
+		if n > 0 {
+			bytesRead += int64(n)
+		}
+		if rErr != nil {
+			break
+		}
+	}
+	totalDuration := time.Since(t0).Seconds()
+	res.BytesRead = bytesRead
+	if totalDuration > 0.001 {
+		res.Speed = (float64(bytesRead) / 1024.0 / 1024.0) / totalDuration
+	}
+	res.Success = true
+	return res
+}

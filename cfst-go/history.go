@@ -49,20 +49,21 @@ type WindowStats struct {
 
 // HourStats tracks metrics aggregated for a specific hour of the day (00..23).
 type HourStats struct {
-	Hour          int     `json:"hour"`
-	Count         int     `json:"count"`
-	FailCount     int     `json:"fail_count"`
-	AvgSpeed      float64 `json:"avg_speed"`
-	MedianSpeed   float64 `json:"median_speed"`
-	P10Speed      float64 `json:"p10_speed"`
-	MinSpeed      float64 `json:"min_speed"`
-	AvgRTT        float64 `json:"avg_rtt"`
-	AvgLoss       float64 `json:"avg_loss"`
-	AvgJitter     float64 `json:"avg_jitter"`
-	AvgStability  float64 `json:"avg_stability"`
-	StallRate     float64 `json:"stall_rate"`
-	FailRate      float64 `json:"fail_rate"`
-	PeakHourScore float64 `json:"peak_hour_score"`
+	Hour          int       `json:"hour"`
+	Count         int       `json:"count"`
+	FailCount     int       `json:"fail_count"`
+	AvgSpeed      float64   `json:"avg_speed"`
+	MedianSpeed   float64   `json:"median_speed"`
+	P10Speed      float64   `json:"p10_speed"`
+	MinSpeed      float64   `json:"min_speed"`
+	AvgRTT        float64   `json:"avg_rtt"`
+	AvgLoss       float64   `json:"avg_loss"`
+	AvgJitter     float64   `json:"avg_jitter"`
+	AvgStability  float64   `json:"avg_stability"`
+	StallRate     float64   `json:"stall_rate"`
+	FailRate      float64   `json:"fail_rate"`
+	PeakHourScore float64   `json:"peak_hour_score"`
+	LastUpdated   time.Time `json:"last_updated,omitempty"`
 }
 
 // CalcPeakHourScore computes a 0-100 composite quality score for a given hour.
@@ -125,8 +126,14 @@ func (r *RouteRecord) AddSample(s MeasurementSample) {
 	// 1. Append sample
 	r.Samples = append(r.Samples, s)
 
-	// Keep samples up to 24 hours (max 1000 samples to prevent memory unbounded growth)
-	cutoff := s.Timestamp.Add(-24 * time.Hour)
+	// Keep samples up to 24 hours (Max 10000 samples to prevent unbounded memory growth while fully covering 24h)
+	latestTime := s.Timestamp
+	for _, sample := range r.Samples {
+		if sample.Timestamp.After(latestTime) {
+			latestTime = sample.Timestamp
+		}
+	}
+	cutoff := latestTime.Add(-24 * time.Hour)
 	startIdx := 0
 	for startIdx < len(r.Samples) && r.Samples[startIdx].Timestamp.Before(cutoff) {
 		startIdx++
@@ -134,8 +141,8 @@ func (r *RouteRecord) AddSample(s MeasurementSample) {
 	if startIdx > 0 {
 		r.Samples = r.Samples[startIdx:]
 	}
-	if len(r.Samples) > 1000 {
-		r.Samples = r.Samples[len(r.Samples)-1000:]
+	if len(r.Samples) > 10000 {
+		r.Samples = r.Samples[len(r.Samples)-10000:]
 	}
 
 	// 2. Update EWMA
@@ -152,15 +159,31 @@ func (r *RouteRecord) AddSample(s MeasurementSample) {
 		r.EWMA.RecordFailure(s.Timestamp)
 	}
 
-	// 3. Update PeakHour stats (0..23)
+	// 3. Update PeakHour stats (0..23) with time-based decay
 	h := s.Timestamp.Hour()
 	hs := &r.PeakHours[h]
+
+	isInitial := (hs.Count == 0 && hs.AvgSpeed == 0)
+
+	// If hs was updated on a previous day/cycle (>12h ago), apply exponential decay to historical counts
+	if !hs.LastUpdated.IsZero() && s.Timestamp.Sub(hs.LastUpdated) > 12*time.Hour {
+		days := math.Max(1.0, s.Timestamp.Sub(hs.LastUpdated).Hours()/24.0)
+		decay := math.Pow(0.60, days)
+		hs.Count = int(float64(hs.Count) * decay)
+		if hs.Count < 1 {
+			hs.Count = 1
+		}
+		hs.FailCount = int(float64(hs.FailCount) * decay)
+	}
+	hs.LastUpdated = s.Timestamp
 	hs.Count++
+
 	if !s.Success {
 		hs.FailCount++
 	} else {
-		successCount := float64(hs.Count - hs.FailCount)
-		if successCount <= 1 {
+		// Alpha-weighted EWMA update so recent peak hour quality has stronger weight
+		alpha := 0.35
+		if isInitial {
 			hs.AvgSpeed = s.Speed
 			hs.MedianSpeed = s.MedianSpeed
 			hs.P10Speed = s.P10Speed
@@ -173,28 +196,111 @@ func (r *RouteRecord) AddSample(s MeasurementSample) {
 				hs.StallRate = s.TotalStallDuration / 10.0
 			}
 		} else {
-			hs.AvgSpeed += (s.Speed - hs.AvgSpeed) / successCount
+			hs.AvgSpeed = hs.AvgSpeed*(1-alpha) + s.Speed*alpha
 			if s.MedianSpeed > 0 {
-				hs.MedianSpeed += (s.MedianSpeed - hs.MedianSpeed) / successCount
+				hs.MedianSpeed = hs.MedianSpeed*(1-alpha) + s.MedianSpeed*alpha
 			}
 			if s.P10Speed > 0 {
-				hs.P10Speed += (s.P10Speed - hs.P10Speed) / successCount
+				hs.P10Speed = hs.P10Speed*(1-alpha) + s.P10Speed*alpha
 			}
-			if s.MinSpeed < hs.MinSpeed {
+			if s.MinSpeed < hs.MinSpeed || hs.MinSpeed <= 0 {
 				hs.MinSpeed = s.MinSpeed
+			} else {
+				hs.MinSpeed = hs.MinSpeed*(1-alpha) + s.MinSpeed*alpha
 			}
-			hs.AvgRTT += (s.RTT - hs.AvgRTT) / successCount
-			hs.AvgLoss += (s.PacketLoss - hs.AvgLoss) / successCount
-			hs.AvgJitter += (s.Jitter - hs.AvgJitter) / successCount
-			hs.AvgStability += (s.Stability - hs.AvgStability) / successCount
+			hs.AvgRTT = hs.AvgRTT*(1-alpha) + s.RTT*alpha
+			hs.AvgLoss = hs.AvgLoss*(1-alpha) + s.PacketLoss*alpha
+			hs.AvgJitter = hs.AvgJitter*(1-alpha) + s.Jitter*alpha
+			hs.AvgStability = hs.AvgStability*(1-alpha) + s.Stability*alpha
 			sampleStallRate := s.TotalStallDuration / 10.0
-			hs.StallRate += (sampleStallRate - hs.StallRate) / successCount
+			hs.StallRate = hs.StallRate*(1-alpha) + sampleStallRate*alpha
 		}
 	}
 	if hs.Count > 0 {
 		hs.FailRate = float64(hs.FailCount) / float64(hs.Count)
 	}
 	hs.PeakHourScore = CalcPeakHourScore(hs)
+}
+
+// CalcConfidence computes a 0-100 confidence score based on:
+// 1. Observation duration (span between earliest and latest sample)
+// 2. Sample count
+// 3. Success rate
+// 4. Peak hour coverage
+// 5. Recency
+func (r *RouteRecord) CalcConfidence(now time.Time) float64 {
+	if len(r.Samples) == 0 {
+		return 20.0 // neutral starting baseline
+	}
+
+	firstTime := r.Samples[0].Timestamp
+	lastTime := r.Samples[len(r.Samples)-1].Timestamp
+	span := lastTime.Sub(firstTime)
+	if span < 0 {
+		span = 0
+	}
+
+	total := len(r.Samples)
+	var validCount int
+	hasPeakHour := false
+	for _, s := range r.Samples {
+		if s.Success {
+			validCount++
+		}
+		h := s.Timestamp.Hour()
+		if h >= 20 && h <= 22 {
+			hasPeakHour = true
+		}
+	}
+
+	// 1. Duration score (0 to 50 points): requires observation time to climb
+	var durationScore float64
+	spanMins := span.Minutes()
+	if spanMins < 2 {
+		durationScore = 10.0
+	} else if spanMins < 5 {
+		durationScore = 15.0
+	} else if spanMins < 15 {
+		durationScore = 25.0
+	} else if spanMins < 30 {
+		durationScore = 35.0
+	} else if spanMins < 60 {
+		durationScore = 40.0
+	} else if spanMins < 180 {
+		durationScore = 45.0
+	} else {
+		durationScore = 50.0
+	}
+
+	// 2. Sample count score (0 to 30 points)
+	countScore := math.Min(30.0, float64(total)/20.0*30.0)
+
+	// 3. Peak hour coverage bonus (0 to 10 points)
+	peakBonus := 0.0
+	if hasPeakHour && spanMins >= 15 {
+		peakBonus = 10.0
+	}
+
+	// 4. Stability / Success bonus (0 to 10 points)
+	successRate := float64(validCount) / float64(total)
+	successBonus := successRate * 10.0
+
+	rawConfidence := durationScore + countScore + peakBonus + successBonus
+
+	// 5. Recency penalty (if last tested was long ago)
+	timeSinceLast := now.Sub(lastTime)
+	if timeSinceLast > 10*time.Minute {
+		overMins := timeSinceLast.Minutes() - 10.0
+		decay := math.Max(0.50, 1.0-(overMins/60.0)*0.50)
+		rawConfidence *= decay
+	}
+
+	if rawConfidence < 20.0 {
+		rawConfidence = 20.0
+	} else if rawConfidence > 100.0 {
+		rawConfidence = 100.0
+	}
+	return math.Round(rawConfidence*10) / 10
 }
 
 // CalcWindowStats aggregates samples within the specified duration before now.
@@ -241,16 +347,7 @@ func (r *RouteRecord) CalcWindowStats(d time.Duration, now time.Time) WindowStat
 		return ws
 	}
 
-	// Confidence calculation: gradually builds from 20 up to 100
-	if total < 3 {
-		ws.Confidence = 20.0
-	} else if total < 6 {
-		ws.Confidence = 50.0
-	} else if total < 12 {
-		ws.Confidence = 80.0
-	} else {
-		ws.Confidence = math.Min(100.0, 80.0+float64(total-12)*2.0)
-	}
+	ws.Confidence = r.CalcConfidence(now)
 
 	ws.FailRate = float64(failCount) / float64(total)
 	if validCount > 0 {
@@ -374,6 +471,9 @@ func (s *RouteStore) UpsertRoute(m RouteMetrics) *RouteRecord {
 	rec.Metrics.ConsecutiveDegraded = m.ConsecutiveDegraded
 	rec.Metrics.LastTested = m.LastTested
 	rec.Metrics.Timestamp = m.Timestamp
+	rec.Metrics.IsStale = m.IsStale
+	rec.Metrics.ObservationDuration = m.ObservationDuration
+	rec.Metrics.LastSuccess = m.LastSuccess
 
 	return rec
 }
@@ -417,24 +517,70 @@ func (s *RouteStore) RecordProbeResult(m RouteMetrics, success bool) {
 		sample.Timestamp = time.Now()
 	}
 
-	rec.AddSample(sample)
-
-	// Update health status with baseline P10
+	// 1. Capture baseline P10 BEFORE adding current sample to EWMA / History
+	// This ensures sudden speed drops are accurately measured rather than immediately smoothed out.
 	baselineP10 := rec.EWMA.LongSnapshot().P10Speed
 	if baselineP10 <= 0 {
 		baselineP10 = rec.EWMA.LongSnapshot().Speed
 	}
+	m.BaselineP10 = baselineP10
+
+	// Pre-calculate SpeedDropPercent against uncorrupted baseline
+	effSpeed := sample.P10Speed
+	if effSpeed <= 0 && sample.MinSpeed > 0 {
+		effSpeed = sample.MinSpeed
+	}
+	if effSpeed <= 0 {
+		effSpeed = sample.Speed
+	}
+	if baselineP10 > 2.0 && effSpeed >= 0 {
+		drop := (1.0 - (effSpeed / baselineP10)) * 100.0
+		if drop > 0 {
+			m.SpeedDropPercent = math.Round(drop*10) / 10
+		} else {
+			m.SpeedDropPercent = 0
+		}
+	} else {
+		m.SpeedDropPercent = 0
+	}
+
+	// 2. Update health status using uncorrupted baseline
+	if success {
+		m.LastSuccess = sample.Timestamp
+	} else if !rec.Metrics.LastSuccess.IsZero() {
+		m.LastSuccess = rec.Metrics.LastSuccess
+	}
 	m.UpdateHealth(success, baselineP10)
+
+	// 3. Now add sample to history and update EWMA
+	rec.AddSample(sample)
 
 	// Update EWMA snapshot
 	snap := rec.EWMA.ShortSnapshot()
 	m.EWMA = &snap
 
-	// Evaluate confidence
-	w15 := rec.CalcWindowStats(15*time.Minute, sample.Timestamp)
-	m.Confidence = w15.Confidence
-	if m.Confidence <= 0 {
-		m.Confidence = 30.0
+	// Evaluate confidence based on time duration + count + success rate + recency
+	m.Confidence = rec.CalcConfidence(sample.Timestamp)
+	if len(rec.Samples) > 0 {
+		m.ObservationDuration = rec.Samples[len(rec.Samples)-1].Timestamp.Sub(rec.Samples[0].Timestamp).Seconds()
+	}
+
+	// Stale route check
+	now := sample.Timestamp
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if !m.LastTested.IsZero() {
+		if m.Tier == TierActive && now.Sub(m.LastTested) > 5*time.Minute {
+			m.IsStale = true
+		} else if m.Tier != TierActive && now.Sub(m.LastTested) > 15*time.Minute {
+			m.IsStale = true
+		} else {
+			m.IsStale = false
+		}
+	}
+	if m.IsStale {
+		m.Confidence *= 0.50
 	}
 
 	// Update current hour's PeakHourScore
@@ -444,6 +590,9 @@ func (s *RouteStore) RecordProbeResult(m RouteMetrics, success bool) {
 	// Evaluate multi-horizon scores
 	penalty := rec.PeakHourPenalty(h)
 	GlobalScoreEngine.EvaluateRoute(&m, snap, rec.EWMA.LongSnapshot(), penalty)
+	if m.IsStale {
+		m.FinalScore *= 0.50
+	}
 
 	// Assign grade and recommendation
 	m.StabilityGrade = m.DetermineStabilityGrade()
@@ -466,10 +615,19 @@ func (s *RouteStore) Get(idOrIP string) (*RouteRecord, bool) {
 func (s *RouteStore) getAllLocked() []RouteMetrics {
 	seen := make(map[string]bool)
 	var list []RouteMetrics
+	now := time.Now()
 	for _, rec := range s.routes {
 		if !seen[rec.Metrics.IP] {
 			seen[rec.Metrics.IP] = true
-			list = append(list, rec.Metrics)
+			m := rec.Metrics
+			if !m.LastTested.IsZero() {
+				if m.Tier == TierActive && now.Sub(m.LastTested) > 5*time.Minute {
+					m.IsStale = true
+				} else if m.Tier != TierActive && now.Sub(m.LastTested) > 15*time.Minute {
+					m.IsStale = true
+				}
+			}
+			list = append(list, m)
 		}
 	}
 	return list
@@ -488,7 +646,8 @@ func (s *RouteStore) GetBest(limit int, colo string) []RouteMetrics {
 	s.mu.RUnlock()
 
 	mode := GlobalScoreEngine.GetMode()
-	curHour := time.Now().Hour()
+	now := time.Now()
+	curHour := now.Hour()
 	isPeakTime := (mode == ModePeak) || (curHour >= 19 && curHour <= 23)
 
 	type candidateScore struct {
@@ -501,12 +660,27 @@ func (s *RouteStore) GetBest(limit int, colo string) []RouteMetrics {
 		if colo != "" && m.Colo != colo {
 			continue
 		}
+
+		// Stale route protection:
+		// If untested for > 60 minutes, exclude from GetBest() completely.
+		timeSinceTest := now.Sub(m.LastTested)
+		if !m.LastTested.IsZero() && timeSinceTest > 60*time.Minute {
+			continue
+		}
+
 		// 1. Exclude FAILED and FAILING routes
 		if m.Health == HealthFailed || m.Health == HealthFailing {
 			continue
 		}
 
 		effective := m.FinalScore
+
+		// Stale route penalization: untested > 5m for active or > 15m for others
+		if m.IsStale || (!m.LastTested.IsZero() && ((m.Tier == TierActive && timeSinceTest > 5*time.Minute) || (m.Tier != TierActive && timeSinceTest > 15*time.Minute))) {
+			m.IsStale = true
+			effective *= 0.50
+			m.Confidence *= 0.50
+		}
 
 		// 2. RECOVERING routes downweighted by 30%
 		if m.Health == HealthRecovering {
@@ -628,7 +802,7 @@ func (s *RouteStore) SaveSnapshot(path string) error {
 	s.mu.RUnlock()
 
 	container := SnapshotContainer{
-		Version:   "2.1.0",
+		Version:   "2.1.1",
 		Timestamp: time.Now(),
 		Routes:    uniqueRecords,
 	}

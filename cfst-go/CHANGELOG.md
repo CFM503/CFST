@@ -1,5 +1,35 @@
 # Changelog
 
+## v2.1.1 (2026-09-08)
+
+### Hardening: Long-Term Probe Stability & Low-Traffic Scheduling
+- **Probe Profile Explicitly Standardized (`probe.go`, `api.go`)**:
+  - Default probe profile explicitly standardized as Cloudflare Official (`ProfileCFST`, `https://speed.cloudflare.com/__down?bytes=500000000`).
+  - Added dedicated constructors `NewProfileCFST()`, `NewProfileGOWAYWSS(host, path, sni, port)`, and `NewProfileCustom(customURL, sni, port)`.
+  - Exposed `profile`, `profile_type`, `test_url`, `sni`, `host`, `path`, and `protocol` in `/api/health` and `/api/config`.
+- **Low-Traffic Multi-Layered Probe Scheduler (`probe.go`, `engine.go`)**:
+  - L1 (TCP Ping): Minimal byte overhead (SYN/ACK).
+  - L2 (WSS Handshake): Low byte overhead (TLS + HTTP 101 Handshake, 1~2KB).
+  - L3 (Lightweight HTTP Probe): Low-bandwidth probe (~100KB download / HTTP Range) validating TTFB, HTTP status, and Cloudflare colo without wasting bandwidth.
+  - L4 (Full Speed Calibration): Throttled schedule:
+    - Active routes: L3 probe every 3 cycles (~30s), L4 full speed calibration only every 60 cycles (~10m).
+    - Standby routes: L3 every 6 cycles, L4 full speed every 120 cycles.
+    - Candidate routes: L1/L2 only.
+    - Failed routes: strictly L1/L2 recovery checks, ZERO speed tests.
+- **Observation Span & Duration-Gated Confidence (`history.go`)**:
+  - Confidence calculation is strictly gated by observation time duration (span) + sample count + success rate + peak hour coverage + recency.
+  - Guaranteed: 12 samples over 2 minutes cannot exceed 50% confidence. High confidence (>70%) requires multi-hour observation spans.
+- **SpeedDrop Baseline Calculation Order Fix (`history.go`)**:
+  - Baseline P10 is captured from EWMA *before* adding the current measurement sample.
+  - Sudden speed drops (e.g., from 50 MB/s to 30 MB/s) accurately register a 40% drop rather than being smoothed out by the sample itself.
+- **Peak Hour Matrix Historical EWMA Decay (`history.go`)**:
+  - Day-to-day exponential decay (`math.Pow(0.60, days)`) and $\alpha=0.35$ EWMA weighting ensures recent peak data dominates over stale historical records.
+- **True 24-Hour History Retention (`history.go`)**:
+  - Sample capacity expanded from 1,000 to 10,000 samples, pruned by a 24-hour cutoff window anchored to latest sample timestamp.
+- **Stale Route Protection (`history.go`)**:
+  - Routes untested for > 5m (active) or > 15m (others) are marked `is_stale = true` and receive a 50% discount on confidence and final score.
+  - Routes untested for > 60m are excluded from `GetBest()` recommendations.
+
 ## v2.1.0 (2026-09-08)
 
 ### Major Architecture Upgrade: GOWAY Route Quality Probe & Stability Analyzer
