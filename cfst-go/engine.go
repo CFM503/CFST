@@ -254,6 +254,7 @@ func ProcessIntervalSamples(intervals []SpeedIntervalSample, totalBytes int64, t
 	maxSpd := 0.0
 
 	curConsecutiveStalls := 0
+	curConsecutiveStallDur := 0.0
 	for i, it := range intervals {
 		s := it.IntervalSpeed
 		speeds[i] = s
@@ -269,14 +270,15 @@ func ProcessIntervalSamples(intervals []SpeedIntervalSample, totalBytes int64, t
 			sm.ZeroSpeedIntervals++
 			sm.TotalStallDuration += it.DeltaDuration
 			curConsecutiveStalls++
-			curStallDur := float64(curConsecutiveStalls) * it.DeltaDuration
-			if curStallDur > sm.LongestStallDuration {
-				sm.LongestStallDuration = curStallDur
+			curConsecutiveStallDur += it.DeltaDuration
+			if curConsecutiveStallDur > sm.LongestStallDuration {
+				sm.LongestStallDuration = curConsecutiveStallDur
 			}
 		} else {
 			if curConsecutiveStalls > 0 {
 				sm.StallCount++
 				curConsecutiveStalls = 0
+				curConsecutiveStallDur = 0.0
 			}
 		}
 	}

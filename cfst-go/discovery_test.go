@@ -222,3 +222,223 @@ func TestDiscoveryStatusAPI(t *testing.T) {
 		t.Fatalf("expected existing_routes 19, got %d", status.ExistingRoutes)
 	}
 }
+
+func TestDiscoveryRunOnceAddsCandidate(t *testing.T) {
+	store := NewRouteStore()
+	cfg := DefaultProbeConfig()
+	sched := NewProbeScheduler(store, cfg)
+	dm := NewDiscoveryManager(store, sched)
+
+	newIP := "198.51.100.99"
+	dm.scanFunc = func(ctx context.Context, ips []string, port int, concurrent int, profile ProbeProfile, progress func(done, total, valid int)) ([]NodeResult, int, int) {
+		return []NodeResult{
+			{
+				IP:         newIP,
+				Port:       443,
+				TCPLatency: 25.0,
+				PacketLoss: 0.0,
+				Jitter:     1.0,
+				Colo:       "SJC",
+			},
+		}, 1, 1
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	status, err := dm.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunOnce failed: %v", err)
+	}
+
+	if status.NewCandidates != 1 {
+		t.Fatalf("expected 1 new candidate, got %d", status.NewCandidates)
+	}
+
+	rec, exists := store.Get(newIP)
+	if !exists {
+		t.Fatalf("expected newly discovered route in store")
+	}
+	if rec.Metrics.Tier != TierCandidate {
+		t.Fatalf("expected discovered route to be TierCandidate, got %s", rec.Metrics.Tier)
+	}
+	if rec.Metrics.Colo != "SJC" {
+		t.Fatalf("expected Colo SJC, got %s", rec.Metrics.Colo)
+	}
+}
+
+func TestDiscoveryRunOncePreservesHistory(t *testing.T) {
+	store := NewRouteStore()
+	cfg := DefaultProbeConfig()
+	sched := NewProbeScheduler(store, cfg)
+	dm := NewDiscoveryManager(store, sched)
+
+	existingIP := "198.51.100.88"
+	store.UpsertRoute(RouteMetrics{
+		IP:         existingIP,
+		Port:       443,
+		Tier:       TierStandby,
+		Health:     HealthHealthy,
+		FinalScore: 85.0,
+		P10Speed:   35.0,
+		LastTested: time.Now().Add(-5 * time.Minute),
+	})
+
+	rec, _ := store.Get(existingIP)
+	for i := 0; i < 20; i++ {
+		rec.AddSample(MeasurementSample{
+			Timestamp: time.Now().Add(-time.Duration(20-i) * time.Minute),
+			Speed:     40.0,
+			P10Speed:  35.0,
+			RTT:       28.0,
+			Stability: 90.0,
+			Success:   true,
+		})
+	}
+	rec.Metrics.FinalScore = 85.0
+
+	// Scanner discovers existing IP with newly resolved Colo "HKG"
+	dm.scanFunc = func(ctx context.Context, ips []string, port int, concurrent int, profile ProbeProfile, progress func(done, total, valid int)) ([]NodeResult, int, int) {
+		return []NodeResult{
+			{
+				IP:         existingIP,
+				Port:       443,
+				TCPLatency: 26.0,
+				Colo:       "HKG",
+			},
+		}, 1, 1
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	status, err := dm.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunOnce failed: %v", err)
+	}
+
+	if status.ExistingRoutes != 1 {
+		t.Fatalf("expected 1 existing route, got %d", status.ExistingRoutes)
+	}
+
+	afterRec, exists := store.Get(existingIP)
+	if !exists {
+		t.Fatalf("expected route in store")
+	}
+	if len(afterRec.Samples) != 20 {
+		t.Fatalf("samples must remain 20, got %d", len(afterRec.Samples))
+	}
+	if afterRec.Metrics.Tier != TierStandby {
+		t.Fatalf("tier must remain TierStandby, got %s", afterRec.Metrics.Tier)
+	}
+	if afterRec.Metrics.FinalScore != 85.0 {
+		t.Fatalf("final score must remain 85.0, got %.1f", afterRec.Metrics.FinalScore)
+	}
+	if afterRec.Metrics.Colo != "HKG" {
+		t.Fatalf("expected Colo to be updated to HKG via UpdateRouteColo, got %s", afterRec.Metrics.Colo)
+	}
+}
+
+func TestDiscoveryImmediateStartup(t *testing.T) {
+	store := NewRouteStore()
+	cfg := DefaultProbeConfig()
+	sched := NewProbeScheduler(store, cfg)
+	dm := NewDiscoveryManager(store, sched)
+
+	var runCalled atomic.Bool
+	dm.scanFunc = func(ctx context.Context, ips []string, port int, concurrent int, profile ProbeProfile, progress func(done, total, valid int)) ([]NodeResult, int, int) {
+		runCalled.Store(true)
+		return nil, 0, 0
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	dm.Start(ctx)
+	defer dm.Stop()
+
+	// Wait up to 1 second for the immediate startup discovery pass to fire
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		if runCalled.Load() {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if !runCalled.Load() {
+		t.Fatalf("expected discovery to run immediately upon Start() without waiting for ticker")
+	}
+}
+
+func TestDiscoveryNoOverlappingRuns(t *testing.T) {
+	store := NewRouteStore()
+	cfg := DefaultProbeConfig()
+	sched := NewProbeScheduler(store, cfg)
+	dm := NewDiscoveryManager(store, sched)
+
+	inScan := make(chan struct{})
+	finishScan := make(chan struct{})
+
+	dm.scanFunc = func(ctx context.Context, ips []string, port int, concurrent int, profile ProbeProfile, progress func(done, total, valid int)) ([]NodeResult, int, int) {
+		close(inScan)
+		<-finishScan
+		return nil, 0, 0
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// Run 1 begins
+	go func() {
+		_, _ = dm.RunOnce(ctx)
+	}()
+
+	<-inScan
+
+	// Run 2 attempts while Run 1 is in progress
+	_, err := dm.RunOnce(ctx)
+	if err == nil || !strings.Contains(err.Error(), "already in progress") {
+		t.Fatalf("expected 'already in progress' error for overlapping RunOnce, got %v", err)
+	}
+
+	close(finishScan)
+}
+
+func TestDiscoveryManagerRestart(t *testing.T) {
+	store := NewRouteStore()
+	cfg := DefaultProbeConfig()
+	sched := NewProbeScheduler(store, cfg)
+	dm := NewDiscoveryManager(store, sched)
+
+	dm.scanFunc = func(ctx context.Context, ips []string, port int, concurrent int, profile ProbeProfile, progress func(done, total, valid int)) ([]NodeResult, int, int) {
+		return nil, 0, 0
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 1. Start
+	dm.Start(ctx)
+	if !dm.running.Load() {
+		t.Fatalf("expected discovery manager to be running after Start()")
+	}
+
+	// 2. Stop
+	dm.Stop()
+	if dm.running.Load() {
+		t.Fatalf("expected discovery manager to be stopped after Stop()")
+	}
+
+	// 3. Restart cleanly
+	dm.Start(ctx)
+	if !dm.running.Load() {
+		t.Fatalf("expected discovery manager to be running after second Start()")
+	}
+
+	// Final stop
+	dm.Stop()
+	if dm.running.Load() {
+		t.Fatalf("expected discovery manager to be stopped after final Stop()")
+	}
+}

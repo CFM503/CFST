@@ -1,5 +1,32 @@
 # Changelog
 
+## v2.1.5 (2026-09-08)
+
+### Release: Harden Candidate Discovery and Probe Lifecycle
+- **Fix Candidate L3 metrics propagation (`probe.go`, `score.go`)**:
+  - `ExecuteLayeredProbeWithSnapshot()` properly maps L3 lightweight HTTP probe results (`Speed`, `Colo`, `TTFB`) to `LayeredProbeResult` (`SingleSpeed`, `DownloadSpeed`, `Colo`, `LoadLatency`).
+  - `ProbeOnce()` updates `RouteMetrics` with L3 probe speeds while preserving existing historical statistics without fabricating false P10/stability metrics.
+  - `ScoreEngine` naturally evaluates routes based on observed L3 speed and derives stability from L1 latency/jitter/loss consistency when L4 interval samples are absent, allowing valid candidates to progress to Standby.
+- **Fix Discovery RouteStore synchronization (`history.go`, `discovery.go`)**:
+  - Replaced direct pointer field mutations on `rec.Metrics.Colo` outside mutex locks with `RouteStore.UpdateRouteColo(ip, colo)` executing under synchronized `store.mu.Lock()`.
+- **Immediate startup discovery (`discovery.go`)**:
+  - `DiscoveryManager.Start()` triggers an immediate low-bandwidth discovery pass asynchronously on startup in a background goroutine, ensuring fresh IP discovery without waiting for the 60-minute ticker.
+- **True concurrent in-flight probe test (`probe_test.go`)**:
+  - Added `TestProbeInFlightConcurrentRace` testing multiple goroutines competing simultaneously via `startCh` and proving that `inFlight.LoadOrStore` guarantees exactly one probe execution per IP.
+- **Candidate promotion integration tests (`probe_test.go`, `discovery_test.go`)**:
+  - Added `TestCandidateL3ObservationAndPromotion` testing genuine Candidate progression (L1 -> L2 -> L3 -> `RecordProbeResult` -> `EWMA` -> `Score` -> `ObservationDuration` -> `EvaluateTierTransitions` -> `Standby`) without hardcoded scores.
+  - Added `TestCandidateL3Observation`, `TestDiscoveryRunOnceAddsCandidate`, and `TestDiscoveryRunOncePreservesHistory`.
+- **Discovery overlap protection (`discovery.go`, `discovery_test.go`)**:
+  - Added atomic CAS `inProgress` guard on `DiscoveryManager.RunOnce()` preventing concurrent overlapping discovery passes.
+  - Added unit test `TestDiscoveryNoOverlappingRuns`.
+- **Stall duration calculation fix (`engine.go`, `history.go`, `engine_test.go`)**:
+  - Updated `ProcessIntervalSamples` to accumulate actual `it.DeltaDuration` across consecutive stall intervals rather than multiplying count by current delta.
+  - Added `TestLongestStallDurationVariableIntervals` validating variable stall interval accumulation.
+  - Made stall rate denominator in `AddSample` use `sample.DurationSeconds` (with 10.0s legacy fallback).
+- **Scheduler/Discovery restart safety (`probe.go`, `discovery.go`)**:
+  - Re-initialized `stopCh` on `Start()` under lock in both `ProbeScheduler` and `DiscoveryManager`, allowing safe `Start -> Stop -> Start` lifecycles.
+  - Added `TestProbeSchedulerRestart` and `TestDiscoveryManagerRestart`.
+
 ## v2.1.4 (2026-09-08)
 
 ### Feature: Continuous Discovery, In-Flight De-duplication & Candidate Promotion

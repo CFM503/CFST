@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -453,5 +455,207 @@ func TestLongTermDemotion(t *testing.T) {
 	_, exists := store.Get(activeIP)
 	if exists {
 		t.Fatalf("expected long-term failed route to be pruned from RouteStore")
+	}
+}
+
+func TestProbeInFlightConcurrentRace(t *testing.T) {
+	store := NewRouteStore()
+	cfg := DefaultProbeConfig()
+	scheduler := NewProbeScheduler(store, cfg)
+
+	testIP := "198.51.100.2"
+	store.UpsertRoute(RouteMetrics{
+		IP:     testIP,
+		Port:   443,
+		Tier:   TierActive,
+		Health: HealthHealthy,
+	})
+
+	var executionCount atomic.Int32
+	scheduler.probeExec = func(ctx context.Context, target ResolvedProbeTarget, cfg ProbeConfig, runL3 bool, runFullSpeed bool) LayeredProbeResult {
+		executionCount.Add(1)
+		time.Sleep(50 * time.Millisecond) // hold in-flight state
+		return LayeredProbeResult{
+			Success:          true,
+			RTT:              20.0,
+			HandshakeSuccess: true,
+			SingleSpeed:      10.0,
+			Colo:             "SJC",
+		}
+	}
+
+	const goroutines = 10
+	var wg sync.WaitGroup
+	startCh := make(chan struct{})
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-startCh
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_, _ = scheduler.ProbeOnce(ctx, testIP, false)
+		}()
+	}
+
+	// Release all goroutines simultaneously
+	close(startCh)
+	wg.Wait()
+
+	// Exactly 1 goroutine must have won the race and executed probeExec
+	if count := executionCount.Load(); count != 1 {
+		t.Fatalf("expected exactly 1 probe execution during concurrent race, got %d", count)
+	}
+
+	// After completion, inFlight must be clean
+	if _, loaded := scheduler.inFlight.Load(testIP); loaded {
+		t.Fatalf("expected inFlight to be cleaned up after all goroutines finish")
+	}
+}
+
+func TestCandidateL3Observation(t *testing.T) {
+	store := NewRouteStore()
+	cfg := DefaultProbeConfig()
+	scheduler := NewProbeScheduler(store, cfg)
+
+	candidateIP := "104.16.2.2"
+	store.UpsertRoute(RouteMetrics{
+		IP:     candidateIP,
+		Port:   443,
+		Tier:   TierCandidate,
+		Health: HealthHealthy,
+	})
+
+	scheduler.probeExec = func(ctx context.Context, target ResolvedProbeTarget, cfg ProbeConfig, runL3 bool, runFullSpeed bool) LayeredProbeResult {
+		return LayeredProbeResult{
+			Success:          true,
+			RTT:              22.0,
+			PacketLoss:       0.0,
+			Jitter:           1.2,
+			HandshakeSuccess: true,
+			SingleSpeed:      18.5,
+			DownloadSpeed:    18.5,
+			Colo:             "HKG",
+			LoadLatency:      45.0,
+			L3Executed:       true,
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	m, err := scheduler.ProbeOnce(ctx, candidateIP, false)
+	if err != nil {
+		t.Fatalf("ProbeOnce failed: %v", err)
+	}
+
+	if m.SingleSpeed != 18.5 {
+		t.Fatalf("expected SingleSpeed 18.5, got %.2f", m.SingleSpeed)
+	}
+	if m.DownloadSpeed != 18.5 {
+		t.Fatalf("expected DownloadSpeed 18.5, got %.2f", m.DownloadSpeed)
+	}
+	if m.Colo != "HKG" {
+		t.Fatalf("expected Colo HKG, got %s", m.Colo)
+	}
+
+	rec, exists := store.Get(candidateIP)
+	if !exists {
+		t.Fatalf("expected route in store")
+	}
+	if len(rec.Samples) != 1 {
+		t.Fatalf("expected 1 sample in history, got %d", len(rec.Samples))
+	}
+	if rec.Samples[0].Speed != 18.5 {
+		t.Fatalf("expected sample speed 18.5, got %.2f", rec.Samples[0].Speed)
+	}
+}
+
+func TestCandidateL3ObservationAndPromotion(t *testing.T) {
+	store := NewRouteStore()
+	cfg := DefaultProbeConfig()
+	scheduler := NewProbeScheduler(store, cfg)
+
+	candidateIP := "104.16.3.3"
+	store.UpsertRoute(RouteMetrics{
+		IP:     candidateIP,
+		Port:   443,
+		Tier:   TierCandidate,
+		Health: HealthHealthy,
+	})
+
+	baseTime := time.Now().Add(-6 * time.Minute)
+
+	// Simulate 4 successive L3 probe cycles over 6 minutes (> 300s observation duration)
+	for i := 0; i < 4; i++ {
+		probeTime := baseTime.Add(time.Duration(i*100) * time.Second)
+		scheduler.probeExec = func(ctx context.Context, target ResolvedProbeTarget, cfg ProbeConfig, runL3 bool, runFullSpeed bool) LayeredProbeResult {
+			return LayeredProbeResult{
+				Success:          true,
+				RTT:              25.0,
+				PacketLoss:       0.0,
+				Jitter:           1.5,
+				HandshakeSuccess: true,
+				SingleSpeed:      22.0,
+				DownloadSpeed:    22.0,
+				Colo:             "HKG",
+				L3Executed:       true,
+			}
+		}
+
+		rec, _ := store.Get(candidateIP)
+		rec.Metrics.LastTested = probeTime
+
+		m := rec.Metrics
+		m.LastTested = probeTime
+		m.SingleSpeed = 22.0
+		m.DownloadSpeed = 22.0
+		m.RTT = 25.0
+		m.PacketLoss = 0.0
+		m.Jitter = 1.5
+		m.HandshakeSuccess = true
+		m.Colo = "HKG"
+
+		store.RecordProbeResult(m, true)
+	}
+
+	rec, _ := store.Get(candidateIP)
+	if rec.Metrics.Tier != TierStandby {
+		t.Fatalf("expected Candidate to promote to Standby based on real L3 observations, got tier %s (Score=%.1f, Confidence=%.1f, Obs=%.1f, Samples=%d)",
+			rec.Metrics.Tier, rec.Metrics.FinalScore, rec.Metrics.Confidence, rec.Metrics.ObservationDuration, len(rec.Samples))
+	}
+}
+
+func TestProbeSchedulerRestart(t *testing.T) {
+	store := NewRouteStore()
+	cfg := DefaultProbeConfig()
+	scheduler := NewProbeScheduler(store, cfg)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 1. Start scheduler
+	scheduler.Start(ctx)
+	if !scheduler.running.Load() {
+		t.Fatalf("expected scheduler to be running after Start()")
+	}
+
+	// 2. Stop scheduler
+	scheduler.Stop()
+	if scheduler.running.Load() {
+		t.Fatalf("expected scheduler to be stopped after Stop()")
+	}
+
+	// 3. Restart scheduler cleanly without panic or immediate exit
+	scheduler.Start(ctx)
+	if !scheduler.running.Load() {
+		t.Fatalf("expected scheduler to be running after second Start()")
+	}
+
+	// Final stop
+	scheduler.Stop()
+	if scheduler.running.Load() {
+		t.Fatalf("expected scheduler to be stopped after final Stop()")
 	}
 }

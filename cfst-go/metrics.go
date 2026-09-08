@@ -58,9 +58,9 @@ type RouteMetrics struct {
 	StabilityGrade        StabilityGrade      `json:"stability_grade"`
 	Recommendation        RouteRecommendation `json:"recommendation"`
 	RecommendationReasons []string            `json:"recommendation_reasons"`
-	RTT                   float64             `json:"rtt"`         // ms (TCPLatency)
-	PacketLoss            float64             `json:"packet_loss"` // 0.0 - 1.0 (0% - 100%)
-	Jitter                float64             `json:"jitter"`      // ms
+	RTT                   float64             `json:"rtt"`            // ms (TCPLatency)
+	PacketLoss            float64             `json:"packet_loss"`    // 0.0 - 1.0 (0% - 100%)
+	Jitter                float64             `json:"jitter"`         // ms
 	DownloadSpeed         float64             `json:"download_speed"` // MB/s
 	SingleSpeed           float64             `json:"single_speed"`   // MB/s
 	P10Speed              float64             `json:"p10_speed"`      // MB/s
@@ -70,7 +70,7 @@ type RouteMetrics struct {
 	MaxSpeed              float64             `json:"max_speed"`      // MB/s
 	StdDev                float64             `json:"std_dev"`
 	CV                    float64             `json:"cv"`
-	Stability             float64             `json:"stability"` // 0.0 - 100.0 (Composite stability)
+	Stability             float64             `json:"stability"`    // 0.0 - 100.0 (Composite stability)
 	LoadLatency           float64             `json:"load_latency"` // ms
 	HandshakeSuccess      bool                `json:"handshake_success"`
 	ZeroSpeedIntervals    int                 `json:"zero_speed_intervals"`
@@ -78,6 +78,7 @@ type RouteMetrics struct {
 	TotalStallDuration    float64             `json:"total_stall_duration"`
 	LongestStallDuration  float64             `json:"longest_stall_duration"`
 	StallRate             float64             `json:"stall_rate"`
+	DurationSeconds       float64             `json:"duration_seconds,omitempty"`
 	BaselineP10           float64             `json:"baseline_p10"`
 	SpeedDropPercent      float64             `json:"speed_drop_percent"`
 	Confidence            float64             `json:"confidence"` // 0.0 - 100.0
@@ -317,35 +318,35 @@ func FromNodeResult(n NodeResult, tier RouteTier) *RouteMetrics {
 	}
 
 	rm := &RouteMetrics{
-		ID:                  GenerateRouteID(n.IP, n.Port),
-		IP:                  n.IP,
-		Port:                n.Port,
-		Colo:                n.Colo,
-		Tier:                tier,
-		Health:              HealthHealthy,
-		StabilityGrade:      GradeStable,
-		Recommendation:      RecGood,
-		RTT:                 n.TCPLatency,
-		PacketLoss:          n.PacketLoss,
-		Jitter:              n.Jitter,
-		DownloadSpeed:       n.DownloadSpeed,
-		SingleSpeed:         n.SingleSpeed,
-		P10Speed:            p10,
-		MedianSpeed:         median,
-		MinSpeed:            n.MinSpeed,
-		Stability:           n.Stability,
-		LoadLatency:         n.LoadLatency,
-		HandshakeSuccess:    n.Colo != "ERR" && n.Colo != "429" && n.TCPLatency > 0,
-		StallCount:          n.StallCount,
-		ZeroSpeedIntervals:  n.ZeroSpeedIntervals,
-		Confidence:          50.0,
-		InstantScore:        n.Score,
-		ShortTermScore:      n.Score,
-		LongTermScore:       n.Score,
-		FinalScore:          n.Score,
-		ConsecutiveSuccess:  1,
-		LastTested:          now,
-		Timestamp:           now,
+		ID:                 GenerateRouteID(n.IP, n.Port),
+		IP:                 n.IP,
+		Port:               n.Port,
+		Colo:               n.Colo,
+		Tier:               tier,
+		Health:             HealthHealthy,
+		StabilityGrade:     GradeStable,
+		Recommendation:     RecGood,
+		RTT:                n.TCPLatency,
+		PacketLoss:         n.PacketLoss,
+		Jitter:             n.Jitter,
+		DownloadSpeed:      n.DownloadSpeed,
+		SingleSpeed:        n.SingleSpeed,
+		P10Speed:           p10,
+		MedianSpeed:        median,
+		MinSpeed:           n.MinSpeed,
+		Stability:          n.Stability,
+		LoadLatency:        n.LoadLatency,
+		HandshakeSuccess:   n.Colo != "ERR" && n.Colo != "429" && n.TCPLatency > 0,
+		StallCount:         n.StallCount,
+		ZeroSpeedIntervals: n.ZeroSpeedIntervals,
+		Confidence:         50.0,
+		InstantScore:       n.Score,
+		ShortTermScore:     n.Score,
+		LongTermScore:      n.Score,
+		FinalScore:         n.Score,
+		ConsecutiveSuccess: 1,
+		LastTested:         now,
+		Timestamp:          now,
 	}
 	rm.StabilityGrade = rm.DetermineStabilityGrade()
 	rec, reasons := rm.GenerateRecommendation()

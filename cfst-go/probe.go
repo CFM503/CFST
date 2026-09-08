@@ -358,6 +358,7 @@ type LayeredProbeResult struct {
 	Jitter               float64
 	HandshakeSuccess     bool
 	SingleSpeed          float64
+	DownloadSpeed        float64
 	MinSpeed             float64
 	P10Speed             float64
 	MedianSpeed          float64
@@ -387,6 +388,7 @@ type ProbeScheduler struct {
 	running      atomic.Bool
 	stopCh       chan struct{}
 	probeTrigger chan string
+	probeExec    func(ctx context.Context, target ResolvedProbeTarget, cfg ProbeConfig, runL3 bool, runFullSpeed bool) LayeredProbeResult
 }
 
 var GlobalProbeScheduler = NewProbeScheduler(GlobalRouteStore, DefaultProbeConfig())
@@ -543,8 +545,13 @@ func (ps *ProbeScheduler) ExecuteLayeredProbeWithSnapshot(ctx context.Context, t
 			res.Error = "L3 HTTP probe failed: " + l3Res.Error
 			return res
 		}
+		res.SingleSpeed = l3Res.Speed
+		res.DownloadSpeed = l3Res.Speed
 		if l3Res.Colo != "" {
 			res.Colo = l3Res.Colo
+		}
+		if l3Res.TTFB > 0 {
+			res.LoadLatency = l3Res.TTFB
 		}
 		res.L3Executed = true
 	}
@@ -569,6 +576,7 @@ func (ps *ProbeScheduler) ExecuteLayeredProbeWithSnapshot(ctx context.Context, t
 
 		sm := SingleStreamTestDetailed(ctx, target, duration, nil, res.RTT, res.Jitter, res.PacketLoss)
 		res.SingleSpeed = sm.AverageSpeed
+		res.DownloadSpeed = sm.AverageSpeed
 		res.MinSpeed = sm.MinSpeed
 		res.P10Speed = sm.P10Speed
 		res.MedianSpeed = sm.MedianSpeed
@@ -657,7 +665,7 @@ func (ps *ProbeScheduler) ProbeOnce(ctx context.Context, ip string, forceSpeed b
 		case TierActive:
 			// Active route: L1/L2 every cycle (10s)
 			// L3 lightweight 100KB check every L3ProbeCycle (default 3 cycles = ~30s)
-			if cycle%int64(l3Cycle) == 0 {
+			if cycle == 1 || cycle%int64(l3Cycle) == 0 {
 				runL3 = true
 			}
 			// L4 full speed calibration only every FullSpeedCycle (default 60 cycles = ~10m)
@@ -666,7 +674,7 @@ func (ps *ProbeScheduler) ProbeOnce(ctx context.Context, ip string, forceSpeed b
 			}
 		case TierStandby:
 			// Standby route: lower frequency
-			if cycle%int64(l3Cycle*2) == 0 {
+			if cycle == 1 || cycle%int64(l3Cycle*2) == 0 {
 				runL3 = true
 			}
 			if cycle%int64(fullCycle*2) == 0 {
@@ -674,7 +682,7 @@ func (ps *ProbeScheduler) ProbeOnce(ctx context.Context, ip string, forceSpeed b
 			}
 		case TierCandidate:
 			// Candidate: low frequency
-			if cycle%int64(l3Cycle*4) == 0 {
+			if cycle == 1 || cycle%int64(l3Cycle*4) == 0 {
 				runL3 = true
 			}
 			runFullSpeed = false
@@ -686,7 +694,23 @@ func (ps *ProbeScheduler) ProbeOnce(ctx context.Context, ip string, forceSpeed b
 	}
 
 	target := ResolveProbeTarget(cfg, ip, port)
-	result := ps.ExecuteLayeredProbeWithSnapshot(ctx, target, cfg, runL3, runFullSpeed)
+	var result LayeredProbeResult
+	if ps.probeExec != nil {
+		result = ps.probeExec(ctx, target, cfg, runL3, runFullSpeed)
+	} else {
+		result = ps.ExecuteLayeredProbeWithSnapshot(ctx, target, cfg, runL3, runFullSpeed)
+	}
+
+	durationSec := 0.0
+	if runFullSpeed {
+		d := cfg.FullDuration
+		if d < 2 {
+			d = 5
+		}
+		durationSec = float64(d)
+	} else if runL3 {
+		durationSec = 1.0
+	}
 
 	now := time.Now()
 	m := RouteMetrics{
@@ -711,6 +735,7 @@ func (ps *ProbeScheduler) ProbeOnce(ctx context.Context, ip string, forceSpeed b
 		TotalStallDuration:   result.TotalStallDuration,
 		LongestStallDuration: result.LongestStallDuration,
 		StallRate:            result.StallRate,
+		DurationSeconds:      durationSec,
 		LoadLatency:          result.LoadLatency,
 		LastTested:           now,
 		Timestamp:            now,
@@ -726,21 +751,43 @@ func (ps *ProbeScheduler) ProbeOnce(ctx context.Context, ip string, forceSpeed b
 		m.ConsecutiveSuccess = rec.Metrics.ConsecutiveSuccess
 		m.ConsecutiveDegraded = rec.Metrics.ConsecutiveDegraded
 		m.Health = rec.Metrics.Health
-		// If full speed test wasn't run on this cycle, inherit previous speeds
+		// If full speed test wasn't run on this cycle, handle speeds
 		if !runFullSpeed {
-			m.DownloadSpeed = rec.Metrics.DownloadSpeed
-			m.SingleSpeed = rec.Metrics.SingleSpeed
-			m.P10Speed = rec.Metrics.P10Speed
-			m.MedianSpeed = rec.Metrics.MedianSpeed
-			m.MinSpeed = rec.Metrics.MinSpeed
-			m.Stability = rec.Metrics.Stability
-			m.CV = rec.Metrics.CV
-			m.StallCount = rec.Metrics.StallCount
-			m.ZeroSpeedIntervals = rec.Metrics.ZeroSpeedIntervals
-			m.TotalStallDuration = rec.Metrics.TotalStallDuration
-			m.LongestStallDuration = rec.Metrics.LongestStallDuration
-			m.StallRate = rec.Metrics.StallRate
-			m.LoadLatency = rec.Metrics.LoadLatency
+			if runL3 {
+				// L3 updated single speed / download speed from real lightweight HTTP probe
+				m.DownloadSpeed = result.SingleSpeed
+				m.SingleSpeed = result.SingleSpeed
+				if result.LoadLatency > 0 {
+					m.LoadLatency = result.LoadLatency
+				} else {
+					m.LoadLatency = rec.Metrics.LoadLatency
+				}
+				// Preserve existing P10/Median/Min/Stability/CV/Stall from previous history
+				m.P10Speed = rec.Metrics.P10Speed
+				m.MedianSpeed = rec.Metrics.MedianSpeed
+				m.MinSpeed = rec.Metrics.MinSpeed
+				m.Stability = rec.Metrics.Stability
+				m.CV = rec.Metrics.CV
+				m.StallCount = rec.Metrics.StallCount
+				m.ZeroSpeedIntervals = rec.Metrics.ZeroSpeedIntervals
+				m.TotalStallDuration = rec.Metrics.TotalStallDuration
+				m.LongestStallDuration = rec.Metrics.LongestStallDuration
+				m.StallRate = rec.Metrics.StallRate
+			} else {
+				m.DownloadSpeed = rec.Metrics.DownloadSpeed
+				m.SingleSpeed = rec.Metrics.SingleSpeed
+				m.P10Speed = rec.Metrics.P10Speed
+				m.MedianSpeed = rec.Metrics.MedianSpeed
+				m.MinSpeed = rec.Metrics.MinSpeed
+				m.Stability = rec.Metrics.Stability
+				m.CV = rec.Metrics.CV
+				m.StallCount = rec.Metrics.StallCount
+				m.ZeroSpeedIntervals = rec.Metrics.ZeroSpeedIntervals
+				m.TotalStallDuration = rec.Metrics.TotalStallDuration
+				m.LongestStallDuration = rec.Metrics.LongestStallDuration
+				m.StallRate = rec.Metrics.StallRate
+				m.LoadLatency = rec.Metrics.LoadLatency
+			}
 		}
 	}
 
@@ -754,9 +801,13 @@ func (ps *ProbeScheduler) ProbeOnce(ctx context.Context, ip string, forceSpeed b
 
 // Start launches the background probing daemon.
 func (ps *ProbeScheduler) Start(ctx context.Context) {
+	ps.mu.Lock()
 	if ps.running.Swap(true) {
+		ps.mu.Unlock()
 		return // already running
 	}
+	ps.stopCh = make(chan struct{})
+	ps.mu.Unlock()
 
 	go func() {
 		ticker := time.NewTicker(2 * time.Second)
@@ -783,6 +834,8 @@ func (ps *ProbeScheduler) Start(ctx context.Context) {
 
 // Stop cleanly terminates the probe scheduler.
 func (ps *ProbeScheduler) Stop() {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
 	if ps.running.Swap(false) {
 		close(ps.stopCh)
 	}

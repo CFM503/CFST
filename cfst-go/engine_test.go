@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 import (
 	"testing"
@@ -74,5 +74,30 @@ func TestProcessIntervalSamplesExtremeDipAndStability(t *testing.T) {
 	}
 	if smSolid.MinSpeed != 54.0 {
 		t.Fatalf("Solid route min speed must be 54.0, got %.2f", smSolid.MinSpeed)
+	}
+}
+
+func TestLongestStallDurationVariableIntervals(t *testing.T) {
+	// interval 1 = 1s stall
+	// interval 2 = 2s stall
+	// interval 3 = 1.5s stall
+	// total consecutive stall = 4.5s
+	intervals := []SpeedIntervalSample{
+		{DeltaBytes: 10 * 1024 * 1024, DeltaDuration: 1.0, IntervalSpeed: 10.0, IsStall: false},
+		{DeltaBytes: 0, DeltaDuration: 1.0, IntervalSpeed: 0.0, IsStall: true},
+		{DeltaBytes: 0, DeltaDuration: 2.0, IntervalSpeed: 0.0, IsStall: true},
+		{DeltaBytes: 0, DeltaDuration: 1.5, IntervalSpeed: 0.0, IsStall: true},
+		{DeltaBytes: 15 * 1024 * 1024, DeltaDuration: 1.0, IntervalSpeed: 15.0, IsStall: false},
+	}
+	sm := ProcessIntervalSamples(intervals, int64(25*1024*1024), 6.5, 30.0, 1.0, 0.0)
+
+	if sm.LongestStallDuration != 4.5 {
+		t.Fatalf("expected LongestStallDuration=4.5s, got %.2f", sm.LongestStallDuration)
+	}
+	if sm.TotalStallDuration != 4.5 {
+		t.Fatalf("expected TotalStallDuration=4.5s, got %.2f", sm.TotalStallDuration)
+	}
+	if sm.StallCount != 1 {
+		t.Fatalf("expected StallCount=1, got %d", sm.StallCount)
 	}
 }

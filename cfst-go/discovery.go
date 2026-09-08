@@ -24,12 +24,14 @@ type DiscoveryStatus struct {
 
 // DiscoveryManager orchestrates periodic background discovery of Cloudflare edge IPs.
 type DiscoveryManager struct {
-	mu      sync.RWMutex
-	status  DiscoveryStatus
-	store   *RouteStore
-	sched   *ProbeScheduler
-	running atomic.Bool
-	stopCh  chan struct{}
+	mu         sync.RWMutex
+	status     DiscoveryStatus
+	store      *RouteStore
+	sched      *ProbeScheduler
+	running    atomic.Bool
+	inProgress atomic.Bool
+	stopCh     chan struct{}
+	scanFunc   func(ctx context.Context, ips []string, port int, concurrent int, profile ProbeProfile, progress func(done, total, valid int)) ([]NodeResult, int, int)
 }
 
 var GlobalDiscoveryManager = NewDiscoveryManager(GlobalRouteStore, GlobalProbeScheduler)
@@ -59,10 +61,23 @@ func (dm *DiscoveryManager) GetStatus() DiscoveryStatus {
 
 // Start launches the continuous background discovery worker.
 func (dm *DiscoveryManager) Start(ctx context.Context) {
+	dm.mu.Lock()
 	if dm.running.Swap(true) {
+		dm.mu.Unlock()
 		return // already running
 	}
+	dm.stopCh = make(chan struct{})
+	dm.mu.Unlock()
 
+	// 1. Trigger immediate initial discovery pass asynchronously on startup
+	go func() {
+		cfg := dm.sched.GetConfig()
+		if cfg.DiscoveryEnabled {
+			_, _ = dm.RunOnce(ctx)
+		}
+	}()
+
+	// 2. Periodic background discovery loop
 	go func() {
 		cfg := dm.sched.GetConfig()
 		interval := cfg.DiscoveryInterval
@@ -99,6 +114,8 @@ func (dm *DiscoveryManager) Start(ctx context.Context) {
 
 // Stop cleanly halts the background discovery worker.
 func (dm *DiscoveryManager) Stop() {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
 	if dm.running.Swap(false) {
 		close(dm.stopCh)
 	}
@@ -106,6 +123,11 @@ func (dm *DiscoveryManager) Stop() {
 
 // RunOnce performs a single low-bandwidth discovery pass across Cloudflare IP space.
 func (dm *DiscoveryManager) RunOnce(ctx context.Context) (DiscoveryStatus, error) {
+	if !dm.inProgress.CompareAndSwap(false, true) {
+		return dm.GetStatus(), fmt.Errorf("discovery already in progress")
+	}
+	defer dm.inProgress.Store(false)
+
 	start := time.Now()
 	cfg := dm.sched.GetConfig()
 
@@ -116,7 +138,7 @@ func (dm *DiscoveryManager) RunOnce(ctx context.Context) (DiscoveryStatus, error
 
 	ips := GenerateIPs(scanCount, true, "")
 	if len(ips) == 0 {
-		return dm.GetStatus(), fmt.Errorf("no Cloudflare IPs generated")
+		return dm.GetStatus(), fmt.Errorf("no candidate IPs generated for discovery")
 	}
 
 	fmt.Printf("\n[Discovery]\nScanning %d Cloudflare IPs...\n", len(ips))
@@ -126,18 +148,23 @@ func (dm *DiscoveryManager) RunOnce(ctx context.Context) (DiscoveryStatus, error
 		scanConcurrency = cfg.MaxConcurrent
 	}
 
-	validNodes, tcpValid, httpsValid := ScanRoutesWithProfileDetailed(ctx, ips, cfg.Port, scanConcurrency, cfg.Profile, nil)
+	scanFn := dm.scanFunc
+	if scanFn == nil {
+		scanFn = ScanRoutesWithProfileDetailed
+	}
+
+	validNodes, tcpValid, httpsValid := scanFn(ctx, ips, cfg.Port, scanConcurrency, cfg.Profile, nil)
 
 	newCandidates := 0
 	existingRoutes := 0
 	var bestNewCandidate *RouteMetrics
 
 	for _, node := range validNodes {
-		if rec, exists := dm.store.Get(node.IP); exists {
+		if _, exists := dm.store.Get(node.IP); exists {
 			// Existing route: preserve all historical samples, EWMA, and stability scores
 			existingRoutes++
-			if rec.Metrics.Colo == "" && node.Colo != "" {
-				rec.Metrics.Colo = node.Colo
+			if node.Colo != "" {
+				dm.store.UpdateRouteColo(node.IP, node.Colo)
 			}
 		} else {
 			// New route: strictly enter as TierCandidate

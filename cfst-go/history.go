@@ -23,6 +23,7 @@ type MeasurementSample struct {
 	StallCount         int       `json:"stall_count"`
 	TotalStallDuration float64   `json:"total_stall_duration"`
 	ZeroSpeedIntervals int       `json:"zero_speed_intervals"`
+	DurationSeconds    float64   `json:"duration_seconds,omitempty"`
 	Success            bool      `json:"success"`
 }
 
@@ -146,10 +147,15 @@ func (r *RouteRecord) AddSample(s MeasurementSample) {
 	}
 
 	// 2. Update EWMA
+	sampleDuration := s.DurationSeconds
+	if sampleDuration <= 0 {
+		sampleDuration = 10.0 // legacy snapshot fallback
+	}
+
 	if s.Success {
 		stallRate := 0.0
 		if s.TotalStallDuration > 0 {
-			stallRate = s.TotalStallDuration / 10.0
+			stallRate = s.TotalStallDuration / sampleDuration
 			if stallRate > 1.0 {
 				stallRate = 1.0
 			}
@@ -193,7 +199,7 @@ func (r *RouteRecord) AddSample(s MeasurementSample) {
 			hs.AvgJitter = s.Jitter
 			hs.AvgStability = s.Stability
 			if s.TotalStallDuration > 0 {
-				hs.StallRate = s.TotalStallDuration / 10.0
+				hs.StallRate = s.TotalStallDuration / sampleDuration
 			}
 		} else {
 			hs.AvgSpeed = hs.AvgSpeed*(1-alpha) + s.Speed*alpha
@@ -212,7 +218,7 @@ func (r *RouteRecord) AddSample(s MeasurementSample) {
 			hs.AvgLoss = hs.AvgLoss*(1-alpha) + s.PacketLoss*alpha
 			hs.AvgJitter = hs.AvgJitter*(1-alpha) + s.Jitter*alpha
 			hs.AvgStability = hs.AvgStability*(1-alpha) + s.Stability*alpha
-			sampleStallRate := s.TotalStallDuration / 10.0
+			sampleStallRate := s.TotalStallDuration / sampleDuration
 			hs.StallRate = hs.StallRate*(1-alpha) + sampleStallRate*alpha
 		}
 	}
@@ -502,6 +508,7 @@ func (s *RouteStore) RecordProbeResult(m RouteMetrics, success bool) {
 		StallCount:         m.StallCount,
 		TotalStallDuration: m.TotalStallDuration,
 		ZeroSpeedIntervals: m.ZeroSpeedIntervals,
+		DurationSeconds:    m.DurationSeconds,
 		Success:            success,
 	}
 	if sample.Speed <= 0 {
@@ -612,6 +619,22 @@ func (s *RouteStore) Get(idOrIP string) (*RouteRecord, bool) {
 	defer s.mu.RUnlock()
 	rec, ok := s.routes[idOrIP]
 	return rec, ok
+}
+
+// UpdateRouteColo safely updates the Colo for an existing route under lock if it was previously empty.
+func (s *RouteStore) UpdateRouteColo(ip, colo string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rec, ok := s.routes[ip]
+	if !ok || rec == nil {
+		return false
+	}
+	if rec.Metrics.Colo == "" && colo != "" {
+		rec.Metrics.Colo = colo
+		return true
+	}
+	return false
 }
 
 // getAllLocked returns all unique RouteMetrics without acquiring locks (call while holding mu).
@@ -985,7 +1008,7 @@ func (s *RouteStore) SaveSnapshot(path string) error {
 	s.mu.RUnlock()
 
 	container := SnapshotContainer{
-		Version:   "2.1.4",
+		Version:   "2.1.5",
 		Timestamp: time.Now(),
 		Routes:    uniqueRecords,
 	}

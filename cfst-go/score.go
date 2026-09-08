@@ -241,11 +241,28 @@ func (e *ScoreEngine) EvaluateRoute(m *RouteMetrics, shortEWMA, longEWMA EWMASna
 	}
 	effectiveP10 := m.P10Speed
 	if effectiveP10 <= 0 && effectiveSpeed > 0 {
-		effectiveP10 = m.MinSpeed
+		if m.MinSpeed > 0 {
+			effectiveP10 = m.MinSpeed
+		} else {
+			effectiveP10 = effectiveSpeed
+		}
+	}
+	effectiveMin := m.MinSpeed
+	if effectiveMin <= 0 && effectiveSpeed > 0 {
+		effectiveMin = effectiveP10
+	}
+	effectiveStability := m.Stability
+	if effectiveStability <= 0 && effectiveSpeed > 0 {
+		latCons := 100.0
+		if m.RTT > 0 {
+			latCons = math.Max(0, math.Min(100, 100.0-(m.Jitter/(m.RTT+1.0))*100.0))
+		}
+		lossCons := math.Max(0, math.Min(100, (1.0-m.PacketLoss)*100.0))
+		effectiveStability = 80.0*0.50 + latCons*0.25 + lossCons*0.25
 	}
 
 	// 1. InstantScore from current measurement
-	m.InstantScore = e.calcMetricScore(w, effectiveSpeed, effectiveP10, m.MinSpeed, m.RTT, m.Jitter, m.PacketLoss, m.Stability, m.HandshakeSuccess, m.Colo)
+	m.InstantScore = e.calcMetricScore(w, effectiveSpeed, effectiveP10, effectiveMin, m.RTT, m.Jitter, m.PacketLoss, effectiveStability, m.HandshakeSuccess, m.Colo)
 
 	// 2. ShortTermScore from short-term EWMA (~5-15 min window)
 	shortSpeed := shortEWMA.Speed
@@ -258,9 +275,13 @@ func (e *ScoreEngine) EvaluateRoute(m *RouteMetrics, shortEWMA, longEWMA EWMASna
 	}
 	shortMinSpeed := shortEWMA.MinSpeed
 	if shortMinSpeed <= 0 {
-		shortMinSpeed = m.MinSpeed
+		shortMinSpeed = effectiveMin
 	}
-	m.ShortTermScore = e.calcMetricScore(w, shortSpeed, shortP10, shortMinSpeed, shortEWMA.Latency, shortEWMA.Jitter, shortEWMA.Loss, shortEWMA.Stability, m.HandshakeSuccess, m.Colo)
+	shortStability := shortEWMA.Stability
+	if shortStability <= 0 {
+		shortStability = effectiveStability
+	}
+	m.ShortTermScore = e.calcMetricScore(w, shortSpeed, shortP10, shortMinSpeed, shortEWMA.Latency, shortEWMA.Jitter, shortEWMA.Loss, shortStability, m.HandshakeSuccess, m.Colo)
 
 	// 3. LongTermScore from long-term EWMA (~several hours)
 	longSpeed := longEWMA.Speed
@@ -275,7 +296,11 @@ func (e *ScoreEngine) EvaluateRoute(m *RouteMetrics, shortEWMA, longEWMA EWMASna
 	if longMinSpeed <= 0 {
 		longMinSpeed = shortMinSpeed
 	}
-	rawLongScore := e.calcMetricScore(w, longSpeed, longP10, longMinSpeed, longEWMA.Latency, longEWMA.Jitter, longEWMA.Loss, longEWMA.Stability, m.HandshakeSuccess, m.Colo)
+	longStability := longEWMA.Stability
+	if longStability <= 0 {
+		longStability = shortStability
+	}
+	rawLongScore := e.calcMetricScore(w, longSpeed, longP10, longMinSpeed, longEWMA.Latency, longEWMA.Jitter, longEWMA.Loss, longStability, m.HandshakeSuccess, m.Colo)
 	m.LongTermScore = math.Max(0, rawLongScore-peakHourPenalty)
 
 	// 4. PeakHourScore
