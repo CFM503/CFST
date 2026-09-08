@@ -198,9 +198,15 @@ func (s *wssMockServer) serveConn(rawConn net.Conn) {
 	}
 
 	s.mu.Lock()
-	s.gotHost = host
-	s.gotPath = reqPath
-	s.gotUpgrade = upgrade
+	if upgrade != "" {
+		s.gotUpgrade = upgrade
+		s.gotHost = host
+		s.gotPath = reqPath
+	} else if s.gotUpgrade == "" {
+		s.gotHost = host
+		s.gotPath = reqPath
+		s.gotUpgrade = upgrade
+	}
 	status := s.statusCode
 	body := s.responseBody
 	reqHost := s.requiredHost

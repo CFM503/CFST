@@ -73,6 +73,14 @@ type RouteMetrics struct {
 	Stability             float64             `json:"stability"`    // 0.0 - 100.0 (Composite stability)
 	LoadLatency           float64             `json:"load_latency"` // ms
 	HandshakeSuccess      bool                `json:"handshake_success"`
+	GOWAYWSSCompatible   bool                `json:"goway_wss_compatible"`
+	GOWAYWSSLatency      float64             `json:"goway_wss_latency"`
+	GOWAYWSSErrorStage   string              `json:"goway_wss_error_stage,omitempty"`
+	GOWAYWSSHTTPStatus   int                 `json:"goway_wss_http_status,omitempty"`
+	GOWAYWSSErrorMessage string              `json:"goway_wss_error_message,omitempty"`
+	GOWAYWSSSNISent      string              `json:"goway_wss_sni_sent,omitempty"`
+	GOWAYWSSHostSent     string              `json:"goway_wss_host_sent,omitempty"`
+	GOWAYWSSPathSent     string              `json:"goway_wss_path_sent,omitempty"`
 	ZeroSpeedIntervals    int                 `json:"zero_speed_intervals"`
 	StallCount            int                 `json:"stall_count"`
 	TotalStallDuration    float64             `json:"total_stall_duration"`

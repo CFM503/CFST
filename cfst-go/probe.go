@@ -257,7 +257,9 @@ func NormalizeProbeConfig(cfg *ProbeConfig) {
 func ResolveProbeTarget(cfg ProbeConfig, ip string, port int) ResolvedProbeTarget {
 	NormalizeProbeConfig(&cfg)
 	targetPort := port
-	if targetPort <= 0 {
+	if cfg.Profile.Type == ProfileGOWAYWSS && cfg.Profile.Port > 0 {
+		targetPort = cfg.Profile.Port
+	} else if targetPort <= 0 {
 		targetPort = cfg.Profile.Port
 	}
 	if targetPort <= 0 {
@@ -345,6 +347,14 @@ type LayeredProbeResult struct {
 	PacketLoss           float64
 	Jitter               float64
 	HandshakeSuccess     bool
+	GOWAYWSSCompatible   bool
+	GOWAYWSSLatency      float64
+	GOWAYWSSErrorStage   string
+	GOWAYWSSHTTPStatus   int
+	GOWAYWSSErrorMessage string
+	GOWAYWSSSNISent      string
+	GOWAYWSSHostSent     string
+	GOWAYWSSPathSent     string
 	SingleSpeed          float64
 	DownloadSpeed        float64
 	MinSpeed             float64
@@ -475,6 +485,7 @@ func (ps *ProbeScheduler) ExecuteLayeredProbeWithSnapshot(ctx context.Context, t
 		// ProfileCFST: Standard HTTPS / TLS connectivity check.
 		// NEVER run GOWAY WSS Handshake or request /pyway in CFST mode.
 		ok, _, _, colo, err := HTTPSConnectivityCheck(ctx, target.IP, target.Port, target.SNI, target.Host, target.URL, 3*time.Second)
+		res.GOWAYWSSCompatible = false
 		if !ok {
 			res.HandshakeSuccess = false
 			if err != nil {
@@ -492,6 +503,14 @@ func (ps *ProbeScheduler) ExecuteLayeredProbeWithSnapshot(ctx context.Context, t
 	case ProfileGOWAYWSS:
 		// ProfileGOWAYWSS: GOWAY WSS Handshake with configurable Host, SNI, and Path from Profile.
 		wssRes := WSSHandshakeCheckDetailed(target.IP, target.Port, target.SNI, target.Host, target.Path, 3*time.Second)
+		res.GOWAYWSSCompatible = wssRes.Success
+		res.GOWAYWSSLatency = wssRes.Latency
+		res.GOWAYWSSErrorStage = wssRes.ErrorStage
+		res.GOWAYWSSHTTPStatus = wssRes.HTTPStatus
+		res.GOWAYWSSErrorMessage = wssRes.ErrorMessage
+		res.GOWAYWSSSNISent = wssRes.SNISent
+		res.GOWAYWSSHostSent = wssRes.HostSent
+		res.GOWAYWSSPathSent = wssRes.PathSent
 		if !wssRes.Success {
 			res.HandshakeSuccess = false
 			res.Error = fmt.Sprintf("GOWAY WSS handshake failed (%s: %s)", wssRes.ErrorStage, wssRes.ErrorMessage)
@@ -503,6 +522,14 @@ func (ps *ProbeScheduler) ExecuteLayeredProbeWithSnapshot(ctx context.Context, t
 		// ProfileCustom: Protocol-driven check
 		if target.Protocol == "wss" {
 			wssRes := WSSHandshakeCheckDetailed(target.IP, target.Port, target.SNI, target.Host, target.Path, 3*time.Second)
+			res.GOWAYWSSCompatible = wssRes.Success
+			res.GOWAYWSSLatency = wssRes.Latency
+			res.GOWAYWSSErrorStage = wssRes.ErrorStage
+			res.GOWAYWSSHTTPStatus = wssRes.HTTPStatus
+			res.GOWAYWSSErrorMessage = wssRes.ErrorMessage
+			res.GOWAYWSSSNISent = wssRes.SNISent
+			res.GOWAYWSSHostSent = wssRes.HostSent
+			res.GOWAYWSSPathSent = wssRes.PathSent
 			if !wssRes.Success {
 				res.HandshakeSuccess = false
 				res.Error = fmt.Sprintf("Custom WSS handshake failed (%s: %s)", wssRes.ErrorStage, wssRes.ErrorMessage)
@@ -511,6 +538,7 @@ func (ps *ProbeScheduler) ExecuteLayeredProbeWithSnapshot(ctx context.Context, t
 			res.HandshakeSuccess = true
 		} else {
 			ok, _, _, colo, err := HTTPSConnectivityCheck(ctx, target.IP, target.Port, target.SNI, target.Host, target.URL, 3*time.Second)
+			res.GOWAYWSSCompatible = false
 			if !ok {
 				res.HandshakeSuccess = false
 				if err != nil {
@@ -624,11 +652,14 @@ func (ps *ProbeScheduler) ProbeOnce(ctx context.Context, ip string, forceSpeed b
 	cfg := ps.GetConfig()
 
 	port := cfg.Port
+	if cfg.Profile.Type == ProfileGOWAYWSS && cfg.Profile.Port > 0 {
+		port = cfg.Profile.Port
+	}
 	tier := TierCandidate
 	existingColo := ""
 	recM, exists := ps.store.GetMetrics(ip)
 	if exists {
-		if recM.Port > 0 {
+		if recM.Port > 0 && cfg.Profile.Type != ProfileGOWAYWSS {
 			port = recM.Port
 		}
 		tier = recM.Tier
@@ -718,6 +749,14 @@ func (ps *ProbeScheduler) ProbeOnce(ctx context.Context, ip string, forceSpeed b
 		PacketLoss:           result.PacketLoss,
 		Jitter:               result.Jitter,
 		HandshakeSuccess:     result.HandshakeSuccess,
+		GOWAYWSSCompatible:   result.GOWAYWSSCompatible,
+		GOWAYWSSLatency:      result.GOWAYWSSLatency,
+		GOWAYWSSErrorStage:   result.GOWAYWSSErrorStage,
+		GOWAYWSSHTTPStatus:   result.GOWAYWSSHTTPStatus,
+		GOWAYWSSErrorMessage: result.GOWAYWSSErrorMessage,
+		GOWAYWSSSNISent:      result.GOWAYWSSSNISent,
+		GOWAYWSSHostSent:     result.GOWAYWSSHostSent,
+		GOWAYWSSPathSent:     result.GOWAYWSSPathSent,
 		DownloadSpeed:        result.SingleSpeed,
 		SingleSpeed:          result.SingleSpeed,
 		P10Speed:             result.P10Speed,
