@@ -576,3 +576,339 @@ func TestDiscoveryManagerRestartNoRace(t *testing.T) {
 		t.Fatalf("expected discovery manager to be stopped after second restart")
 	}
 }
+
+// --- GOWAY-WSS Discovery Admission Gate Tests ---
+
+func TestDiscoveryGOWAYWSS101EntersCandidate(t *testing.T) {
+	store := NewRouteStore()
+	cfg := DefaultProbeConfig()
+	cfg.Profile = NewProfileGOWAYWSS("wss.example.com", "/pyway", "sni.example.com", 443)
+	sched := NewProbeScheduler(store, cfg)
+	dm := NewDiscoveryManager(store, sched)
+
+	targetIP := "198.51.100.101"
+	dm.scanFunc = func(ctx context.Context, ips []string, port int, concurrent int, profile ProbeProfile, progress func(done, total, valid int)) ([]NodeResult, int, int) {
+		return []NodeResult{
+			{
+				IP:                 targetIP,
+				Port:               443,
+				TCPLatency:         25.0,
+				Colo:               "HKG",
+				GOWAYWSSCompatible: true,
+				GOWAYWSSLatency:    26.5,
+				GOWAYWSSHTTPStatus: 101,
+				GOWAYWSSSNISent:    "sni.example.com",
+				GOWAYWSSHostSent:   "wss.example.com",
+				GOWAYWSSPathSent:   "/pyway",
+			},
+		}, 1, 1
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	status, err := dm.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunOnce failed: %v", err)
+	}
+
+	if status.NewCandidates != 1 {
+		t.Fatalf("expected 1 new candidate, got %d", status.NewCandidates)
+	}
+
+	rec, exists := store.Get(targetIP)
+	if !exists {
+		t.Fatalf("route %s not inserted into RouteStore", targetIP)
+	}
+	if rec.Metrics.Tier != TierCandidate {
+		t.Fatalf("expected TierCandidate, got %s", rec.Metrics.Tier)
+	}
+	if !rec.Metrics.GOWAYWSSCompatible {
+		t.Fatalf("expected GOWAYWSSCompatible=true")
+	}
+	if rec.Metrics.GOWAYWSSHTTPStatus != 101 {
+		t.Fatalf("expected HTTP status 101, got %d", rec.Metrics.GOWAYWSSHTTPStatus)
+	}
+	if rec.Metrics.GOWAYWSSHostSent != "wss.example.com" {
+		t.Fatalf("expected Host wss.example.com, got %s", rec.Metrics.GOWAYWSSHostSent)
+	}
+	if rec.Metrics.GOWAYWSSSNISent != "sni.example.com" {
+		t.Fatalf("expected SNI sni.example.com, got %s", rec.Metrics.GOWAYWSSSNISent)
+	}
+	if rec.Metrics.GOWAYWSSPathSent != "/pyway" {
+		t.Fatalf("expected Path /pyway, got %s", rec.Metrics.GOWAYWSSPathSent)
+	}
+}
+
+func TestDiscoveryGOWAYWSS403Blocked(t *testing.T) {
+	store := NewRouteStore()
+	cfg := DefaultProbeConfig()
+	cfg.Profile = NewProfileGOWAYWSS("wss.example.com", "/pyway", "sni.example.com", 443)
+	sched := NewProbeScheduler(store, cfg)
+	dm := NewDiscoveryManager(store, sched)
+
+	targetIP := "198.51.100.102"
+	dm.scanFunc = func(ctx context.Context, ips []string, port int, concurrent int, profile ProbeProfile, progress func(done, total, valid int)) ([]NodeResult, int, int) {
+		return []NodeResult{
+			{
+				IP:                   targetIP,
+				Port:                 443,
+				TCPLatency:           25.0,
+				GOWAYWSSCompatible:   false,
+				GOWAYWSSHTTPStatus:   403,
+				GOWAYWSSErrorStage:   "status",
+				GOWAYWSSErrorMessage: "Forbidden (HTTP 403)",
+			},
+		}, 1, 0
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	status, err := dm.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunOnce failed: %v", err)
+	}
+
+	if status.NewCandidates != 0 {
+		t.Fatalf("HTTP 403 must NOT enter candidate pool, got new_candidates=%d", status.NewCandidates)
+	}
+
+	if _, exists := store.Get(targetIP); exists {
+		t.Fatalf("HTTP 403 route %s must NOT exist in RouteStore", targetIP)
+	}
+}
+
+func TestDiscoveryGOWAYWSS200Blocked(t *testing.T) {
+	store := NewRouteStore()
+	cfg := DefaultProbeConfig()
+	cfg.Profile = NewProfileGOWAYWSS("wss.example.com", "/pyway", "sni.example.com", 443)
+	sched := NewProbeScheduler(store, cfg)
+	dm := NewDiscoveryManager(store, sched)
+
+	targetIP := "198.51.100.103"
+	dm.scanFunc = func(ctx context.Context, ips []string, port int, concurrent int, profile ProbeProfile, progress func(done, total, valid int)) ([]NodeResult, int, int) {
+		return []NodeResult{
+			{
+				IP:                   targetIP,
+				Port:                 443,
+				TCPLatency:           25.0,
+				GOWAYWSSCompatible:   false,
+				GOWAYWSSHTTPStatus:   200,
+				GOWAYWSSErrorStage:   "status",
+				GOWAYWSSErrorMessage: "HTTP 200 (expected 101 Switching Protocols)",
+			},
+		}, 1, 0
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	status, err := dm.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunOnce failed: %v", err)
+	}
+
+	if status.NewCandidates != 0 {
+		t.Fatalf("HTTP 200 must NOT enter candidate pool in GOWAY-WSS mode, got new_candidates=%d", status.NewCandidates)
+	}
+
+	if _, exists := store.Get(targetIP); exists {
+		t.Fatalf("HTTP 200 route %s must NOT exist in RouteStore", targetIP)
+	}
+}
+
+func TestDiscoveryGOWAYWSS404Blocked(t *testing.T) {
+	store := NewRouteStore()
+	cfg := DefaultProbeConfig()
+	cfg.Profile = NewProfileGOWAYWSS("wss.example.com", "/pyway", "sni.example.com", 443)
+	sched := NewProbeScheduler(store, cfg)
+	dm := NewDiscoveryManager(store, sched)
+
+	targetIP := "198.51.100.104"
+	dm.scanFunc = func(ctx context.Context, ips []string, port int, concurrent int, profile ProbeProfile, progress func(done, total, valid int)) ([]NodeResult, int, int) {
+		return []NodeResult{
+			{
+				IP:                   targetIP,
+				Port:                 443,
+				TCPLatency:           25.0,
+				GOWAYWSSCompatible:   false,
+				GOWAYWSSHTTPStatus:   404,
+				GOWAYWSSErrorStage:   "status",
+				GOWAYWSSErrorMessage: "Not Found (HTTP 404)",
+			},
+		}, 1, 0
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	status, err := dm.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunOnce failed: %v", err)
+	}
+
+	if status.NewCandidates != 0 {
+		t.Fatalf("HTTP 404 must NOT enter candidate pool, got new_candidates=%d", status.NewCandidates)
+	}
+
+	if _, exists := store.Get(targetIP); exists {
+		t.Fatalf("HTTP 404 route %s must NOT exist in RouteStore", targetIP)
+	}
+}
+
+func TestDiscoveryCFSTAllowsHTTPSWithoutWSS(t *testing.T) {
+	store := NewRouteStore()
+	cfg := DefaultProbeConfig()
+	if cfg.Profile.Type != ProfileCFST {
+		t.Fatalf("expected ProfileCFST default")
+	}
+	sched := NewProbeScheduler(store, cfg)
+	dm := NewDiscoveryManager(store, sched)
+
+	targetIP := "198.51.100.105"
+	dm.scanFunc = func(ctx context.Context, ips []string, port int, concurrent int, profile ProbeProfile, progress func(done, total, valid int)) ([]NodeResult, int, int) {
+		if profile.Type != ProfileCFST {
+			t.Fatalf("scanFunc received non-CFST profile: %s", profile.Type)
+		}
+		return []NodeResult{
+			{
+				IP:                 targetIP,
+				Port:               443,
+				TCPLatency:         28.0,
+				Colo:               "SJC",
+				SingleSpeed:        12.5,
+				GOWAYWSSCompatible: false, // CFST mode does not set this
+			},
+		}, 1, 1
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	status, err := dm.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunOnce failed: %v", err)
+	}
+
+	if status.NewCandidates != 1 {
+		t.Fatalf("expected 1 new candidate for valid CFST HTTPS node, got %d", status.NewCandidates)
+	}
+
+	rec, exists := store.Get(targetIP)
+	if !exists {
+		t.Fatalf("route %s must exist in RouteStore", targetIP)
+	}
+	if rec.Metrics.Tier != TierCandidate {
+		t.Fatalf("expected TierCandidate, got %s", rec.Metrics.Tier)
+	}
+	if rec.Metrics.GOWAYWSSCompatible {
+		t.Fatalf("ProfileCFST node must have GOWAYWSSCompatible=false")
+	}
+}
+
+func TestDiscoveryGOWAYWSSNotBypassedByHTTPSSuccess(t *testing.T) {
+	store := NewRouteStore()
+	cfg := DefaultProbeConfig()
+	cfg.Profile = NewProfileGOWAYWSS("wss.example.com", "/pyway", "sni.example.com", 443)
+	sched := NewProbeScheduler(store, cfg)
+	dm := NewDiscoveryManager(store, sched)
+
+	targetIP := "198.51.100.106"
+	dm.scanFunc = func(ctx context.Context, ips []string, port int, concurrent int, profile ProbeProfile, progress func(done, total, valid int)) ([]NodeResult, int, int) {
+		// Simulate: TCP succeeded, HTTPS succeeded (speed > 0, Colo returned), BUT WSS returned HTTP 403!
+		return []NodeResult{
+			{
+				IP:                   targetIP,
+				Port:                 443,
+				TCPLatency:           18.0,
+				Colo:                 "NRT",
+				DownloadSpeed:        25.0,
+				SingleSpeed:          25.0,
+				GOWAYWSSCompatible:   false, // WSS 403!
+				GOWAYWSSHTTPStatus:   403,
+				GOWAYWSSErrorStage:   "status",
+				GOWAYWSSErrorMessage: "Forbidden (HTTP 403)",
+			},
+		}, 1, 1
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	status, err := dm.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunOnce failed: %v", err)
+	}
+
+	// Must NOT be bypassed by HTTPS success!
+	if status.NewCandidates != 0 {
+		t.Fatalf("CRITICAL BYPASS: node with GOWAYWSSCompatible=false was admitted into candidates due to HTTPS success! new_candidates=%d", status.NewCandidates)
+	}
+
+	if _, exists := store.Get(targetIP); exists {
+		t.Fatalf("CRITICAL BYPASS: node %s exists in RouteStore despite failing WSS check", targetIP)
+	}
+}
+
+func TestDiscoveryExistingRouteBypassBlocked(t *testing.T) {
+	store := NewRouteStore()
+	cfg := DefaultProbeConfig()
+	cfg.Profile = NewProfileGOWAYWSS("wss.example.com", "/pyway", "sni.example.com", 443)
+	sched := NewProbeScheduler(store, cfg)
+	dm := NewDiscoveryManager(store, sched)
+
+	targetIP := "198.51.100.107"
+	// Insert an existing route currently in TierActive and marked healthy
+	store.UpsertRoute(RouteMetrics{
+		ID:                 GenerateRouteID(targetIP, 443),
+		IP:                 targetIP,
+		Port:               443,
+		Tier:               TierActive,
+		Health:             HealthHealthy,
+		HandshakeSuccess:   true,
+		GOWAYWSSCompatible: true,
+		LastTested:         time.Now().Add(-5 * time.Minute),
+	})
+
+	// Discovery scans and finds this IP, but this round it fails WSS (e.g. HTTP 502)
+	dm.scanFunc = func(ctx context.Context, ips []string, port int, concurrent int, profile ProbeProfile, progress func(done, total, valid int)) ([]NodeResult, int, int) {
+		return []NodeResult{
+			{
+				IP:                   targetIP,
+				Port:                 443,
+				TCPLatency:           22.0,
+				GOWAYWSSCompatible:   false,
+				GOWAYWSSHTTPStatus:   502,
+				GOWAYWSSErrorStage:   "status",
+				GOWAYWSSErrorMessage: "Bad Gateway (HTTP 502)",
+			},
+		}, 1, 0
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	status, err := dm.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunOnce failed: %v", err)
+	}
+
+	if status.ExistingRoutes != 0 {
+		t.Fatalf("failed route must NOT be counted as valid existing route, got %d", status.ExistingRoutes)
+	}
+
+	rec, exists := store.Get(targetIP)
+	if !exists {
+		t.Fatalf("expected record to exist in store")
+	}
+	if rec.Metrics.GOWAYWSSCompatible {
+		t.Fatalf("existing route must NOT retain GOWAYWSSCompatible=true after failing WSS in discovery")
+	}
+	if rec.Metrics.HandshakeSuccess {
+		t.Fatalf("existing route must NOT retain HandshakeSuccess=true after failing WSS in discovery")
+	}
+	if rec.Metrics.Health == HealthHealthy {
+		t.Fatalf("existing route must NOT retain HealthHealthy after failure")
+	}
+}

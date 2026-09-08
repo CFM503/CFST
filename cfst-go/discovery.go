@@ -184,17 +184,66 @@ func (dm *DiscoveryManager) RunOnce(ctx context.Context) (DiscoveryStatus, error
 	existingRoutes := 0
 	var bestNewCandidate *RouteMetrics
 
+	isGOWAYWSS := cfg.Profile.Type == ProfileGOWAYWSS || (cfg.Profile.Type == ProfileCustom && cfg.Profile.Protocol == "wss")
+
 	for _, node := range validNodes {
-		if _, exists := dm.store.Get(node.IP); exists {
+		// Strict GOWAY-WSS compatibility gate:
+		// When profile is GOWAY-WSS, ONLY nodes with GOWAYWSSCompatible == true can enter or remain as valid candidates.
+		// Nodes returning HTTP 200, 403, 404, 502 or with failed WSS handshakes are strictly rejected.
+		if isGOWAYWSS && !node.GOWAYWSSCompatible {
+			if rec, exists := dm.store.Get(node.IP); exists {
+				// Existing route failed WSS check in this round: record failure so it cannot bypass as valid candidate
+				rm := rec.Metrics
+				rm.GOWAYWSSCompatible = false
+				rm.HandshakeSuccess = false
+				rm.GOWAYWSSLatency = node.GOWAYWSSLatency
+				rm.GOWAYWSSErrorStage = node.GOWAYWSSErrorStage
+				rm.GOWAYWSSHTTPStatus = node.GOWAYWSSHTTPStatus
+				rm.GOWAYWSSErrorMessage = node.GOWAYWSSErrorMessage
+				rm.GOWAYWSSSNISent = node.GOWAYWSSSNISent
+				rm.GOWAYWSSHostSent = node.GOWAYWSSHostSent
+				rm.GOWAYWSSPathSent = node.GOWAYWSSPathSent
+				dm.store.RecordProbeResult(rm, false)
+			}
+			continue
+		}
+
+		if rec, exists := dm.store.Get(node.IP); exists {
 			// Existing route: preserve all historical samples, EWMA, and stability scores
 			existingRoutes++
 			if node.Colo != "" {
 				dm.store.UpdateRouteColo(node.IP, node.Colo)
 			}
+			if isGOWAYWSS {
+				rm := rec.Metrics
+				rm.GOWAYWSSCompatible = true
+				rm.HandshakeSuccess = true
+				rm.GOWAYWSSLatency = node.GOWAYWSSLatency
+				rm.GOWAYWSSErrorStage = node.GOWAYWSSErrorStage
+				rm.GOWAYWSSHTTPStatus = node.GOWAYWSSHTTPStatus
+				rm.GOWAYWSSErrorMessage = node.GOWAYWSSErrorMessage
+				rm.GOWAYWSSSNISent = node.GOWAYWSSSNISent
+				rm.GOWAYWSSHostSent = node.GOWAYWSSHostSent
+				rm.GOWAYWSSPathSent = node.GOWAYWSSPathSent
+				dm.store.UpsertRoute(rm)
+			}
 		} else {
 			// New route: strictly enter as TierCandidate
 			newCandidates++
 			rm := FromNodeResult(node, TierCandidate)
+			if isGOWAYWSS {
+				rm.GOWAYWSSCompatible = true
+				rm.HandshakeSuccess = true
+				rm.GOWAYWSSLatency = node.GOWAYWSSLatency
+				rm.GOWAYWSSErrorStage = node.GOWAYWSSErrorStage
+				rm.GOWAYWSSHTTPStatus = node.GOWAYWSSHTTPStatus
+				rm.GOWAYWSSErrorMessage = node.GOWAYWSSErrorMessage
+				rm.GOWAYWSSSNISent = node.GOWAYWSSSNISent
+				rm.GOWAYWSSHostSent = node.GOWAYWSSHostSent
+				rm.GOWAYWSSPathSent = node.GOWAYWSSPathSent
+			} else {
+				rm.GOWAYWSSCompatible = false
+			}
 			dm.store.UpsertRoute(*rm)
 
 			if bestNewCandidate == nil || rm.FinalScore > bestNewCandidate.FinalScore || (rm.FinalScore == bestNewCandidate.FinalScore && rm.RTT < bestNewCandidate.RTT) {
