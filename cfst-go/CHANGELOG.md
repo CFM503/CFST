@@ -1,5 +1,32 @@
 # Changelog
 
+## v2.2.0 (2026-09-08)
+
+### Release: GOWAY WSS Compatibility & End-to-End Selection Hard Gate
+- **Real GOWAY WSS Handshake Check with Strict HTTP 101 Validation (`scanner.go`, `probe.go`)**:
+  - Implemented genuine TLS WebSocket upgrade handshake check (`WSSHandshakeCheckDetailed`) requiring HTTP 101 Switching Protocols.
+  - Eliminated false-positive HTTP 200 passings or body string match bypasses; non-101 responses (HTTP 200, 403, 502) are strictly treated as incompatible.
+  - Decoupled `Host`, `SNI`, `Path`, and `Port` parameter handling so custom CDN/edge endpoints and backend paths can be probed independently.
+- **Granular GOWAY-WSS Diagnostics (`engine.go`, `history.go`)**:
+  - Added structured diagnostic metrics to `NodeResult` and `RouteMetrics`: `goway_wss_compatible`, `goway_wss_latency`, `goway_wss_error_stage`, `goway_wss_http_status`, `goway_wss_error_message`, `goway_wss_sni_sent`, `goway_wss_host_sent`, `goway_wss_path_sent`.
+  - Preserved diagnostics in `RouteStore.UpsertRoute()` so route inspection and UI reflect exact handshake stages.
+- **Profile-Driven Probing & Protocol Isolation (`daemon.go`, `discovery.go`, `probe.go`)**:
+  - `ProfileGOWAYWSS` specifically drives WSS probing, while default `ProfileCFST` strictly uses Cloudflare official TCP + HTTPS and never executes WSS handshakes.
+  - Custom profiles (`ProfileCustom`) with `Protocol == "wss"` inherit full GOWAY WSS handling.
+- **Discovery Gate & Dynamic Route Updates (`discovery.go`)**:
+  - In GOWAY-WSS mode, discovery scans strictly verify WSS handshake before inserting new candidates into `RouteStore`.
+  - Re-scans of existing routes immediately update their `GOWAYWSSCompatible` status and diagnostic fields upon recovery or failure.
+- **RouteStore Selection & Tier Transition Hard Gate (`history.go`)**:
+  - In `GetBest()`: routes with `GOWAYWSSCompatible == false` are strictly excluded from candidates before scoring under GOWAY-WSS mode, regardless of score or health.
+  - In `evaluateTierTransitionsLocked()`:
+    - Active Demotion: Existing Active routes that become WSS-incompatible are immediately demoted to Standby.
+    - Candidate -> Standby: Only WSS-compatible routes can be promoted.
+    - Standby -> Active: Only WSS-compatible standbys are eligible for Active promotion.
+    - Active Challenger: Incompatible standbys cannot challenge or replace an Active route.
+  - CFST mode completely ignores the compatibility flag, maintaining 100% backward compatibility.
+- **Comprehensive Unit & Concurrency Tests (`history_test.go`, `goway_wss_test.go`, `discovery_test.go`, `probe_audit_test.go`)**:
+  - Added full test coverage for WSS handshake status verification, parameter independence, discovery gating, route upsert persistence, GetBest exclusion, and tier transition gates.
+
 ## v2.1.8 (2026-09-08)
 
 ### Release: Stabilization & Cross-Platform CI Reliability Release

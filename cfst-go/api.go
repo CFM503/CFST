@@ -58,7 +58,7 @@ func handleAPIHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":         "ok",
 		"service":        "CFST Route Quality Probe",
-		"version":        "v2.1.9-dev",
+		"version":        "v2.2.0",
 		"uptime_seconds": int64(time.Since(appStartTime).Seconds()),
 		"score_mode":     GlobalScoreEngine.GetMode(),
 		"profile":        cfg.Profile.Type,
@@ -412,7 +412,7 @@ func handleAPIConfig(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		cfg := GlobalProbeScheduler.GetConfig()
 		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"version":                "v2.1.9-dev",
+			"version":                "v2.2.0",
 			"score_mode":             GlobalScoreEngine.GetMode(),
 			"profile":                cfg.Profile,
 			"profile_type":           cfg.Profile.Type,

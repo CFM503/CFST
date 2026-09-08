@@ -72,13 +72,15 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: CFST v2.1.8
+          name: CFST v2.2.0
           body: |
-            Stabilization & Cross-Platform CI Reliability Release.
-            - Confirmed v2.1.7 stable route quality probe architecture as baseline
-            - Strict default ProfileCFST (Cloudflare official TCP + HTTPS, zero WSS)
-            - Hardened TCPPing sub-microsecond timer resolution on Windows loopback
-            - Stabilized raw TCP/TLS test listeners and readiness pre-flight for cross-platform CI
+            GOWAY WSS Compatibility & End-to-End Selection Hard Gate Release.
+            - Real GOWAY WSS Handshake probe with strict HTTP 101 status validation
+            - Independent configuration of Host, SNI, Path, and Port
+            - Granular diagnostics: error stage, status code, detailed message, SNI/Host/Path sent
+            - Discovery-phase WSS gate & route upsert diagnostic persistence
+            - RouteStore selection (GetBest) and Tier transitions hard gate (Active demotion, Candidate/Standby promotion, Challenger protection)
+            - Strict default ProfileCFST remains 100% unaffected and isolated
             - Windows 11 x64 release only
           files: dist/CFST-windows-amd64.exe
           generate_release_notes: false
