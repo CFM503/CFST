@@ -35,6 +35,9 @@ func main() {
 	flag.IntVar(&cfg.FailedInterval, "failed-interval", cfg.FailedInterval, "Failed route recovery probe interval in seconds")
 	flag.StringVar(&cfg.ScoreMode, "mode", cfg.ScoreMode, "Scoring mode: normal or peak")
 	flag.StringVar(&cfg.StateFile, "state", cfg.StateFile, "State persistence JSON file path")
+	flag.BoolVar(&cfg.DiscoveryEnabled, "discovery", cfg.DiscoveryEnabled, "Enable continuous Cloudflare IP discovery in daemon mode")
+	flag.IntVar(&cfg.DiscoveryInterval, "discovery-interval", cfg.DiscoveryInterval, "Discovery scan interval in seconds (default 3600)")
+	flag.IntVar(&cfg.DiscoveryScanCount, "discovery-count", cfg.DiscoveryScanCount, "Discovery IPs to scan per pass (default 200)")
 	versionFlag := flag.Bool("v", false, "Show version and exit")
 	flag.BoolVar(versionFlag, "version", false, "Show version and exit")
 
@@ -61,7 +64,7 @@ func main() {
 	flag.Parse()
 
 	if *versionFlag {
-		println("CFST v2.1.3 (GOWAY Route Quality Probe & Long-Term Stability Analyzer)")
+		println("CFST v2.1.4 (GOWAY Route Quality Probe & Long-Term Stability Analyzer)")
 		return
 	}
 

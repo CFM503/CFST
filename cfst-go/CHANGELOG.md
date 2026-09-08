@@ -1,5 +1,48 @@
 # Changelog
 
+## v2.1.4 (2026-09-08)
+
+### Feature: Continuous Discovery, In-Flight De-duplication & Candidate Promotion
+- **Per-IP In-Flight Probe De-duplication (`probe.go`)**:
+  - Implemented `inFlight sync.Map` on `ProbeScheduler` to ensure at most one active `ProbeOnce` runs on any given IP concurrently.
+  - Guaranteed safe cleanup via `defer ps.inFlight.Delete(ip)` across all execution paths (normal completion, error, panic, context timeout).
+  - Wired in-flight guard into `evaluateAndSchedule()` and `TriggerOnDemand()` to avoid unnecessary goroutine and timer overhead.
+- **Fixed Configuration Snapshot in `ProbeOnce` (`probe.go`)**:
+  - Completely eradicated un-synchronized field reads (`ps.cfg.Port`).
+  - Added single atomic snapshot read `cfg := ps.GetConfig()` at the start of `ProbeOnce()`.
+  - Pass snapshot `cfg` and resolved `target` to `ExecuteLayeredProbeWithSnapshot()`, preventing mid-probe configuration tearing when API updates occur.
+- **Continuous Background Cloudflare IP Discovery (`discovery.go`, `daemon.go`, `scanner.go`)**:
+  - Added `DiscoveryManager` running periodic background discovery (default interval: 60 minutes, scan count: 200 IPs).
+  - Discovery is strictly low bandwidth: executes L1 TCP Ping + L2 `HTTPSConnectivityCheck` for `ProfileCFST` (no WSS, no full speed tests during scan).
+  - Discovered new valid IPs enter `RouteStore` strictly as `TierCandidate` (never directly Active).
+  - Re-discovered existing IPs preserve all historical records (`EWMA`, discrete samples, peak-hour stats, health, and stability score) without overwrite.
+  - Structured summary logging:
+    ```
+    [Discovery] Scanning 200 Cloudflare IPs...
+    [Discovery] TCP valid: 42 | HTTPS valid: 31 | New candidates: 12 | Existing routes: 19
+    [Discovery] Best candidate: 104.x.x.x | Score: 91.4 | P10: 38.2 MB/s | Stability: 88.7
+    ```
+- **Candidate Promotion & Degraded Route Demotion Lifecycle (`history.go`)**:
+  - Implemented `EvaluateTierTransitions()` with single-step transition protection:
+    - `Candidate -> Standby`: Requires `ObservationDuration >= 300s`, `Samples >= 3`, `Confidence >= 35.0`, `Health == HealthHealthy`, `FinalScore >= 70.0`, `PacketLoss <= 0.05`, `Jitter <= 25.0`, `StallCount == 0`.
+    - `Standby -> Active`: When Active route is degraded or when Standby consistently and significantly beats Active over long term (`FinalScore >= active.FinalScore + 5.0`, `Confidence >= 60.0`, `P10Speed >= active.P10Speed`, `ObservationDuration >= 900s`). Eliminates single high-speed spike takeover.
+    - `Active -> Standby`: When Active route degrades (`HealthDegraded`, `HealthFailing`, `SpeedDropPercent >= 35%`, `ConsecutiveFails >= 2`).
+    - `Standby -> Candidate`: When Standby fails repeatedly (`HealthFailing`, `FinalScore < 50.0`, `ConsecutiveFails >= 3`).
+    - `Candidate -> Failed`: When Candidate fails persistently (`HealthFailed`, `ConsecutiveFails >= 5`).
+    - `Failed Pruning`: Removes permanently dead routes (`HealthFailed`, `ConsecutiveFails >= 10`, untested > 2 hours).
+- **New Discovery Status API & CLI Flags (`api.go`, `main.go`)**:
+  - Added `GET /api/discovery/status` returning runtime state (`enabled`, `interval_sec`, `last_run`, `last_duration_sec`, `scanned`, `tcp_valid`, `https_valid`, `new_candidates`, `existing_routes`).
+  - Added CLI flags `-discovery`, `-discovery-interval`, `-discovery-count`.
+  - Bumped version to `v2.1.4` across CLI, API, Web UI, and Snapshot persistence.
+- **Comprehensive Unit & Concurrency Test Suite (`discovery_test.go`, `probe_test.go`)**:
+  - `TestProbeInFlightDedup`: verifies concurrency de-duplication on same IP.
+  - `TestProbeUsesConfigSnapshot`: proves probe uses immutable snapshot during API updates.
+  - `TestDiscoveryAddsCandidate`: verifies new nodes enter `RouteStore` strictly as `TierCandidate`.
+  - `TestDiscoveryDoesNotDuplicateExistingRoute`: verifies existing route histories are preserved intact.
+  - `TestDiscoveryUsesCFSTProfile`: verifies Discovery adheres strictly to CFST HTTPS profile without WSS.
+  - `TestCandidatePromotion`: verifies multi-horizon candidate promotion gating.
+  - `TestLongTermDemotion`: verifies staged demotion and persistent failure pruning.
+
 ## v2.1.3 (2026-09-08)
 
 ### Fix: Unify Daemon and Initial Scan with ProbeProfile Architecture

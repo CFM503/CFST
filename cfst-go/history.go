@@ -602,6 +602,9 @@ func (s *RouteStore) RecordProbeResult(m RouteMetrics, success bool) {
 
 	// Commit updated metrics into record
 	rec.Metrics = m
+
+	// Automatically evaluate candidate promotion and degraded route demotion
+	s.evaluateTierTransitionsLocked(sample.Timestamp)
 }
 
 func (s *RouteStore) Get(idOrIP string) (*RouteRecord, bool) {
@@ -783,6 +786,186 @@ func (s *RouteStore) GetPeakHours(idOrIP string) [24]HourStats {
 	return rec.PeakHours
 }
 
+// DeleteRoute safely removes a route by its IP or ID from the RouteStore.
+func (s *RouteStore) DeleteRoute(idOrIP string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.routes[idOrIP]
+	if !ok {
+		return false
+	}
+	delete(s.routes, rec.Metrics.IP)
+	delete(s.routes, rec.Metrics.ID)
+	return true
+}
+
+// EvaluateTierTransitions evaluates promotion, demotion, and pruning across all managed routes.
+func (s *RouteStore) EvaluateTierTransitions(now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.evaluateTierTransitionsLocked(now)
+}
+
+func (s *RouteStore) evaluateTierTransitionsLocked(now time.Time) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+
+	seen := make(map[string]bool)
+	var records []*RouteRecord
+	for _, rec := range s.routes {
+		if rec != nil && !seen[rec.Metrics.IP] {
+			seen[rec.Metrics.IP] = true
+			records = append(records, rec)
+		}
+	}
+
+	// 1. Long-term failed route pruning and initial tier categorization:
+	var activeRec *RouteRecord
+	var standbyRecs []*RouteRecord
+	var candidateRecs []*RouteRecord
+
+	for _, rec := range records {
+		m := &rec.Metrics
+		// Prune if Health == HealthFailed, ConsecutiveFails >= 10, and untested for > 2 hours
+		if m.Health == HealthFailed && m.ConsecutiveFails >= 10 && !m.LastTested.IsZero() && now.Sub(m.LastTested) > 2*time.Hour {
+			delete(s.routes, m.IP)
+			delete(s.routes, m.ID)
+			continue
+		}
+
+		switch m.Tier {
+		case TierActive:
+			activeRec = rec
+		case TierStandby:
+			standbyRecs = append(standbyRecs, rec)
+		case TierCandidate:
+			candidateRecs = append(candidateRecs, rec)
+		}
+	}
+
+	// Ensure each route transitions at most once per evaluation cycle
+	transitioned := make(map[string]bool)
+
+	// 2. Demotion: Active -> Standby
+	if activeRec != nil {
+		m := &activeRec.Metrics
+		if m.Health == HealthDegraded || m.Health == HealthFailing || m.Health == HealthFailed || m.SpeedDropPercent >= 35.0 || m.ConsecutiveFails >= 2 {
+			m.Tier = TierStandby
+			transitioned[m.IP] = true
+			standbyRecs = append(standbyRecs, activeRec)
+			activeRec = nil
+		}
+	}
+
+	// 3. Demotion: Standby -> Candidate
+	var remainingStandbys []*RouteRecord
+	for _, rec := range standbyRecs {
+		if transitioned[rec.Metrics.IP] {
+			remainingStandbys = append(remainingStandbys, rec)
+			continue
+		}
+		m := &rec.Metrics
+		if m.Health == HealthFailing || m.Health == HealthFailed || (m.ObservationDuration >= 300.0 && m.FinalScore < 50.0 && m.FinalScore > 0) || m.ConsecutiveFails >= 3 {
+			m.Tier = TierCandidate
+			transitioned[m.IP] = true
+			candidateRecs = append(candidateRecs, rec)
+		} else {
+			remainingStandbys = append(remainingStandbys, rec)
+		}
+	}
+	standbyRecs = remainingStandbys
+
+	// 4. Demotion: Candidate -> Failed
+	var remainingCandidates []*RouteRecord
+	for _, rec := range candidateRecs {
+		if transitioned[rec.Metrics.IP] {
+			remainingCandidates = append(remainingCandidates, rec)
+			continue
+		}
+		m := &rec.Metrics
+		if m.Health == HealthFailed || m.ConsecutiveFails >= 5 {
+			m.Tier = TierFailed
+			transitioned[m.IP] = true
+		} else {
+			remainingCandidates = append(remainingCandidates, rec)
+		}
+	}
+	candidateRecs = remainingCandidates
+
+	// 5. Promotion: Candidate -> Standby
+	// Requires:
+	// - ObservationDuration >= 300s (5 min)
+	// - len(Samples) >= 3
+	// - Confidence >= 35.0
+	// - Health == HealthHealthy
+	// - FinalScore >= 70.0
+	// - PacketLoss <= 0.05
+	// - Jitter <= 25.0
+	// - StallCount == 0
+	for _, rec := range candidateRecs {
+		if transitioned[rec.Metrics.IP] {
+			continue
+		}
+		m := &rec.Metrics
+		if m.ObservationDuration >= 300.0 && len(rec.Samples) >= 3 && m.Confidence >= 35.0 &&
+			m.Health == HealthHealthy && m.FinalScore >= 70.0 && m.PacketLoss <= 0.05 &&
+			m.Jitter <= 25.0 && m.StallCount == 0 {
+			m.Tier = TierStandby
+			transitioned[m.IP] = true
+			standbyRecs = append(standbyRecs, rec)
+		}
+	}
+
+	// 6. Promotion: Standby -> Active
+	// Eligible standby requires:
+	// - Health == HealthHealthy
+	// - Confidence >= 50.0
+	// - FinalScore >= 70.0
+	// - PacketLoss <= 0.02
+	// - StallCount == 0
+	if activeRec == nil {
+		var bestStandby *RouteRecord
+		for _, rec := range standbyRecs {
+			if transitioned[rec.Metrics.IP] {
+				continue
+			}
+			m := &rec.Metrics
+			if m.Health == HealthHealthy && m.Confidence >= 50.0 && m.FinalScore >= 70.0 && m.PacketLoss <= 0.02 && m.StallCount == 0 {
+				if bestStandby == nil || m.FinalScore > bestStandby.Metrics.FinalScore {
+					bestStandby = rec
+				}
+			}
+		}
+		if bestStandby != nil {
+			bestStandby.Metrics.Tier = TierActive
+			activeRec = bestStandby
+		}
+	} else {
+		// Active exists: only replace if Standby significantly and consistently beats Active over long term
+		// FinalScore >= active.FinalScore + 5.0 && Confidence >= 60.0 && P10Speed >= active.P10Speed && ObservationDuration >= 900s
+		var bestChallenger *RouteRecord
+		for _, rec := range standbyRecs {
+			if transitioned[rec.Metrics.IP] {
+				continue
+			}
+			m := &rec.Metrics
+			if m.Health == HealthHealthy && m.Confidence >= 60.0 && m.ObservationDuration >= 900.0 &&
+				m.FinalScore >= activeRec.Metrics.FinalScore+5.0 && m.P10Speed >= activeRec.Metrics.P10Speed &&
+				m.PacketLoss <= 0.02 && m.StallCount == 0 {
+				if bestChallenger == nil || m.FinalScore > bestChallenger.Metrics.FinalScore {
+					bestChallenger = rec
+				}
+			}
+		}
+		if bestChallenger != nil {
+			activeRec.Metrics.Tier = TierStandby
+			bestChallenger.Metrics.Tier = TierActive
+			activeRec = bestChallenger
+		}
+	}
+}
+
 // SnapshotContainer stores full state for robust serialization.
 type SnapshotContainer struct {
 	Version   string                  `json:"version"`
@@ -802,7 +985,7 @@ func (s *RouteStore) SaveSnapshot(path string) error {
 	s.mu.RUnlock()
 
 	container := SnapshotContainer{
-		Version:   "2.1.2",
+		Version:   "2.1.4",
 		Timestamp: time.Now(),
 		Routes:    uniqueRecords,
 	}

@@ -257,6 +257,12 @@ func NormalizeProbeConfig(cfg *ProbeConfig) {
 	if cfg.MaxConcurrent < 1 {
 		cfg.MaxConcurrent = 2
 	}
+	if cfg.DiscoveryInterval <= 0 {
+		cfg.DiscoveryInterval = 60 * time.Minute
+	}
+	if cfg.DiscoveryScanCount <= 0 {
+		cfg.DiscoveryScanCount = 200
+	}
 }
 
 // ResolveProbeTarget returns a ResolvedProbeTarget for an IP/port based strictly on cfg.Profile.
@@ -296,43 +302,49 @@ func ResolveProbeTarget(cfg ProbeConfig, ip string, port int) ResolvedProbeTarge
 
 // ProbeConfig holds parameters controlling tiered background probing.
 type ProbeConfig struct {
-	Profile           ProbeProfile  `json:"profile"`
-	ActiveInterval    time.Duration `json:"active_interval"`    // High frequency for active routes
-	StandbyInterval   time.Duration `json:"standby_interval"`   // Medium frequency for standby routes
-	CandidateInterval time.Duration `json:"candidate_interval"` // Low frequency for candidate pool
-	FailedInterval    time.Duration `json:"failed_interval"`    // Periodic recovery checks for failed routes
-	MaxConcurrent     int           `json:"max_concurrent"`     // Concurrency limit for background ping/wss
-	MaxSpeedTests     int           `json:"max_speed_tests"`    // Strict limit (usually 1) for concurrent speed tests
-	QuickDuration     int           `json:"quick_duration"`     // Duration in seconds for L3 quick speed test
-	FullDuration      int           `json:"full_duration"`      // Duration in seconds for L4 full speed test
-	L3ProbeCycle      int           `json:"l3_probe_cycle"`     // Lightweight HTTP check every N cycles (e.g. 3)
-	FullSpeedCycle    int           `json:"full_speed_cycle"`   // Full speed test calibration cycle (e.g. 60)
-	SpeedTestCycle    int           `json:"speed_test_cycle"`   // Legacy alias for FullSpeedCycle
-	WSSHost           string        `json:"wss_host"`
-	SNI               string        `json:"sni"`
-	URL               string        `json:"url"`
-	Port              int           `json:"port"`
+	Profile            ProbeProfile  `json:"profile"`
+	ActiveInterval     time.Duration `json:"active_interval"`      // High frequency for active routes
+	StandbyInterval    time.Duration `json:"standby_interval"`     // Medium frequency for standby routes
+	CandidateInterval  time.Duration `json:"candidate_interval"`   // Low frequency for candidate pool
+	FailedInterval     time.Duration `json:"failed_interval"`      // Periodic recovery checks for failed routes
+	MaxConcurrent      int           `json:"max_concurrent"`       // Concurrency limit for background ping/wss
+	MaxSpeedTests      int           `json:"max_speed_tests"`      // Strict limit (usually 1) for concurrent speed tests
+	QuickDuration      int           `json:"quick_duration"`       // Duration in seconds for L3 quick speed test
+	FullDuration       int           `json:"full_duration"`        // Duration in seconds for L4 full speed test
+	L3ProbeCycle       int           `json:"l3_probe_cycle"`       // Lightweight HTTP check every N cycles (e.g. 3)
+	FullSpeedCycle     int           `json:"full_speed_cycle"`     // Full speed test calibration cycle (e.g. 60)
+	SpeedTestCycle     int           `json:"speed_test_cycle"`     // Legacy alias for FullSpeedCycle
+	DiscoveryEnabled   bool          `json:"discovery_enabled"`    // Periodic background Cloudflare IP discovery
+	DiscoveryInterval  time.Duration `json:"discovery_interval"`   // Interval between discovery passes (default 60m)
+	DiscoveryScanCount int           `json:"discovery_scan_count"` // Number of random IPs scanned per pass (default 200)
+	WSSHost            string        `json:"wss_host"`
+	SNI                string        `json:"sni"`
+	URL                string        `json:"url"`
+	Port               int           `json:"port"`
 }
 
 func DefaultProbeConfig() ProbeConfig {
 	prof := NewProfileCFST()
 	cfg := ProbeConfig{
-		Profile:           prof,
-		ActiveInterval:    10 * time.Second,
-		StandbyInterval:   30 * time.Second,
-		CandidateInterval: 180 * time.Second,
-		FailedInterval:    60 * time.Second,
-		MaxConcurrent:     4,
-		MaxSpeedTests:     1,
-		QuickDuration:     3,
-		FullDuration:      10,
-		L3ProbeCycle:      3,  // L3 lightweight 100KB probe every 3 cycles (~30s on Active)
-		FullSpeedCycle:    60, // L4 full speed calibration every 60 cycles (~10m on Active)
-		SpeedTestCycle:    60,
-		WSSHost:           "", // isolated from CFST mode!
-		SNI:               prof.SNI,
-		URL:               prof.TestURL,
-		Port:              prof.Port,
+		Profile:            prof,
+		ActiveInterval:     10 * time.Second,
+		StandbyInterval:    30 * time.Second,
+		CandidateInterval:  180 * time.Second,
+		FailedInterval:     60 * time.Second,
+		MaxConcurrent:      4,
+		MaxSpeedTests:      1,
+		QuickDuration:      3,
+		FullDuration:       10,
+		L3ProbeCycle:       3,  // L3 lightweight 100KB probe every 3 cycles (~30s on Active)
+		FullSpeedCycle:     60, // L4 full speed calibration every 60 cycles (~10m on Active)
+		SpeedTestCycle:     60,
+		DiscoveryEnabled:   true,
+		DiscoveryInterval:  60 * time.Minute,
+		DiscoveryScanCount: 200,
+		WSSHost:            "", // isolated from CFST mode!
+		SNI:                prof.SNI,
+		URL:                prof.TestURL,
+		Port:               prof.Port,
 	}
 	NormalizeProbeConfig(&cfg)
 	return cfg
@@ -371,6 +383,7 @@ type ProbeScheduler struct {
 	speedSem     chan struct{} // limits concurrent bandwidth-heavy speed tests
 	probeSem     chan struct{} // limits lightweight concurrent pings/handshakes
 	cycleCount   sync.Map      // route IP -> int64 cycle count
+	inFlight     sync.Map      // route IP -> struct{} per-IP probe concurrency de-duplication
 	running      atomic.Bool
 	stopCh       chan struct{}
 	probeTrigger chan string
@@ -407,6 +420,11 @@ func (ps *ProbeScheduler) GetConfig() ProbeConfig {
 func (ps *ProbeScheduler) ExecuteLayeredProbe(ctx context.Context, ip string, port int, runL3 bool, runFullSpeed bool) LayeredProbeResult {
 	cfg := ps.GetConfig()
 	target := ResolveProbeTarget(cfg, ip, port)
+	return ps.ExecuteLayeredProbeWithSnapshot(ctx, target, cfg, runL3, runFullSpeed)
+}
+
+// ExecuteLayeredProbeWithSnapshot executes L1 to L5 sequentially with a fixed target and config snapshot.
+func (ps *ProbeScheduler) ExecuteLayeredProbeWithSnapshot(ctx context.Context, target ResolvedProbeTarget, cfg ProbeConfig, runL3 bool, runFullSpeed bool) LayeredProbeResult {
 	res := LayeredProbeResult{Success: false}
 
 	// -------------------------------------------------------------
@@ -592,18 +610,32 @@ func (ps *ProbeScheduler) incCycle(ip string) int64 {
 }
 
 func (ps *ProbeScheduler) ProbeOnce(ctx context.Context, ip string, forceSpeed bool) (*RouteMetrics, error) {
-	rec, exists := ps.store.Get(ip)
-	port := ps.cfg.Port
+	// 1. In-flight per-IP probe de-duplication:
+	// Only one ProbeOnce can run per IP at any time.
+	if _, loaded := ps.inFlight.LoadOrStore(ip, struct{}{}); loaded {
+		if rec, exists := ps.store.Get(ip); exists {
+			return &rec.Metrics, nil
+		}
+		return nil, fmt.Errorf("probe already in progress for %s", ip)
+	}
+	defer ps.inFlight.Delete(ip)
+
+	// 2. Atomic configuration snapshot: single synchronized read, preventing torn or mixed state
+	cfg := ps.GetConfig()
+
+	port := cfg.Port
 	tier := TierCandidate
 	existingColo := ""
+	rec, exists := ps.store.Get(ip)
 	if exists {
-		port = rec.Metrics.Port
+		if rec.Metrics.Port > 0 {
+			port = rec.Metrics.Port
+		}
 		tier = rec.Metrics.Tier
 		existingColo = rec.Metrics.Colo
 	}
 
-	// Determine if speed test is scheduled
-	cfg := ps.GetConfig()
+	// 3. Determine if speed test is scheduled using snapshot cfg
 	cycle := ps.incCycle(ip)
 
 	runL3 := false
@@ -653,7 +685,8 @@ func (ps *ProbeScheduler) ProbeOnce(ctx context.Context, ip string, forceSpeed b
 		}
 	}
 
-	result := ps.ExecuteLayeredProbe(ctx, ip, port, runL3, runFullSpeed)
+	target := ResolveProbeTarget(cfg, ip, port)
+	result := ps.ExecuteLayeredProbeWithSnapshot(ctx, target, cfg, runL3, runFullSpeed)
 
 	now := time.Now()
 	m := RouteMetrics{
@@ -778,6 +811,11 @@ func (ps *ProbeScheduler) evaluateAndSchedule(ctx context.Context, now time.Time
 		}
 
 		if r.LastTested.IsZero() || now.Sub(r.LastTested) >= interval {
+			// In-flight check: skip if probe is already running on this IP
+			if _, inFlight := ps.inFlight.Load(r.IP); inFlight {
+				continue
+			}
+
 			// Acquire concurrency slot
 			select {
 			case ps.probeSem <- struct{}{}:
@@ -790,10 +828,17 @@ func (ps *ProbeScheduler) evaluateAndSchedule(ctx context.Context, now time.Time
 			}
 		}
 	}
+
+	// Periodically evaluate tier promotions and demotions across all managed routes
+	ps.store.EvaluateTierTransitions(now)
 }
 
 // TriggerOnDemand queues an on-demand probe request.
 func (ps *ProbeScheduler) TriggerOnDemand(ip string) {
+	// Skip queuing if this IP is already being probed
+	if _, inFlight := ps.inFlight.Load(ip); inFlight {
+		return
+	}
 	select {
 	case ps.probeTrigger <- ip:
 	default:

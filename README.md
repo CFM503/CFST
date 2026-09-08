@@ -1,10 +1,10 @@
 # CFST - Cloudflare Route Quality Probe & SpeedTest
 
-> v2.1.3 | Go Edition
+> v2.1.4 | Go Edition
 
 CFST 已从一次性 Cloudflare IP 测速工具全面重构升级为 **GOWAY 线路质量长期探针 + 稳定性分析 + 高峰期选路数据源 (Route Quality Probe & Stability Analyzer)**。
 
-核心设计哲学：**稳定性与保底速度 (P10) > 峰值瞬时速度**。杜绝瞬时抽水型峰值节点影响排名，为流媒体、高速隧道与科学选路提供最具韧性的前置线路决策依据。v2.1.3 彻底消除了后台 daemon 与种子扫描中的旧 WSS 架构回归，统一 ProbeProfile 执行链，并修复了自定义 VPS 非标准端口 Host 头保留与 L4 目标直通。
+核心设计哲学：**稳定性与保底速度 (P10) > 峰值瞬时速度**。杜绝瞬时抽水型峰值节点影响排名，为流媒体、高速隧道与科学选路提供最具韧性的前置线路决策依据。v2.1.4 新增了后台持续 Cloudflare IP 自动发现（低带宽 L1+L2 探测）、单 IP 探针并发去重（in-flight guard）、严格固定配置快照读取、Candidate ➔ Standby ➔ Active 候选晋升与变差淘汰生命周期，以及 `/api/discovery/status` 状态查询接口。
 
 作为测量层无缝对接 **GoPass 控制器** 与 **GOWAY 隧道**。
 
@@ -70,6 +70,38 @@ CFST 已从一次性 Cloudflare IP 测速工具全面重构升级为 **GOWAY 线
 - 🧭 **智能选路建议体系 (Recommendations)** — 输出 `BEST`、`GOOD`、`USABLE`、`DEGRADED`、`AVOID`、`FAILED` 等级并附带诊断原因列表。
 - 📉 **EWMA 故障压制与衰减** — 线路发生探测失败时，EWMA 立即施加失败压力（`RecordFailure`），指数级衰减历史速度，防止离线节点残留虚高评分。
 - 💾 **原子化安全持久化** — 支持 Windows 文件系统安全的临时文件写入、`.bak` 轮转备份与双重恢复机制。
+
+## 持续发现、探针去重与候选晋升体系 (v2.1.4)
+
+- 🔭 **后台持续 Cloudflare IP 自动发现 (`discovery.go`, `daemon.go`)** —
+  - 启动独立的 `DiscoveryManager` 后台周期运行引擎（默认每 60 分钟扫描 200 个随机 Cloudflare IPv4 地址）。
+  - **严格低带宽探针**：Discovery 阶段仅执行 L1 TCP Ping + L2 HTTPSConnectivityCheck（ProfileCFST 下直连 `speed.cloudflare.com`），**绝不在发现阶段盲目运行带宽吞吐测速**。
+  - **新 IP 隔离进入 Candidate**：新发现的有效节点严格以 `TierCandidate` 进入候选池，绝不直接冲入 Active 或 Standby。
+  - **历史记录安全保留**：若 Discovery 再次扫描到已在 `RouteStore` 中的节点，严格保留其历史 EWMA、分片采样、PeakHours、健康度与稳定性评分，绝不覆盖或清空历史数据。
+  - **结构化摘要日志**：
+    ```
+    [Discovery] Scanning 200 Cloudflare IPs...
+    [Discovery] TCP valid: 42
+    [Discovery] HTTPS valid: 31
+    [Discovery] New candidates: 12
+    [Discovery] Existing routes: 19
+    ```
+- 🔒 **单 IP 探针并发去重 (In-Flight Guard, `probe.go`)** —
+  - `ProbeScheduler` 增加 `inFlight sync.Map`，保证同一个 IP 在任意时刻最多只有一个 `ProbeOnce` 在执行。
+  - 采用 `defer ps.inFlight.Delete(ip)` 保证 panic、错误或超时等任何情况下状态均可靠回收。
+  - 调度器 `evaluateAndSchedule` 与手动触发 `TriggerOnDemand` 均共享该去重校验，避免重复排队。
+- 📸 **ProbeScheduler 配置快照读取 (`probe.go`)** —
+  - 彻底杜绝在 `ProbeOnce()` 中直接并发读取 `ps.cfg.Port` 等未加锁字段。
+  - 执行伊始统一获取 `cfg := ps.GetConfig()` 快照，单次探针期间使用的 Profile、Port、测速时长、循环周期全部来自该快照，彻底免疫并发 API 配置更新造成的配置撕裂。
+- 📈 **全流程候选晋升与变差淘汰生命周期 (`history.go`)** —
+  - **Candidate ➔ Standby**：要求观察时间 $\ge 300\text{s}$（至少 5 分钟）、样本数 $\ge 3$、置信度 $\ge 35.0$、健康度为 `HEALTHY`、综合分 $\ge 70.0$、丢包率 $\le 0.05$、抖动 $\le 25.0\text{ms}$、零断流卡顿。
+  - **Standby ➔ Active**：当前 Active 降级或 Standby 在长周期内显著优于 Active（综合分高 5 分以上、置信度 $\ge 60.0$、P10 保底速度更优且连续观察 $\ge 15$ 分钟）。**严禁单次瞬时高速直接夺取 Active**。
+  - **Active ➔ Standby**：Active 节点发生降级（`DEGRADED`/`FAILING`）、掉速超过 35% 或连续失败 2 次立即退回 Standby。
+  - **Standby ➔ Candidate**：Standby 节点持续衰退、长期评分低于 50 或连续失败 3 次退回 Candidate。
+  - **Candidate ➔ Failed**：连续失败 5 次进入 Failed 恢复探测队列。
+  - **持久失效节点安全修剪**：连续失败 $\ge 10$ 次且超 2 小时未连通的节点自动从内存 RouteStore 清理。
+- 📡 **发现状态接口 (`GET /api/discovery/status`)** —
+  - 输出 `enabled`、`interval_sec`、`last_run`、`last_duration_sec`、`scanned`、`tcp_valid`、`https_valid`、`new_candidates`、`existing_routes` 等完整实时数据。
 
 ## 架构统一与候选池初始化解耦 (v2.1.3)
 

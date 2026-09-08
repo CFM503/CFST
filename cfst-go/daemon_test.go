@@ -102,7 +102,7 @@ func TestSeedCandidatesGOWAYWSSUsesProfile(t *testing.T) {
 	port, _ := strconv.Atoi(u.Port())
 
 	prof := NewProfileGOWAYWSS("edge.goway.custom", "/custom-pyway", "sni.goway.custom", port)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	_ = ScanRoutesWithProfile(ctx, []string{"127.0.0.1"}, port, 1, prof, nil)

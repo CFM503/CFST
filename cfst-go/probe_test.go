@@ -269,3 +269,189 @@ func TestDefaultCFSTModeProtocolIsolation(t *testing.T) {
 		t.Fatalf("CFST mode must never resolve to wss protocol")
 	}
 }
+
+func TestProbeInFlightDedup(t *testing.T) {
+	store := NewRouteStore()
+	cfg := DefaultProbeConfig()
+	scheduler := NewProbeScheduler(store, cfg)
+
+	testIP := "198.51.100.1"
+	store.UpsertRoute(RouteMetrics{
+		IP:     testIP,
+		Port:   443,
+		Tier:   TierActive,
+		Health: HealthHealthy,
+	})
+
+	// Manually mark inFlight
+	scheduler.inFlight.Store(testIP, struct{}{})
+
+	// Calling ProbeOnce while inFlight must return immediately without error
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	m, err := scheduler.ProbeOnce(ctx, testIP, false)
+	if err != nil {
+		t.Fatalf("expected graceful return for in-flight route, got error: %v", err)
+	}
+	if m == nil || m.IP != testIP {
+		t.Fatalf("expected existing route metrics returned, got %+v", m)
+	}
+
+	// Now clear inFlight
+	scheduler.inFlight.Delete(testIP)
+
+	// Ensure inFlight is cleared on probe completion
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel2()
+	_, _ = scheduler.ProbeOnce(ctx2, testIP, false)
+
+	if _, loaded := scheduler.inFlight.Load(testIP); loaded {
+		t.Fatalf("expected inFlight to be cleaned up after ProbeOnce returns")
+	}
+}
+
+func TestProbeUsesConfigSnapshot(t *testing.T) {
+	store := NewRouteStore()
+	initialCfg := DefaultProbeConfig()
+	initialCfg.FullDuration = 12
+	scheduler := NewProbeScheduler(store, initialCfg)
+
+	snapCfg := scheduler.GetConfig()
+	if snapCfg.FullDuration != 12 {
+		t.Fatalf("expected snapshot FullDuration 12, got %d", snapCfg.FullDuration)
+	}
+
+	// Concurrently change scheduler config
+	modifiedCfg := DefaultProbeConfig()
+	modifiedCfg.FullDuration = 99
+	scheduler.UpdateConfig(modifiedCfg)
+
+	// The previous snapshot MUST remain unchanged
+	if snapCfg.FullDuration != 12 {
+		t.Fatalf("snapshot must remain immutable, got %d", snapCfg.FullDuration)
+	}
+}
+
+func TestCandidatePromotion(t *testing.T) {
+	store := NewRouteStore()
+
+	// Route starts as Candidate
+	candidateIP := "104.16.1.1"
+	store.UpsertRoute(RouteMetrics{
+		IP:     candidateIP,
+		Port:   443,
+		Tier:   TierCandidate,
+		Health: HealthHealthy,
+	})
+
+	rec, _ := store.Get(candidateIP)
+
+	// Single high-speed test must NOT promote directly to Active!
+	sample1 := MeasurementSample{
+		Timestamp: time.Now().Add(-10 * time.Minute),
+		Speed:     85.0,
+		P10Speed:  70.0,
+		RTT:       25.0,
+		Stability: 95.0,
+		Success:   true,
+	}
+	rec.AddSample(sample1)
+	store.EvaluateTierTransitions(time.Now())
+
+	rec, _ = store.Get(candidateIP)
+	if rec.Metrics.Tier == TierActive {
+		t.Fatalf("single high speed test must NEVER promote Candidate directly to Active!")
+	}
+
+	// Add more observations over 6 minutes to satisfy promotion criteria
+	sample2 := MeasurementSample{
+		Timestamp: time.Now().Add(-5 * time.Minute),
+		Speed:     80.0,
+		P10Speed:  68.0,
+		RTT:       26.0,
+		Stability: 92.0,
+		Success:   true,
+	}
+	sample3 := MeasurementSample{
+		Timestamp: time.Now(),
+		Speed:     82.0,
+		P10Speed:  69.0,
+		RTT:       24.0,
+		Stability: 94.0,
+		Success:   true,
+	}
+	rec.AddSample(sample2)
+	rec.AddSample(sample3)
+
+	now := time.Now()
+	rec.Metrics.ObservationDuration = 360.0
+	rec.Metrics.Confidence = rec.CalcConfidence(now)
+	rec.Metrics.FinalScore = 88.0
+	rec.Metrics.Health = HealthHealthy
+	rec.Metrics.PacketLoss = 0.0
+	rec.Metrics.Jitter = 2.0
+	rec.Metrics.StallCount = 0
+
+	store.EvaluateTierTransitions(now)
+
+	rec, _ = store.Get(candidateIP)
+	if rec.Metrics.Tier != TierStandby && rec.Metrics.Tier != TierActive {
+		t.Fatalf("expected candidate to promote to Standby or Active, got %s", rec.Metrics.Tier)
+	}
+}
+
+func TestLongTermDemotion(t *testing.T) {
+	store := NewRouteStore()
+
+	activeIP := "104.16.2.1"
+	store.UpsertRoute(RouteMetrics{
+		IP:     activeIP,
+		Port:   443,
+		Tier:   TierActive,
+		Health: HealthHealthy,
+	})
+
+	now := time.Now()
+
+	// 1. Active degrades -> demotes to Standby
+	rec, _ := store.Get(activeIP)
+	rec.Metrics.Health = HealthDegraded
+	rec.Metrics.SpeedDropPercent = 45.0
+	store.EvaluateTierTransitions(now)
+
+	rec, _ = store.Get(activeIP)
+	if rec.Metrics.Tier != TierStandby {
+		t.Fatalf("expected degraded Active to demote to Standby, got %s", rec.Metrics.Tier)
+	}
+
+	// 2. Standby fails repeatedly -> demotes to Candidate
+	rec.Metrics.Health = HealthFailing
+	rec.Metrics.ConsecutiveFails = 3
+	store.EvaluateTierTransitions(now)
+
+	rec, _ = store.Get(activeIP)
+	if rec.Metrics.Tier != TierCandidate {
+		t.Fatalf("expected failing Standby to demote to Candidate, got %s", rec.Metrics.Tier)
+	}
+
+	// 3. Candidate fails persistently -> demotes to Failed
+	rec.Metrics.Health = HealthFailed
+	rec.Metrics.ConsecutiveFails = 5
+	store.EvaluateTierTransitions(now)
+
+	rec, _ = store.Get(activeIP)
+	if rec.Metrics.Tier != TierFailed {
+		t.Fatalf("expected persistent failing Candidate to demote to Failed, got %s", rec.Metrics.Tier)
+	}
+
+	// 4. Long-term failed (> 2h, fails >= 10) gets pruned
+	rec.Metrics.ConsecutiveFails = 10
+	rec.Metrics.LastTested = now.Add(-3 * time.Hour)
+	store.EvaluateTierTransitions(now)
+
+	_, exists := store.Get(activeIP)
+	if exists {
+		t.Fatalf("expected long-term failed route to be pruned from RouteStore")
+	}
+}

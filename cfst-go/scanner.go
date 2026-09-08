@@ -37,43 +37,49 @@ type Config struct {
 	Profile         string // "CFST" (default), "GOWAY-WSS", "CUSTOM"
 
 	// Route Quality Probe daemon options
-	DaemonMode        bool
-	APIAddr           string
-	ActiveInterval    int    // seconds
-	StandbyInterval   int    // seconds
-	CandidateInterval int    // seconds
-	FailedInterval    int    // seconds
-	ScoreMode         string // "normal" or "peak"
-	StateFile         string // path to state snapshot json
+	DaemonMode         bool
+	APIAddr            string
+	ActiveInterval     int    // seconds
+	StandbyInterval    int    // seconds
+	CandidateInterval  int    // seconds
+	FailedInterval     int    // seconds
+	ScoreMode          string // "normal" or "peak"
+	StateFile          string // path to state snapshot json
+	DiscoveryEnabled   bool   // periodic continuous discovery in background
+	DiscoveryInterval  int    // seconds between discovery passes (default 3600)
+	DiscoveryScanCount int    // random IPs scanned per pass (default 200)
 }
 
 func DefaultConfig() Config {
 	return Config{
-		Port:              443,
-		MaxScan:           3000,
-		TopN:              100,
-		DLConc:            1,
-		DownloadNum:       20,
-		Duration:          20,
-		StopThreshold:     30.0,
-		Unique:            false,
-		Output:            "result_colo.csv",
-		ScanConcurrent:    200,
-		WebPort:           "9876",
-		URL:               "https://speed.cloudflare.com/__down?bytes=500000000",
-		Skip429:           true,
-		QuickDuration:     3,
-		FilterMode:        "speed",
-		WSSHost:           "colo.4467107.xyz",
-		Profile:           "CFST",
-		DaemonMode:        false,
-		APIAddr:           "127.0.0.1:9876",
-		ActiveInterval:    10,
-		StandbyInterval:   30,
-		CandidateInterval: 180,
-		FailedInterval:    60,
-		ScoreMode:         "normal",
-		StateFile:         "cfst_state.json",
+		Port:               443,
+		MaxScan:            3000,
+		TopN:               100,
+		DLConc:             1,
+		DownloadNum:        20,
+		Duration:           20,
+		StopThreshold:      30.0,
+		Unique:             false,
+		Output:             "result_colo.csv",
+		ScanConcurrent:     200,
+		WebPort:            "9876",
+		URL:                "https://speed.cloudflare.com/__down?bytes=500000000",
+		Skip429:            true,
+		QuickDuration:      3,
+		FilterMode:         "speed",
+		WSSHost:            "colo.4467107.xyz",
+		Profile:            "CFST",
+		DaemonMode:         false,
+		APIAddr:            "127.0.0.1:9876",
+		ActiveInterval:     10,
+		StandbyInterval:    30,
+		CandidateInterval:  180,
+		FailedInterval:     60,
+		ScoreMode:          "normal",
+		StateFile:          "cfst_state.json",
+		DiscoveryEnabled:   true,
+		DiscoveryInterval:  3600,
+		DiscoveryScanCount: 200,
 	}
 }
 
@@ -102,6 +108,12 @@ func isCustomURL(urlStr string) bool {
 // - ProfileGOWAYWSS: TCP Ping + WSSHandshakeCheck (using Profile.Host, Profile.SNI, Profile.Path).
 // - ProfileCustom: TCP Ping + (HTTPSConnectivityCheck if http/https, WSSHandshakeCheck if wss).
 func ScanRoutesWithProfile(ctx context.Context, ips []string, port int, concurrency int, profile ProbeProfile, progressCallback func(done, total, valid int)) []NodeResult {
+	nodes, _, _ := ScanRoutesWithProfileDetailed(ctx, ips, port, concurrency, profile, progressCallback)
+	return nodes
+}
+
+// ScanRoutesWithProfileDetailed runs profile-driven candidate discovery and returns valid nodes along with TCP valid and L2 valid counts.
+func ScanRoutesWithProfileDetailed(ctx context.Context, ips []string, port int, concurrency int, profile ProbeProfile, progressCallback func(done, total, valid int)) ([]NodeResult, int, int) {
 	if profile.Type == "" {
 		profile = NewProfileCFST()
 	}
@@ -115,7 +127,7 @@ func ScanRoutesWithProfile(ctx context.Context, ips []string, port int, concurre
 
 	var validNodes []NodeResult
 	var mu sync.Mutex
-	var done, validCount atomic.Int32
+	var done, validCount, tcpValidCount, l2ValidCount atomic.Int32
 	total := len(ips)
 
 	if concurrency < 1 {
@@ -165,12 +177,14 @@ func ScanRoutesWithProfile(ctx context.Context, ips []string, port int, concurre
 			}
 
 			d := done.Add(1)
-			if len(lats) < pingCount-1 { // require at least 4 successful pings
+			if len(lats) < 3 { // require at least 3 successful pings (up to 40% loss tolerated)
 				if progressCallback != nil && (d%10 == 0 || d == int32(total)) {
 					progressCallback(int(d), total, int(validCount.Load()))
 				}
 				return
 			}
+
+			tcpValidCount.Add(1)
 
 			var sum float64
 			for _, l := range lats {
@@ -234,6 +248,8 @@ func ScanRoutesWithProfile(ctx context.Context, ips []string, port int, concurre
 				}
 			}
 
+			l2ValidCount.Add(1)
+
 			mu.Lock()
 			validNodes = append(validNodes, NodeResult{
 				IP:         ip,
@@ -252,7 +268,7 @@ func ScanRoutesWithProfile(ctx context.Context, ips []string, port int, concurre
 		}(ip)
 	}
 	wg.Wait()
-	return validNodes
+	return validNodes, int(tcpValidCount.Load()), int(l2ValidCount.Load())
 }
 
 // ScanPing runs 5 TCP pings per IP and filters by packet loss.
@@ -644,7 +660,7 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 }
 
 func RunCLI(cfg Config) {
-	fmt.Printf("Cloudflare SpeedTest v2.1.3 (Route Quality Probe - Go Edition)\n\n")
+	fmt.Printf("Cloudflare SpeedTest v2.1.4 (Route Quality Probe - Go Edition)\n\n")
 
 	ips := GenerateIPs(cfg.MaxScan, cfg.Unique, cfg.IPFile)
 	fmt.Printf("🔍 Scanning %d IPs (concurrency: %d)...\n", len(ips), cfg.ScanConcurrent)

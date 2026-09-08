@@ -39,6 +39,13 @@ func ConfigToProbeConfig(cfg Config) ProbeConfig {
 	if cfg.Duration > 0 {
 		probeCfg.FullDuration = cfg.Duration
 	}
+	if cfg.DiscoveryInterval > 0 {
+		probeCfg.DiscoveryInterval = time.Duration(cfg.DiscoveryInterval) * time.Second
+	}
+	if cfg.DiscoveryScanCount > 0 {
+		probeCfg.DiscoveryScanCount = cfg.DiscoveryScanCount
+	}
+	probeCfg.DiscoveryEnabled = cfg.DiscoveryEnabled
 
 	// Profile is strictly explicit!
 	switch strings.ToUpper(strings.TrimSpace(cfg.Profile)) {
@@ -62,7 +69,7 @@ func RunDaemon(cfg Config) {
 	GlobalScoreEngine.SetMode(ScoreMode(cfg.ScoreMode))
 
 	fmt.Println("============================================================")
-	fmt.Println("   CFST Route Quality Probe v2.1.3 (Continuous Daemon Mode)")
+	fmt.Println("   CFST Route Quality Probe v2.1.4 (Continuous Daemon Mode)")
 	fmt.Printf("   Listening on: http://%s\n", cfg.APIAddr)
 	fmt.Printf("   Score Mode:   %s\n", cfg.ScoreMode)
 	fmt.Printf("   Intervals:    Active: %ds | Standby: %ds | Candidate: %ds | Failed: %ds\n",
@@ -70,6 +77,10 @@ func RunDaemon(cfg Config) {
 		int(probeCfg.StandbyInterval.Seconds()),
 		int(probeCfg.CandidateInterval.Seconds()),
 		int(probeCfg.FailedInterval.Seconds()))
+	fmt.Printf("   Discovery:    Enabled: %v | Interval: %ds | ScanCount: %d\n",
+		probeCfg.DiscoveryEnabled,
+		int(probeCfg.DiscoveryInterval.Seconds()),
+		probeCfg.DiscoveryScanCount)
 	fmt.Printf("   Profile:      %s\n", probeCfg.Profile.Type)
 	fmt.Printf("   Protocol:     %s\n", strings.ToUpper(probeCfg.Profile.Protocol))
 	if probeCfg.Profile.Type == ProfileGOWAYWSS {
@@ -115,9 +126,15 @@ func RunDaemon(cfg Config) {
 		}
 	}()
 
-	// 4. Start background probe scheduler
+	// 4. Start background probe scheduler and discovery worker
 	GlobalProbeScheduler.Start(ctx)
 	fmt.Println("⚡ Background Probe Scheduler started.")
+
+	if probeCfg.DiscoveryEnabled {
+		GlobalDiscoveryManager.Start(ctx)
+		fmt.Printf("🔭 Continuous Discovery Engine started (interval: %ds, scan count: %d).\n",
+			int(probeCfg.DiscoveryInterval.Seconds()), probeCfg.DiscoveryScanCount)
+	}
 
 	// 5. Mount Web UI on DefaultServeMux if not already mounted
 	RegisterWebRoutes(cfg)
@@ -134,6 +151,7 @@ func RunDaemon(cfg Config) {
 		<-sigCh
 		fmt.Println("\n🛑 Shutting down Route Quality Probe daemon...")
 		cancel()
+		GlobalDiscoveryManager.Stop()
 		GlobalProbeScheduler.Stop()
 		if cfg.StateFile != "" {
 			_ = GlobalRouteStore.SaveSnapshot(cfg.StateFile)
