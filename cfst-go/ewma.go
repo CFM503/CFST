@@ -204,3 +204,34 @@ func (t *RouteEWMATracker) LongSnapshot() EWMASnapshot {
 		FailurePressure: t.LongFailurePressure.Value,
 	}
 }
+
+// Clone returns a deep copy of the tracker captured under read lock.
+// The copy carries a fresh zero mutex so it can be marshaled safely
+// outside the store lock without racing concurrent Record/RecordFailure.
+func (t *RouteEWMATracker) Clone() *RouteEWMATracker {
+	if t == nil {
+		return nil
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return &RouteEWMATracker{
+		ShortSpeed:           t.ShortSpeed,
+		ShortP10Speed:        t.ShortP10Speed,
+		ShortMinSpeed:        t.ShortMinSpeed,
+		ShortLatency:         t.ShortLatency,
+		ShortLoss:            t.ShortLoss,
+		ShortJitter:          t.ShortJitter,
+		ShortStability:       t.ShortStability,
+		ShortStallRate:       t.ShortStallRate,
+		ShortFailurePressure: t.ShortFailurePressure,
+		LongSpeed:            t.LongSpeed,
+		LongP10Speed:         t.LongP10Speed,
+		LongMinSpeed:         t.LongMinSpeed,
+		LongLatency:          t.LongLatency,
+		LongLoss:             t.LongLoss,
+		LongJitter:           t.LongJitter,
+		LongStability:        t.LongStability,
+		LongStallRate:        t.LongStallRate,
+		LongFailurePressure:  t.LongFailurePressure,
+	}
+}

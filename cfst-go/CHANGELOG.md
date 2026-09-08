@@ -1,5 +1,21 @@
 # Changelog
 
+## v2.1.7 (2026-09-08)
+
+### Release: Final Concurrency Safety Fix & Windows 11 x64 Release
+- **Fixed `RouteStore.SaveSnapshot()` real concurrent data race (`history.go`, `ewma.go`)**:
+  - Root cause: `SaveSnapshot()` collected live `*RouteRecord` pointers under `RLock`, released the lock, then `json.Marshal` read `Metrics/Samples/EWMA/PeakHours` while `RecordProbeResult/AddSample/Upsert` mutated them concurrently.
+  - Fix: added `RouteEWMATracker.Clone()` (fresh mutex, copied under tracker `RLock`) and `RouteRecord.Clone()` (deep copies `Samples`, `RecommendationReasons`, `EWMA` snapshot, `PeakHours`), and `SaveSnapshot()` now deep-copies all unique records while holding `s.mu.RLock()`, marshaling only the isolated copy outside the lock.
+  - Bumped `SnapshotContainer.Version` to `"2.1.7"` (backward-compatible load path unchanged).
+- **Fixed `ProbeScheduler` / `DiscoveryManager` ctx-cancel -> restart lifecycle race (`probe.go`, `discovery.go`)**:
+  - Root cause: goroutine exit via `ctx.Done()` unconditionally executed `running.Store(false)` without generation check and left stale `stopCh` behind; a stale cancel could therefore clear `running` after a newer `Start()` had set it to true.
+  - Fix: `Start()` now checks `running.Load()` under `mu` and creates a new `stopCh` per generation; worker goroutines capture `(myStopCh, myCtx)` and on `myCtx.Done()` clear `running` and nil `stopCh` only when `ps.stopCh == myStopCh` / `dm.stopCh == myStopCh` under lock; `Stop()` closes and nils `stopCh`. `DiscoveryManager` immediate startup pass now captures its context parameter and skips work when already cancelled.
+- **Real concurrency tests (`concurrency_race_test.go`)**:
+  - Added `TestRouteStoreSaveSnapshotConcurrentRace` driving real `RecordProbeResult` writers concurrently with real `SaveSnapshot`/`GetAll`/`GetBest`/tier-evaluation readers, then verifying final snapshot reload.
+  - Added `TestProbeSchedulerCtxCancelRestartNoClobber` and `TestDiscoveryManagerCtxCancelRestartNoClobber` proving old `ctx-cancel` cannot clobber a restarted generation's `running` flag.
+- **Targeted Windows 11 x64 Release (`.github/workflows/release.yml`)**:
+  - Publishes only `CFST-windows-amd64.exe` (`CGO_ENABLED=0`).
+
 ## v2.1.6 (2026-09-08)
 
 ### Release: Final Probe Lifecycle Hardening & Windows 11 x64 Release

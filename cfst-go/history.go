@@ -1020,19 +1020,49 @@ type SnapshotContainer struct {
 	Routes    map[string]*RouteRecord `json:"routes"`
 }
 
+// Clone returns a deep copy of the record safe to marshal outside the store lock.
+// Caller must hold at least s.mu.RLock() so concurrent RecordProbeResult/Upsert
+// (which hold s.mu.Lock()) cannot mutate rec while it is being copied.
+func (r *RouteRecord) Clone() *RouteRecord {
+	if r == nil {
+		return nil
+	}
+	cp := &RouteRecord{
+		Metrics:   r.Metrics,
+		PeakHours: r.PeakHours,
+		EWMA:      r.EWMA.Clone(),
+	}
+	if r.Samples != nil {
+		cp.Samples = make([]MeasurementSample, len(r.Samples))
+		copy(cp.Samples, r.Samples)
+	}
+	if r.Metrics.RecommendationReasons != nil {
+		reasons := make([]string, len(r.Metrics.RecommendationReasons))
+		copy(reasons, r.Metrics.RecommendationReasons)
+		cp.Metrics.RecommendationReasons = reasons
+	}
+	if r.Metrics.EWMA != nil {
+		snap := *r.Metrics.EWMA
+		cp.Metrics.EWMA = &snap
+	}
+	return cp
+}
+
 // SaveSnapshot serializes full state to a JSON file atomically (Windows safe).
 func (s *RouteStore) SaveSnapshot(path string) error {
+	// Deep-copy under RLock so json.Marshal below never reads live records
+	// concurrently mutated by RecordProbeResult/AddSample/Upsert.
 	s.mu.RLock()
 	uniqueRecords := make(map[string]*RouteRecord)
 	for ip, rec := range s.routes {
 		if rec != nil && rec.Metrics.IP == ip {
-			uniqueRecords[ip] = rec
+			uniqueRecords[ip] = rec.Clone()
 		}
 	}
 	s.mu.RUnlock()
 
 	container := SnapshotContainer{
-		Version:   "2.1.6",
+		Version:   "2.1.7",
 		Timestamp: time.Now(),
 		Routes:    uniqueRecords,
 	}

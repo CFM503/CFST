@@ -64,24 +64,28 @@ func (dm *DiscoveryManager) GetStatus() DiscoveryStatus {
 // Start launches the continuous background discovery worker.
 func (dm *DiscoveryManager) Start(ctx context.Context) {
 	dm.mu.Lock()
-	if dm.running.Swap(true) {
+	if dm.running.Load() {
 		dm.mu.Unlock()
 		return // already running
 	}
+	dm.running.Store(true)
 	stopCh := make(chan struct{})
 	dm.stopCh = stopCh
 	dm.mu.Unlock()
 
 	// 1. Trigger immediate initial discovery pass asynchronously on startup
-	go func() {
+	go func(myCtx context.Context) {
+		if myCtx.Err() != nil {
+			return
+		}
 		cfg := dm.sched.GetConfig()
 		if cfg.DiscoveryEnabled {
-			_, _ = dm.RunOnce(ctx)
+			_, _ = dm.RunOnce(myCtx)
 		}
-	}()
+	}(ctx)
 
 	// 2. Periodic background discovery loop
-	go func(stopCh <-chan struct{}) {
+	go func(myStopCh chan struct{}, myCtx context.Context) {
 		if dm.onStartGoroutine != nil {
 			dm.onStartGoroutine()
 		}
@@ -102,17 +106,24 @@ func (dm *DiscoveryManager) Start(ctx context.Context) {
 
 		for {
 			select {
-			case <-stopCh:
+			case <-myStopCh:
 				return
-			case <-ctx.Done():
-				dm.running.Store(false)
+			case <-myCtx.Done():
+				// Only clear running state if this generation is still current.
+				// Prevents a stale ctx-cancel from clobbering a newer Start().
+				dm.mu.Lock()
+				if dm.stopCh == myStopCh {
+					dm.running.Store(false)
+					dm.stopCh = nil
+				}
+				dm.mu.Unlock()
 				return
 			case <-ticker.C:
 				cfg := dm.sched.GetConfig()
 				if !cfg.DiscoveryEnabled {
 					continue
 				}
-				_, _ = dm.RunOnce(ctx)
+				_, _ = dm.RunOnce(myCtx)
 				// Re-align ticker if interval changed
 				if cfg.DiscoveryInterval > 0 && cfg.DiscoveryInterval != interval {
 					interval = cfg.DiscoveryInterval
@@ -120,7 +131,7 @@ func (dm *DiscoveryManager) Start(ctx context.Context) {
 				}
 			}
 		}
-	}(stopCh)
+	}(stopCh, ctx)
 }
 
 // Stop cleanly halts the background discovery worker.
@@ -130,6 +141,7 @@ func (dm *DiscoveryManager) Stop() {
 	if dm.running.Swap(false) {
 		if dm.stopCh != nil {
 			close(dm.stopCh)
+			dm.stopCh = nil
 		}
 	}
 }

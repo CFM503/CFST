@@ -72,14 +72,12 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: CFST v2.1.6
+          name: CFST v2.1.7
           body: |
-            Final probe lifecycle hardening.
-            - Fixed scheduler/discovery stop channel lifecycle race
-            - Hardened in-flight probe result isolation
-            - Added real Candidate L3 integration coverage
-            - Added lifecycle race coverage
-            - Preserved low-bandwidth discovery architecture
-            - Windows 11 x64 release
+            Final concurrency safety fix on top of v2.1.6.
+            - Fixed RouteStore.SaveSnapshot real concurrent data race via deep-copy under RLock
+            - Fixed ProbeScheduler/DiscoveryManager ctx-cancel restart lifecycle race via generation guard
+            - Added real concurrency tests (snapshot vs probe, ctx-cancel restart)
+            - Windows 11 x64 release only
           files: dist/CFST-windows-amd64.exe
           generate_release_notes: false

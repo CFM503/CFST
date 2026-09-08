@@ -810,15 +810,16 @@ func (ps *ProbeScheduler) ProbeOnce(ctx context.Context, ip string, forceSpeed b
 // Start launches the background probing daemon.
 func (ps *ProbeScheduler) Start(ctx context.Context) {
 	ps.mu.Lock()
-	if ps.running.Swap(true) {
+	if ps.running.Load() {
 		ps.mu.Unlock()
 		return // already running
 	}
+	ps.running.Store(true)
 	stopCh := make(chan struct{})
 	ps.stopCh = stopCh
 	ps.mu.Unlock()
 
-	go func(stopCh <-chan struct{}) {
+	go func(myStopCh chan struct{}, myCtx context.Context) {
 		if ps.onStartGoroutine != nil {
 			ps.onStartGoroutine()
 		}
@@ -833,20 +834,27 @@ func (ps *ProbeScheduler) Start(ctx context.Context) {
 
 		for {
 			select {
-			case <-stopCh:
+			case <-myStopCh:
 				return
-			case <-ctx.Done():
-				ps.running.Store(false)
+			case <-myCtx.Done():
+				// Only clear running state if this generation is still current.
+				// Prevents a stale ctx-cancel from clobbering a newer Start().
+				ps.mu.Lock()
+				if ps.stopCh == myStopCh {
+					ps.running.Store(false)
+					ps.stopCh = nil
+				}
+				ps.mu.Unlock()
 				return
 			case ip := <-ps.probeTrigger:
 				go func(targetIP string) {
-					ps.ProbeOnce(ctx, targetIP, true)
+					ps.ProbeOnce(myCtx, targetIP, true)
 				}(ip)
 			case now := <-ticker.C:
-				ps.evaluateAndSchedule(ctx, now)
+				ps.evaluateAndSchedule(myCtx, now)
 			}
 		}
-	}(stopCh)
+	}(stopCh, ctx)
 }
 
 // Stop cleanly terminates the probe scheduler.
@@ -856,6 +864,7 @@ func (ps *ProbeScheduler) Stop() {
 	if ps.running.Swap(false) {
 		if ps.stopCh != nil {
 			close(ps.stopCh)
+			ps.stopCh = nil
 		}
 	}
 }
