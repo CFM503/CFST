@@ -459,6 +459,14 @@ func (s *RouteStore) UpsertRoute(m RouteMetrics) *RouteRecord {
 	rec.Metrics.Stability = m.Stability
 	rec.Metrics.LoadLatency = m.LoadLatency
 	rec.Metrics.HandshakeSuccess = m.HandshakeSuccess
+	rec.Metrics.GOWAYWSSCompatible = m.GOWAYWSSCompatible
+	rec.Metrics.GOWAYWSSLatency = m.GOWAYWSSLatency
+	rec.Metrics.GOWAYWSSErrorStage = m.GOWAYWSSErrorStage
+	rec.Metrics.GOWAYWSSHTTPStatus = m.GOWAYWSSHTTPStatus
+	rec.Metrics.GOWAYWSSErrorMessage = m.GOWAYWSSErrorMessage
+	rec.Metrics.GOWAYWSSSNISent = m.GOWAYWSSSNISent
+	rec.Metrics.GOWAYWSSHostSent = m.GOWAYWSSHostSent
+	rec.Metrics.GOWAYWSSPathSent = m.GOWAYWSSPathSent
 	rec.Metrics.ZeroSpeedIntervals = m.ZeroSpeedIntervals
 	rec.Metrics.StallCount = m.StallCount
 	rec.Metrics.TotalStallDuration = m.TotalStallDuration
