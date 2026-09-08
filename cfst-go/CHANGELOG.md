@@ -1,5 +1,21 @@
 # Changelog
 
+## v2.2.1 (2026-09-08)
+
+### Release: Post-WSS Gate Speed Testing Decoupling & Documentation Enhancement
+- **Post-WSS Gate Speed Testing Target Decoupling (`scanner.go`)**:
+  - Fixed an issue where `runQuickFilter()` and `runParallelDownloadTest()` in GOWAY-WSS mode reused the WSS profile as the HTTPS download target, resulting in 0 candidates being selected during pre-filtering.
+  - Introduced `resolveSpeedTestTarget()`: after GOWAY-WSS / CUSTOM-WSS compatibility is verified via the WSS gate, the speed-quality evaluation phase strictly and automatically switches to the Cloudflare official HTTPS download endpoint (`speed.cloudflare.com/__down`).
+  - Completely decoupled the GOWAY-WSS accessibility check from the Cloudflare throughput/stability measurement.
+- **Unit Testing for Target Resolution (`scanner_test.go`)**:
+  - Added `TestResolveSpeedTestTargetForGOWAYWSS`: verifies GOWAY-WSS switches to official CFST HTTPS download target.
+  - Added `TestResolveSpeedTestTargetForCustomWSS`: verifies CUSTOM-WSS switches to official CFST HTTPS download target.
+  - Added `TestResolveSpeedTestTargetKeepsCFST`: verifies CFST mode remains 100% untouched.
+- **Comprehensive Documentation & Privacy-Safe Usage Guide (`README.md`)**:
+  - Added complete Quick Start & Usage section covering CLI, Daemon, and Web UI modes.
+  - Formatted all command examples with standard documentation placeholder domains (`goway.example.com`), completely sanitized of private domain names.
+  - Updated full CLI argument table with all modern parameters (`-profile`, `-wsshost`, `-wsspath`, `-sni`, `-qd`, etc.).
+
 ## v2.2.0 (2026-09-08)
 
 ### Release: GOWAY WSS Compatibility & End-to-End Selection Hard Gate

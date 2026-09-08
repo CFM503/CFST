@@ -72,15 +72,13 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: CFST v2.2.0
+          name: CFST v2.2.1
           body: |
-            GOWAY WSS Compatibility & End-to-End Selection Hard Gate Release.
-            - Real GOWAY WSS Handshake probe with strict HTTP 101 status validation
-            - Independent configuration of Host, SNI, Path, and Port
-            - Granular diagnostics: error stage, status code, detailed message, SNI/Host/Path sent
-            - Discovery-phase WSS gate & route upsert diagnostic persistence
-            - RouteStore selection (GetBest) and Tier transitions hard gate (Active demotion, Candidate/Standby promotion, Challenger protection)
-            - Strict default ProfileCFST remains 100% unaffected and isolated
+            GOWAY WSS Post-Gate Speed Testing Decoupling & Documentation Release.
+            - Decoupled speed-quality evaluation target: automatically routes to official Cloudflare HTTPS download after GOWAY-WSS gate
+            - Eliminated false 0 candidate pre-filter drop in GOWAY-WSS mode
+            - Added target resolution unit test suite (GOWAY-WSS, CUSTOM-WSS, CFST)
+            - Added complete privacy-sanitized Quick Start and Usage guide in README
             - Windows 11 x64 release only
           files: dist/CFST-windows-amd64.exe
           generate_release_notes: false
