@@ -72,12 +72,13 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: CFST v2.1.7
+          name: CFST v2.1.8
           body: |
-            Final concurrency safety fix on top of v2.1.6.
-            - Fixed RouteStore.SaveSnapshot real concurrent data race via deep-copy under RLock
-            - Fixed ProbeScheduler/DiscoveryManager ctx-cancel restart lifecycle race via generation guard
-            - Added real concurrency tests (snapshot vs probe, ctx-cancel restart)
+            Stabilization & Cross-Platform CI Reliability Release.
+            - Confirmed v2.1.7 stable route quality probe architecture as baseline
+            - Strict default ProfileCFST (Cloudflare official TCP + HTTPS, zero WSS)
+            - Hardened TCPPing sub-microsecond timer resolution on Windows loopback
+            - Stabilized raw TCP/TLS test listeners and readiness pre-flight for cross-platform CI
             - Windows 11 x64 release only
           files: dist/CFST-windows-amd64.exe
           generate_release_notes: false

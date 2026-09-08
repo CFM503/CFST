@@ -1,5 +1,19 @@
 # Changelog
 
+## v2.1.8 (2026-09-08)
+
+### Release: Stabilization & Cross-Platform CI Reliability Release
+- **恢复并确认 v2.1.7 稳定基线**:
+  - 严格保持 v2.1.7 经过充分验证的线路质量探测、多周期分层探针（L1~L5）、稳定性评分（EWMA、Peak Hour、保底 P10/P25）与候选池发现机制作为基线。
+  - 默认探针严格保持为 `ProfileCFST`（Cloudflare 官方 TCP + HTTPS），绝不自动执行 WebSocket 升级探测或向官方节点发送 `/pyway` 请求。
+  - 确认不包含任何未就绪的临时 WSS 门禁逻辑、无硬编码临时域名，无任何 Cloudflare IP 前缀黑白名单。
+- **改进 Windows CI 测试稳定性与跨平台探测健壮性**:
+  - 修复 `TCPPing` 在 Windows 本地回环（`127.0.0.1`）耗时小于 1 微秒时返回 `0.0` 导致偶发误判为超时丢包的问题，确保成功建立 TCP 连接时返回值始终大于 0。
+  - 针对 `TestDiscoveryUsesCFSTProfile` 与 `TestSeedCandidatesGOWAYWSSUsesProfile`，采用独立的 raw TCP/TLS 测试 listener 并引入 readiness pre-flight 预热，精准区分纯 TCP 探测与应用层 HTTP/TLS 请求，彻底消除 Windows 回环环境下偶发的连接竞争与 EOF 报错。
+- **完善全平台自动化测试流程**:
+  - 建立全平台 CI 测试流，确保 Linux（`ubuntu-latest`：单元测试、Race Detector、Go Vet）与 Windows（`windows-latest`：单元测试、Go Vet、二进制编译）均完全绿色通过。
+  - 为后续独立的新版 WSS 兼容性功能开发提供可靠、干净的代码基础。
+
 ## v2.1.7 (2026-09-08)
 
 ### Release: Final Concurrency Safety Fix & Windows 11 x64 Release

@@ -64,7 +64,7 @@ func main() {
 	flag.Parse()
 
 	if *versionFlag {
-		println("CFST v2.1.7 (GOWAY Route Quality Probe & Long-Term Stability Analyzer)")
+		println("CFST v2.1.8 (GOWAY Route Quality Probe & Long-Term Stability Analyzer)")
 		return
 	}
 
