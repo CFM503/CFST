@@ -1,5 +1,26 @@
 # Changelog
 
+## v2.1.2 (2026-09-08)
+
+### Fix: Unify Probe Profile Execution & Isolate GOWAY WSS Mode
+- **Unify Probe Profile Execution (`probe.go`)**:
+  - Implemented `ResolvedProbeTarget` and `ResolveProbeTarget()` to strictly unify parameters across all probe layers (L1~L4).
+  - All network probes (L2, L3, L4) are driven exclusively by `cfg.Profile` rather than legacy disparate fields (`cfg.URL`, `cfg.SNI`, `cfg.WSSHost`).
+  - Added centralized `NormalizeProbeConfig()` to guarantee `cfg.Profile` is the single source of truth while keeping legacy fields in sync.
+- **Isolate GOWAY WSS Mode & Fix Cloudflare Official WSS Conflict (`probe.go`, `engine.go`)**:
+  - In `ProfileCFST`, removed inappropriate `WSSHandshakeCheck` calls and `/pyway` requests.
+  - Implemented lightweight `HTTPSConnectivityCheck` for `ProfileCFST` (TLS handshake + HTTP HEAD/GET Range) verifying TLS status, TTFB, HTTP status, and CDN Colo without WebSocket upgrades.
+  - `ProfileGOWAYWSS` specifically executes GOWAY WSS Handshakes.
+  - `ProfileCustom` dynamically determines L2 checks based on protocol (`wss` vs `https`/`http`).
+- **Configurable WSS Handshake Check (`engine.go`)**:
+  - Updated `WSSHandshakeCheck` to accept `(ip, port, sni, host, path, timeout)`.
+  - Eliminated hardcoded `/pyway` path and hardcoded Host headers. Both are fully dynamic from the profile.
+- **Custom Profile URL & Header Isolation (`engine.go`, `probe.go`)**:
+  - Custom VPS URLs now accurately extract and use their own hostname, SNI, Host, and Path.
+  - Custom endpoints no longer default to `speed.cloudflare.com` Origin/Referer headers in `LightweightHTTPProbe`.
+- **Immediate API Profile Application (`api.go`, `probe.go`)**:
+  - POST `/api/config` updating `profile_type`, `test_url`, `sni`, `host`, `path` immediately affects `GlobalProbeScheduler` and the very next probe pass without delay or stale cache.
+
 ## v2.1.1 (2026-09-08)
 
 ### Hardening: Long-Term Probe Stability & Low-Traffic Scheduling

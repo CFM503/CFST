@@ -1,10 +1,10 @@
 # CFST - Cloudflare Route Quality Probe & SpeedTest
 
-> v2.1.1 | Go Edition
+> v2.1.2 | Go Edition
 
 CFST 已从一次性 Cloudflare IP 测速工具全面重构升级为 **GOWAY 线路质量长期探针 + 稳定性分析 + 高峰期选路数据源 (Route Quality Probe & Stability Analyzer)**。
 
-核心设计哲学：**稳定性与保底速度 (P10) > 峰值瞬时速度**。杜绝瞬时抽水型峰值节点影响排名，为流媒体、高速隧道与科学选路提供最具韧性的前置线路决策依据。v2.1.1 强化了长期低带宽探针调度、Profile 标准化、真 24h 时序记忆、置信度时间门控与陈旧节点保护机制。
+核心设计哲学：**稳定性与保底速度 (P10) > 峰值瞬时速度**。杜绝瞬时抽水型峰值节点影响排名，为流媒体、高速隧道与科学选路提供最具韧性的前置线路决策依据。v2.1.2 全面实现了统一 ProbeProfile 驱动执行架构，彻底解耦 Cloudflare 官方探针与 GOWAY WSS 模式，消除配置漂移并支持 API 即时热生效。
 
 作为测量层无缝对接 **GoPass 控制器** 与 **GOWAY 隧道**。
 
@@ -70,6 +70,26 @@ CFST 已从一次性 Cloudflare IP 测速工具全面重构升级为 **GOWAY 线
 - 🧭 **智能选路建议体系 (Recommendations)** — 输出 `BEST`、`GOOD`、`USABLE`、`DEGRADED`、`AVOID`、`FAILED` 等级并附带诊断原因列表。
 - 📉 **EWMA 故障压制与衰减** — 线路发生探测失败时，EWMA 立即施加失败压力（`RecordFailure`），指数级衰减历史速度，防止离线节点残留虚高评分。
 - 💾 **原子化安全持久化** — 支持 Windows 文件系统安全的临时文件写入、`.bak` 轮转备份与双重恢复机制。
+
+---
+
+## ProbeProfile 统一驱动执行与 GOWAY WSS 解耦隔离 (v2.1.2)
+
+- 🎯 **真正的 ProbeProfile 驱动执行 (`ResolvedProbeTarget`)** —
+  - 彻底终结历史遗留字段（`cfg.URL`、`cfg.SNI`、`cfg.WSSHost`）与实际执行脱节的问题。
+  - 新增统一 Target 解析器 `ResolveProbeTarget(cfg, ip, port)`，将网络参数集中收敛至 `ResolvedProbeTarget`。
+  - 所有 L1（Ping）、L2（连通性）、L3（轻量 HTTP）、L4（全量测速）严格按统一目标执行，彻底杜绝配置漂移。
+- 🛡️ **隔离与解耦 CFST 默认模式与 GOWAY WSS** —
+  - 默认模式 **`ProfileCFST`（Cloudflare Official）** 严格定义为普通 HTTPS 探针，**绝不调用 `WSSHandshakeCheck`**，也绝不向官方发送 `/pyway` 升级请求。
+  - 新增专属 **`HTTPSConnectivityCheck`**，通过轻量级 TLS 握手 + HTTP HEAD/GET Range 探测 TTFB、HTTP 状态码及 CDN Colo，耗费流量极低。
+  - **`ProfileGOWAYWSS`** 专用于 GOWAY 节点校验，严格使用 Profile 传入的 Host、SNI 与 Path。
+  - **`ProfileCustom`** 根据用户指定的 `Protocol` 动态选择 TLS/HTTPS 或 WSS 探针，绝不无条件跑 GOWAY WSS 握手。
+- 🧩 **`WSSHandshakeCheck` 动态参数化** —
+  - 彻底移除硬编码的 `/pyway` 路径与死板 Host 头，签名全面重构为支持 `(ip, port, sni, host, path, timeout)`，支持自定义 GOWAY 部署路径覆盖。
+- 🌐 **Custom Profile 标头隔离与真实自建 VPS 探针** —
+  - 用户配置自建 VPS 测速目标（如 `https://my-vps/test.bin`）时，L3 / L4 自动提取并使用其真实主机名、SNI 与 Host 标头，不再硬塞 `speed.cloudflare.com` 的 Origin/Referer。
+- ⚡ **API 配置热修改即时生效** —
+  - 通过集中式 `NormalizeProbeConfig()` 在收到 `/api/config` POST 时完成 Profile 校验与规范化，写入后下一次 `ProbeOnce` 毫秒级直接生效。
 
 ---
 

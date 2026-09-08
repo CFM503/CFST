@@ -138,7 +138,7 @@ func ScanPing(ctx context.Context, ips []string, port int, concurrency int, wssH
 				}
 				avgLat := sum / float64(len(lats))
 
-				if wssHost != "" && !WSSHandshakeCheck(ip, port, wssHost, 3*time.Second) {
+				if wssHost != "" && !WSSHandshakeCheck(ip, port, wssHost, wssHost, "/pyway", 3*time.Second) {
 					d := done.Add(1)
 					if progressCallback != nil && (d%10 == 0 || d == int32(total)) {
 						progressCallback(int(d), total, int(validCount.Load()))
@@ -466,7 +466,7 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 }
 
 func RunCLI(cfg Config) {
-	fmt.Printf("Cloudflare SpeedTest v2.1.1 (Route Quality Probe - Go Edition)\n\n")
+	fmt.Printf("Cloudflare SpeedTest v2.1.2 (Route Quality Probe - Go Edition)\n\n")
 
 	ips := GenerateIPs(cfg.MaxScan, cfg.Unique, cfg.IPFile)
 	fmt.Printf("🔍 Scanning %d IPs (concurrency: %d)...\n", len(ips), cfg.ScanConcurrent)

@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"math"
+	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -71,14 +73,179 @@ func NewProfileCustom(customURL, sni string, port int) ProbeProfile {
 	if port <= 0 {
 		port = 443
 	}
+	host := sni
+	path := "/"
+	protocol := "https"
+	if customURL != "" {
+		if u, err := url.Parse(customURL); err == nil {
+			if u.Hostname() != "" {
+				host = u.Hostname()
+				if sni == "" {
+					sni = host
+				}
+			}
+			if u.RequestURI() != "" {
+				path = u.RequestURI()
+			}
+			if u.Scheme != "" {
+				protocol = u.Scheme
+			}
+		}
+	}
+	if host == "" {
+		host = sni
+	}
 	return ProbeProfile{
 		Type:     ProfileCustom,
 		Port:     port,
 		SNI:      sni,
-		Host:     sni,
-		Path:     "/",
+		Host:     host,
+		Path:     path,
 		TestURL:  customURL,
-		Protocol: "https",
+		Protocol: protocol,
+	}
+}
+
+// ResolvedProbeTarget defines a normalized and unified target descriptor
+// ensuring all probe layers (L1~L4) execute with strictly consistent parameters.
+type ResolvedProbeTarget struct {
+	ProfileType ProbeProfileType `json:"profile_type"`
+	IP          string           `json:"ip"`
+	Port        int              `json:"port"`
+	SNI         string           `json:"sni"`
+	Host        string           `json:"host"`
+	Path        string           `json:"path"`
+	URL         string           `json:"url"`
+	Protocol    string           `json:"protocol"`
+}
+
+// NormalizeProbeConfig reconciles cfg.Profile as the single source of truth,
+// ensuring legacy fields (URL, SNI, WSSHost, Port) stay in sync and isolating WSS in CFST mode.
+func NormalizeProbeConfig(cfg *ProbeConfig) {
+	if cfg == nil {
+		return
+	}
+
+	if cfg.Profile.Type == "" {
+		cfg.Profile = NewProfileCFST()
+	}
+
+	switch cfg.Profile.Type {
+	case ProfileCFST:
+		if cfg.Profile.TestURL == "" {
+			cfg.Profile.TestURL = "https://speed.cloudflare.com/__down?bytes=500000000"
+		}
+		if cfg.Profile.SNI == "" {
+			cfg.Profile.SNI = "speed.cloudflare.com"
+		}
+		if cfg.Profile.Host == "" {
+			cfg.Profile.Host = cfg.Profile.SNI
+		}
+		if cfg.Profile.Path == "" {
+			cfg.Profile.Path = "/__down"
+		}
+		if cfg.Profile.Protocol == "" {
+			cfg.Profile.Protocol = "https"
+		}
+		if cfg.Profile.Port <= 0 {
+			cfg.Profile.Port = 443
+		}
+		// In CFST mode, WSSHost must NOT participate
+		cfg.WSSHost = ""
+
+	case ProfileGOWAYWSS:
+		if cfg.Profile.Host == "" {
+			cfg.Profile.Host = "colo.4467107.xyz"
+		}
+		if cfg.Profile.SNI == "" {
+			cfg.Profile.SNI = cfg.Profile.Host
+		}
+		if cfg.Profile.Path == "" {
+			cfg.Profile.Path = "/pyway"
+		}
+		if cfg.Profile.Protocol == "" {
+			cfg.Profile.Protocol = "wss"
+		}
+		if cfg.Profile.Port <= 0 {
+			cfg.Profile.Port = 443
+		}
+		if cfg.Profile.TestURL == "" {
+			cfg.Profile.TestURL = "https://speed.cloudflare.com/__down?bytes=500000000"
+		}
+		cfg.WSSHost = cfg.Profile.Host
+
+	case ProfileCustom:
+		if cfg.Profile.Port <= 0 {
+			cfg.Profile.Port = 443
+		}
+		if cfg.Profile.TestURL != "" {
+			if u, err := url.Parse(cfg.Profile.TestURL); err == nil && u.Hostname() != "" {
+				if cfg.Profile.Host == "" {
+					cfg.Profile.Host = u.Hostname()
+				}
+				if cfg.Profile.SNI == "" {
+					cfg.Profile.SNI = cfg.Profile.Host
+				}
+				if cfg.Profile.Path == "" {
+					cfg.Profile.Path = u.RequestURI()
+				}
+				if cfg.Profile.Protocol == "" && u.Scheme != "" {
+					cfg.Profile.Protocol = u.Scheme
+				}
+			}
+		}
+		if cfg.Profile.Protocol == "" {
+			cfg.Profile.Protocol = "https"
+		}
+		if cfg.Profile.Path == "" {
+			cfg.Profile.Path = "/"
+		}
+		if cfg.Profile.Protocol == "wss" {
+			cfg.WSSHost = cfg.Profile.Host
+		} else {
+			cfg.WSSHost = ""
+		}
+	}
+
+	// Synchronize legacy fields from Profile (Profile is the single source of truth!)
+	cfg.URL = cfg.Profile.TestURL
+	cfg.SNI = cfg.Profile.SNI
+	cfg.Port = cfg.Profile.Port
+
+	if cfg.L3ProbeCycle < 1 {
+		cfg.L3ProbeCycle = 3
+	}
+	if cfg.FullSpeedCycle < 1 {
+		cfg.FullSpeedCycle = 60
+	}
+	cfg.SpeedTestCycle = cfg.FullSpeedCycle
+	if cfg.MaxSpeedTests < 1 {
+		cfg.MaxSpeedTests = 1
+	}
+	if cfg.MaxConcurrent < 1 {
+		cfg.MaxConcurrent = 2
+	}
+}
+
+// ResolveProbeTarget returns a ResolvedProbeTarget for an IP/port based strictly on cfg.Profile.
+func ResolveProbeTarget(cfg ProbeConfig, ip string, port int) ResolvedProbeTarget {
+	NormalizeProbeConfig(&cfg)
+	targetPort := port
+	if targetPort <= 0 {
+		targetPort = cfg.Profile.Port
+	}
+	if targetPort <= 0 {
+		targetPort = 443
+	}
+	return ResolvedProbeTarget{
+		ProfileType: cfg.Profile.Type,
+		IP:          ip,
+		Port:        targetPort,
+		SNI:         cfg.Profile.SNI,
+		Host:        cfg.Profile.Host,
+		Path:        cfg.Profile.Path,
+		URL:         cfg.Profile.TestURL,
+		Protocol:    cfg.Profile.Protocol,
 	}
 }
 
@@ -104,7 +271,7 @@ type ProbeConfig struct {
 
 func DefaultProbeConfig() ProbeConfig {
 	prof := NewProfileCFST()
-	return ProbeConfig{
+	cfg := ProbeConfig{
 		Profile:           prof,
 		ActiveInterval:    10 * time.Second,
 		StandbyInterval:   30 * time.Second,
@@ -117,11 +284,13 @@ func DefaultProbeConfig() ProbeConfig {
 		L3ProbeCycle:      3,  // L3 lightweight 100KB probe every 3 cycles (~30s on Active)
 		FullSpeedCycle:    60, // L4 full speed calibration every 60 cycles (~10m on Active)
 		SpeedTestCycle:    60,
-		WSSHost:           "colo.4467107.xyz",
+		WSSHost:           "", // isolated from CFST mode!
 		SNI:               prof.SNI,
 		URL:               prof.TestURL,
 		Port:              prof.Port,
 	}
+	NormalizeProbeConfig(&cfg)
+	return cfg
 }
 
 // LayeredProbeResult contains metrics produced by a multi-layer probe pass.
@@ -165,18 +334,7 @@ type ProbeScheduler struct {
 var GlobalProbeScheduler = NewProbeScheduler(GlobalRouteStore, DefaultProbeConfig())
 
 func NewProbeScheduler(store *RouteStore, cfg ProbeConfig) *ProbeScheduler {
-	if cfg.MaxSpeedTests < 1 {
-		cfg.MaxSpeedTests = 1
-	}
-	if cfg.MaxConcurrent < 1 {
-		cfg.MaxConcurrent = 2
-	}
-	if cfg.L3ProbeCycle < 1 {
-		cfg.L3ProbeCycle = 3
-	}
-	if cfg.FullSpeedCycle < 1 {
-		cfg.FullSpeedCycle = 60
-	}
+	NormalizeProbeConfig(&cfg)
 	return &ProbeScheduler{
 		store:        store,
 		cfg:          cfg,
@@ -188,6 +346,7 @@ func NewProbeScheduler(store *RouteStore, cfg ProbeConfig) *ProbeScheduler {
 }
 
 func (ps *ProbeScheduler) UpdateConfig(cfg ProbeConfig) {
+	NormalizeProbeConfig(&cfg)
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 	ps.cfg = cfg
@@ -199,9 +358,10 @@ func (ps *ProbeScheduler) GetConfig() ProbeConfig {
 	return ps.cfg
 }
 
-// ExecuteLayeredProbe executes L1 to L5 sequentially on an IP, strictly minimizing bandwidth usage.
+// ExecuteLayeredProbe executes L1 to L5 sequentially on an IP, strictly driven by cfg.Profile via ResolvedProbeTarget.
 func (ps *ProbeScheduler) ExecuteLayeredProbe(ctx context.Context, ip string, port int, runL3 bool, runFullSpeed bool) LayeredProbeResult {
 	cfg := ps.GetConfig()
+	target := ResolveProbeTarget(cfg, ip, port)
 	res := LayeredProbeResult{Success: false}
 
 	// -------------------------------------------------------------
@@ -214,7 +374,7 @@ func (ps *ProbeScheduler) ExecuteLayeredProbe(ctx context.Context, ip string, po
 			res.Error = "Context cancelled"
 			return res
 		}
-		lat := TCPPing(ip, port, 1500*time.Millisecond)
+		lat := TCPPing(target.IP, target.Port, 1500*time.Millisecond)
 		if lat > 0 {
 			lats = append(lats, lat)
 		}
@@ -252,28 +412,70 @@ func (ps *ProbeScheduler) ExecuteLayeredProbe(ctx context.Context, ip string, po
 	}
 
 	// -------------------------------------------------------------
-	// Layer 2: WSS Handshake (Simulates goway TLS WebSocket upgrade)
+	// Layer 2: L2 Connectivity Check (Profile-Driven)
 	// -------------------------------------------------------------
-	if cfg.WSSHost != "" {
-		sni := cfg.SNI
-		if sni == "" {
-			sni = cfg.WSSHost
-		}
-		if !WSSHandshakeCheck(ip, port, sni, 3*time.Second) {
+	switch target.ProfileType {
+	case ProfileCFST:
+		// ProfileCFST: Standard HTTPS / TLS connectivity check.
+		// NEVER run GOWAY WSS Handshake or request /pyway in CFST mode.
+		ok, _, _, colo, err := HTTPSConnectivityCheck(ctx, target.IP, target.Port, target.SNI, target.Host, target.URL, 3*time.Second)
+		if !ok {
 			res.HandshakeSuccess = false
-			res.Error = "WSS handshake failed (e.g. 403 or TLS error)"
+			if err != nil {
+				res.Error = "HTTPS connectivity check failed: " + err.Error()
+			} else {
+				res.Error = "HTTPS connectivity check failed"
+			}
 			return res
 		}
 		res.HandshakeSuccess = true
-	} else {
+		if colo != "" {
+			res.Colo = colo
+		}
+
+	case ProfileGOWAYWSS:
+		// ProfileGOWAYWSS: GOWAY WSS Handshake with configurable Host, SNI, and Path from Profile.
+		ok := WSSHandshakeCheck(target.IP, target.Port, target.SNI, target.Host, target.Path, 3*time.Second)
+		if !ok {
+			res.HandshakeSuccess = false
+			res.Error = "GOWAY WSS handshake failed (e.g. 403 or TLS error)"
+			return res
+		}
 		res.HandshakeSuccess = true
+
+	case ProfileCustom:
+		// ProfileCustom: Protocol-driven check
+		if target.Protocol == "wss" {
+			ok := WSSHandshakeCheck(target.IP, target.Port, target.SNI, target.Host, target.Path, 3*time.Second)
+			if !ok {
+				res.HandshakeSuccess = false
+				res.Error = "Custom WSS handshake failed"
+				return res
+			}
+			res.HandshakeSuccess = true
+		} else {
+			ok, _, _, colo, err := HTTPSConnectivityCheck(ctx, target.IP, target.Port, target.SNI, target.Host, target.URL, 3*time.Second)
+			if !ok {
+				res.HandshakeSuccess = false
+				if err != nil {
+					res.Error = "Custom HTTP(S) check failed: " + err.Error()
+				} else {
+					res.Error = "Custom HTTP(S) check failed"
+				}
+				return res
+			}
+			res.HandshakeSuccess = true
+			if colo != "" {
+				res.Colo = colo
+			}
+		}
 	}
 
 	// -------------------------------------------------------------
 	// Layer 3: Lightweight HTTP / HTTPS Probe (~100KB payload)
 	// -------------------------------------------------------------
 	if runL3 && !runFullSpeed {
-		l3Res := LightweightHTTPProbe(ctx, ip, port, cfg.URL, cfg.SNI)
+		l3Res := LightweightHTTPProbe(ctx, target.IP, target.Port, target.URL, target.SNI)
 		if !l3Res.Success {
 			res.Error = "L3 HTTP probe failed: " + l3Res.Error
 			return res
@@ -302,7 +504,7 @@ func (ps *ProbeScheduler) ExecuteLayeredProbe(ctx context.Context, ip string, po
 			duration = 5
 		}
 
-		sm := SingleStreamTestDetailed(ctx, ip, port, duration, cfg.URL, cfg.SNI, nil, res.RTT, res.Jitter, res.PacketLoss)
+		sm := SingleStreamTestDetailed(ctx, target.IP, target.Port, duration, target.URL, target.SNI, nil, res.RTT, res.Jitter, res.PacketLoss)
 		res.SingleSpeed = sm.AverageSpeed
 		res.MinSpeed = sm.MinSpeed
 		res.P10Speed = sm.P10Speed
@@ -321,14 +523,14 @@ func (ps *ProbeScheduler) ExecuteLayeredProbe(ctx context.Context, ip string, po
 			return res
 		}
 
-		// Detect Colo if unknown
-		if res.Colo == "" {
-			res.Colo = GetColo(ip, port)
+		// Detect Colo if unknown and CF URL
+		if res.Colo == "" && strings.Contains(target.URL, "speed.cloudflare.com") {
+			res.Colo = GetColo(target.IP, target.Port)
 		}
 
-		// Layer 5: Load Latency (optional)
-		if !isCustomURL(cfg.URL) {
-			res.LoadLatency = MeasureLoadLatency(ip, port)
+		// Layer 5: Load Latency (optional, only for official CF endpoint)
+		if !isCustomURL(target.URL) {
+			res.LoadLatency = MeasureLoadLatency(target.IP, target.Port)
 		}
 	}
 

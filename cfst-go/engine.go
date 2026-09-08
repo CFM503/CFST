@@ -699,9 +699,25 @@ func TCPPing(ip string, port int, timeout time.Duration) float64 {
 	return float64(time.Since(start).Microseconds()) / 1000.0
 }
 
-// WSSHandshakeCheck simulates goway's WebSocket upgrade handshake over TLS.
+// WSSHandshakeCheck simulates goway's WebSocket upgrade handshake over TLS using target parameters.
 // Returns true if the server responds with 101 Switching Protocols.
-func WSSHandshakeCheck(ip string, port int, sni string, timeout time.Duration) bool {
+func WSSHandshakeCheck(ip string, port int, sni string, host string, path string, timeout time.Duration) bool {
+	if host == "" {
+		host = sni
+	}
+	if sni == "" {
+		sni = host
+	}
+	if path == "" {
+		path = "/pyway"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	if timeout <= 0 {
+		timeout = 3 * time.Second
+	}
+
 	addr := net.JoinHostPort(ip, fmt.Sprintf("%d", port))
 	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
@@ -718,8 +734,8 @@ func WSSHandshakeCheck(ip string, port int, sni string, timeout time.Duration) b
 		return false
 	}
 
-	req := "GET /pyway HTTP/1.1\r\n" +
-		fmt.Sprintf("Host: %s\r\n", sni) +
+	req := fmt.Sprintf("GET %s HTTP/1.1\r\n", path) +
+		fmt.Sprintf("Host: %s\r\n", host) +
 		"Upgrade: websocket\r\n" +
 		"Connection: Upgrade\r\n" +
 		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
@@ -737,6 +753,97 @@ func WSSHandshakeCheck(ip string, port int, sni string, timeout time.Duration) b
 	}
 	resp := string(buf[:n])
 	return strings.Contains(resp, "101")
+}
+
+// HTTPSConnectivityCheck performs low-bandwidth L2 HTTPS/TLS reachability verification,
+// measuring TTFB, validating HTTP status code (< 500), and extracting CDN Colo.
+func HTTPSConnectivityCheck(ctx context.Context, ip string, port int, sni string, host string, testURL string, timeout time.Duration) (bool, float64, int, string, error) {
+	if timeout <= 0 {
+		timeout = 3 * time.Second
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	parsedURL, err := url.Parse(testURL)
+	if err != nil {
+		return false, 0, 0, "", fmt.Errorf("invalid test URL: %w", err)
+	}
+	if host == "" {
+		host = parsedURL.Hostname()
+	}
+	if sni == "" {
+		sni = host
+	}
+
+	client := makeHTTPClient(ip, port, sni)
+	if tr, ok := client.Transport.(*http.Transport); ok {
+		defer tr.CloseIdleConnections()
+	}
+
+	req, err := http.NewRequestWithContext(reqCtx, "HEAD", testURL, nil)
+	if err != nil {
+		return false, 0, 0, "", err
+	}
+	req.Host = host
+	req.Header.Set("Connection", "close")
+
+	if strings.Contains(testURL, "speed.cloudflare.com") {
+		setCFHeaders(req)
+	} else {
+		scheme := parsedURL.Scheme
+		if scheme == "" {
+			scheme = "https"
+		}
+		baseURL := scheme + "://" + host
+		if parsedURL.Port() != "" {
+			baseURL += ":" + parsedURL.Port()
+		}
+		setCFHeadersForURL(req, baseURL)
+	}
+
+	t0 := time.Now()
+	resp, err := client.Do(req)
+	// If server rejects HEAD (e.g. 405 Method Not Allowed), retry with lightweight GET Range
+	if err == nil && resp.StatusCode == http.StatusMethodNotAllowed {
+		resp.Body.Close()
+		reqGet, gErr := http.NewRequestWithContext(reqCtx, "GET", testURL, nil)
+		if gErr == nil {
+			reqGet.Host = host
+			reqGet.Header.Set("Connection", "close")
+			reqGet.Header.Set("Range", "bytes=0-1023")
+			if strings.Contains(testURL, "speed.cloudflare.com") {
+				setCFHeaders(reqGet)
+			} else {
+				baseURL := parsedURL.Scheme + "://" + host
+				setCFHeadersForURL(reqGet, baseURL)
+			}
+			t0 = time.Now()
+			resp, err = client.Do(reqGet)
+		}
+	}
+
+	if err != nil {
+		return false, 0, 0, "", err
+	}
+	defer resp.Body.Close()
+
+	ttfb := float64(time.Since(t0).Microseconds()) / 1000.0
+	statusCode := resp.StatusCode
+	colo := ""
+
+	cfRay := resp.Header.Get("cf-ray")
+	if cfRay != "" {
+		parts := strings.Split(cfRay, "-")
+		if len(parts) >= 2 {
+			colo = strings.ToUpper(parts[len(parts)-1])
+		}
+	}
+
+	if statusCode >= 500 {
+		return false, ttfb, statusCode, colo, fmt.Errorf("HTTP %d", statusCode)
+	}
+
+	return true, ttfb, statusCode, colo, nil
 }
 
 var coloRe = regexp.MustCompile(`colo=([A-Z]+)`)
@@ -894,15 +1001,26 @@ func LightweightHTTPProbe(ctx context.Context, ip string, port int, testURL, cus
 	reqCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
 
-	req, err := newCFRequestWithContext(reqCtx, "GET", probeURL)
+	req, err := http.NewRequestWithContext(reqCtx, "GET", probeURL, nil)
 	if err != nil {
 		res.Error = err.Error()
 		return res
 	}
 	req.Host = host
 	req.Header.Set("Connection", "close")
-	// If custom URL, request range to keep bandwidth small
-	if !strings.Contains(testURL, "speed.cloudflare.com") {
+
+	if strings.Contains(testURL, "speed.cloudflare.com") {
+		setCFHeaders(req)
+	} else {
+		scheme := parsedURL.Scheme
+		if scheme == "" {
+			scheme = "https"
+		}
+		baseURL := scheme + "://" + host
+		if parsedURL.Port() != "" {
+			baseURL += ":" + parsedURL.Port()
+		}
+		setCFHeadersForURL(req, baseURL)
 		req.Header.Set("Range", "bytes=0-102399")
 	}
 

@@ -802,7 +802,7 @@ func (s *RouteStore) SaveSnapshot(path string) error {
 	s.mu.RUnlock()
 
 	container := SnapshotContainer{
-		Version:   "2.1.1",
+		Version:   "2.1.2",
 		Timestamp: time.Now(),
 		Routes:    uniqueRecords,
 	}

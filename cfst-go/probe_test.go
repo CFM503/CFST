@@ -128,3 +128,144 @@ func TestProbeProfileConfiguration(t *testing.T) {
 		t.Fatalf("unexpected Custom profile: %+v", customProf)
 	}
 }
+
+func TestProfileCFSTDoesNotCallWSS(t *testing.T) {
+	cfg := DefaultProbeConfig()
+	if cfg.Profile.Type != ProfileCFST {
+		t.Fatalf("expected default profile CFST, got %s", cfg.Profile.Type)
+	}
+	if cfg.WSSHost != "" {
+		t.Fatalf("CFST mode must have empty WSSHost, got %s", cfg.WSSHost)
+	}
+
+	target := ResolveProbeTarget(cfg, "1.1.1.1", 443)
+	if target.ProfileType != ProfileCFST {
+		t.Fatalf("expected resolved target CFST, got %s", target.ProfileType)
+	}
+	if target.Protocol != "https" {
+		t.Fatalf("expected https protocol for CFST, got %s", target.Protocol)
+	}
+	if target.SNI != "speed.cloudflare.com" || target.Host != "speed.cloudflare.com" {
+		t.Fatalf("expected speed.cloudflare.com, got SNI=%s, Host=%s", target.SNI, target.Host)
+	}
+}
+
+func TestProfileGOWAYWSSCustomParameters(t *testing.T) {
+	prof := NewProfileGOWAYWSS("edge.goway.internal", "/custom-way", "sni.goway.internal", 8443)
+	cfg := DefaultProbeConfig()
+	cfg.Profile = prof
+	NormalizeProbeConfig(&cfg)
+
+	target := ResolveProbeTarget(cfg, "1.2.3.4", 8443)
+	if target.ProfileType != ProfileGOWAYWSS {
+		t.Fatalf("expected GOWAY-WSS, got %s", target.ProfileType)
+	}
+	if target.Host != "edge.goway.internal" {
+		t.Fatalf("expected edge.goway.internal, got %s", target.Host)
+	}
+	if target.Path != "/custom-way" {
+		t.Fatalf("expected /custom-way, got %s", target.Path)
+	}
+	if target.SNI != "sni.goway.internal" {
+		t.Fatalf("expected sni.goway.internal, got %s", target.SNI)
+	}
+	if target.Protocol != "wss" {
+		t.Fatalf("expected wss protocol, got %s", target.Protocol)
+	}
+	if target.Port != 8443 {
+		t.Fatalf("expected port 8443, got %d", target.Port)
+	}
+}
+
+func TestProfileCustomVPSURL(t *testing.T) {
+	vpsURL := "https://my-vps.com:8443/data/speedtest.bin"
+	prof := NewProfileCustom(vpsURL, "my-vps.com", 8443)
+	cfg := DefaultProbeConfig()
+	cfg.Profile = prof
+	NormalizeProbeConfig(&cfg)
+
+	target := ResolveProbeTarget(cfg, "8.8.8.8", 8443)
+	if target.ProfileType != ProfileCustom {
+		t.Fatalf("expected CUSTOM profile, got %s", target.ProfileType)
+	}
+	if target.URL != vpsURL {
+		t.Fatalf("expected %s, got %s", vpsURL, target.URL)
+	}
+	if target.Host != "my-vps.com" {
+		t.Fatalf("expected host my-vps.com, got %s", target.Host)
+	}
+	if target.SNI != "my-vps.com" {
+		t.Fatalf("expected SNI my-vps.com, got %s", target.SNI)
+	}
+	if target.Path != "/data/speedtest.bin" {
+		t.Fatalf("expected /data/speedtest.bin, got %s", target.Path)
+	}
+	if target.Protocol != "https" {
+		t.Fatalf("expected https protocol, got %s", target.Protocol)
+	}
+}
+
+func TestAPIUpdateProfileImmediateEffect(t *testing.T) {
+	store := NewRouteStore()
+	cfg := DefaultProbeConfig()
+	scheduler := NewProbeScheduler(store, cfg)
+
+	// Simulate POST /api/config with ProfileCustom
+	newProfile := NewProfileCustom("https://custom-speed.org/testfile.img", "custom-speed.org", 443)
+	updatedCfg := scheduler.GetConfig()
+	updatedCfg.Profile = newProfile
+	scheduler.UpdateConfig(updatedCfg)
+
+	// Verify immediate effect
+	current := scheduler.GetConfig()
+	if current.Profile.Type != ProfileCustom {
+		t.Fatalf("expected updated profile CUSTOM, got %s", current.Profile.Type)
+	}
+	if current.Profile.TestURL != "https://custom-speed.org/testfile.img" {
+		t.Fatalf("expected updated TestURL, got %s", current.Profile.TestURL)
+	}
+
+	target := ResolveProbeTarget(current, "9.9.9.9", 443)
+	if target.URL != "https://custom-speed.org/testfile.img" {
+		t.Fatalf("expected target URL custom-speed.org, got %s", target.URL)
+	}
+	if target.SNI != "custom-speed.org" {
+		t.Fatalf("expected target SNI custom-speed.org, got %s", target.SNI)
+	}
+}
+
+func TestLegacyFieldsDiscrepancyProfileWins(t *testing.T) {
+	cfg := DefaultProbeConfig()
+	// Deliberately set legacy fields to stale values that disagree with Profile
+	cfg.Profile = NewProfileCustom("https://authoritative.com/speed.bin", "authoritative.com", 443)
+	cfg.URL = "https://stale-legacy.com/old"
+	cfg.SNI = "stale-legacy.com"
+	cfg.WSSHost = "stale-wss.com"
+
+	// Resolve target: Profile must strictly win!
+	target := ResolveProbeTarget(cfg, "1.1.1.1", 443)
+	if target.URL != "https://authoritative.com/speed.bin" {
+		t.Fatalf("Profile must win over legacy cfg.URL, got %s", target.URL)
+	}
+	if target.SNI != "authoritative.com" {
+		t.Fatalf("Profile must win over legacy cfg.SNI, got %s", target.SNI)
+	}
+	if target.Host != "authoritative.com" {
+		t.Fatalf("Profile must win over legacy host, got %s", target.Host)
+	}
+}
+
+func TestDefaultCFSTModeProtocolIsolation(t *testing.T) {
+	cfg := DefaultProbeConfig()
+	if cfg.Profile.Protocol != "https" {
+		t.Fatalf("expected CFST protocol to be https, got %s", cfg.Profile.Protocol)
+	}
+	if cfg.WSSHost != "" {
+		t.Fatalf("CFST mode must have empty WSSHost, got %s", cfg.WSSHost)
+	}
+
+	target := ResolveProbeTarget(cfg, "1.1.1.1", 443)
+	if target.Protocol == "wss" {
+		t.Fatalf("CFST mode must never resolve to wss protocol")
+	}
+}
