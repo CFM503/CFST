@@ -120,7 +120,7 @@ func TestProbeProfileConfiguration(t *testing.T) {
 		t.Fatalf("unexpected CFST profile: %+v", cfstProf)
 	}
 
-	gowayProf := NewProfileGOWAYWSS("colo.4467107.xyz", "/pyway", "colo.4467107.xyz", 443)
+	gowayProf := NewProfileGOWAYWSS("ws.example.com", "/pyway", "ws.example.com", 443)
 	if gowayProf.Type != ProfileGOWAYWSS || gowayProf.Protocol != "wss" {
 		t.Fatalf("unexpected GOWAY WSS profile: %+v", gowayProf)
 	}

@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -120,27 +119,21 @@ func TestDiscoveryUsesCFSTProfile(t *testing.T) {
 	var wssAttempted atomic.Bool
 	var httpsAttempted atomic.Bool
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to listen: %v", err)
-	}
-	defer ln.Close()
-
-	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
-	port, _ := strconv.Atoi(portStr)
-
-	server := &http.Server{
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if strings.ToLower(r.Header.Get("Upgrade")) == "websocket" || r.URL.Path == "/pyway" {
+	tlsConf := generateTestTLSConfig(t)
+	ln, port := startDualProtocolListener(t, tlsConf, nil,
+		func(conn net.Conn, reqLine string, headers map[string]string) {
+			httpsAttempted.Store(true)
+			if strings.ToLower(headers["upgrade"]) == "websocket" || strings.Contains(reqLine, "/pyway") {
 				wssAttempted.Store(true)
 			}
-			httpsAttempted.Store(true)
-			w.Header().Set("cf-ray", "12345-HKG")
-			w.WriteHeader(http.StatusOK)
-		}),
-	}
-	go func() { _ = server.Serve(ln) }()
-	defer server.Close()
+			body := "0123456789abcdef"
+			if strings.HasPrefix(reqLine, "HEAD") {
+				_, _ = fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\ncf-ray: 12345-HKG\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", len(body))
+			} else {
+				_, _ = fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\ncf-ray: 12345-HKG\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
+			}
+		})
+	defer ln.Close()
 
 	cfg := DefaultProbeConfig()
 	if cfg.Profile.Type != ProfileCFST {
@@ -150,7 +143,7 @@ func TestDiscoveryUsesCFSTProfile(t *testing.T) {
 	cfg.Profile.Port = port
 	cfg.Profile.TestURL = fmt.Sprintf("http://127.0.0.1:%d/__down", port)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	validNodes, tcpValid, httpsValid := ScanRoutesWithProfileDetailed(ctx, []string{"127.0.0.1"}, port, 1, cfg.Profile, nil)

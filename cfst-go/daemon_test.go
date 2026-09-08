@@ -3,14 +3,15 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -85,21 +86,22 @@ func TestSeedCandidatesGOWAYWSSUsesProfile(t *testing.T) {
 	var wssReceivedHost string
 	var wssReceivedPath string
 	var wssAttempted atomic.Bool
+	var mu sync.Mutex
 
-	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.ToLower(r.Header.Get("Upgrade")) == "websocket" {
-			wssAttempted.Store(true)
-			wssReceivedHost = r.Host
-			wssReceivedPath = r.URL.Path
-			w.WriteHeader(http.StatusSwitchingProtocols)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer ts.Close()
-
-	u, _ := url.Parse(ts.URL)
-	port, _ := strconv.Atoi(u.Port())
+	tlsConf := generateTestTLSConfig(t)
+	ln, port := startDualProtocolListener(t, tlsConf,
+		func(tlsConn *tls.Conn, sni, host, path, upgrade string) (int, string) {
+			if strings.ToLower(upgrade) == "websocket" {
+				wssAttempted.Store(true)
+				mu.Lock()
+				wssReceivedHost = host
+				wssReceivedPath = path
+				mu.Unlock()
+				return 101, ""
+			}
+			return 200, "OK"
+		}, nil)
+	defer ln.Close()
 
 	prof := NewProfileGOWAYWSS("edge.goway.custom", "/custom-pyway", "sni.goway.custom", port)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -110,11 +112,14 @@ func TestSeedCandidatesGOWAYWSSUsesProfile(t *testing.T) {
 	if !wssAttempted.Load() {
 		t.Fatalf("expected WSS handshake to be attempted for ProfileGOWAYWSS")
 	}
-	if wssReceivedHost != "edge.goway.custom" {
-		t.Fatalf("expected WSS host edge.goway.custom, got %s", wssReceivedHost)
+	mu.Lock()
+	gotHost, gotPath := wssReceivedHost, wssReceivedPath
+	mu.Unlock()
+	if gotHost != "edge.goway.custom" {
+		t.Fatalf("expected WSS host edge.goway.custom, got %s", gotHost)
 	}
-	if wssReceivedPath != "/custom-pyway" {
-		t.Fatalf("expected WSS path /custom-pyway, got %s", wssReceivedPath)
+	if gotPath != "/custom-pyway" {
+		t.Fatalf("expected WSS path /custom-pyway, got %s", gotPath)
 	}
 }
 
@@ -217,7 +222,7 @@ func TestArchitectureAntiRegression(t *testing.T) {
 
 	// C. Even if legacy WSSHost is non-empty, ConfigToProbeConfig MUST remain ProfileCFST unless Profile is explicitly GOWAY-WSS
 	cWithWSSHost := DefaultConfig()
-	cWithWSSHost.WSSHost = "colo.4467107.xyz"
+	cWithWSSHost.WSSHost = "ws.example.com"
 	cWithWSSHost.Profile = ""
 	pWithWSSHost := ConfigToProbeConfig(cWithWSSHost)
 	if pWithWSSHost.Profile.Type != ProfileCFST {

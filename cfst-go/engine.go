@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
@@ -693,63 +694,135 @@ func TCPPing(ip string, port int, timeout time.Duration) float64 {
 		return 0
 	}
 	conn.Close()
-	return float64(time.Since(start).Microseconds()) / 1000.0
+	lat := float64(time.Since(start).Microseconds()) / 1000.0
+	if lat <= 0 {
+		return 0.001
+	}
+	return lat
 }
 
-// WSSHandshakeCheck simulates goway's WebSocket upgrade handshake over TLS using target parameters.
-// Returns true if the server responds with 101 Switching Protocols.
-func WSSHandshakeCheck(ip string, port int, sni string, host string, path string, timeout time.Duration) bool {
-	if host == "" {
-		host = sni
+// WSSHandshakeResult holds granular diagnostics for a WebSocket upgrade handshake probe.
+type WSSHandshakeResult struct {
+	Success         bool    `json:"success"`
+	TCPSuccess      bool    `json:"tcp_success"`
+	TLSHandshake    bool    `json:"tls_handshake"`
+	HTTPUpgradeSent bool    `json:"http_upgrade_sent"`
+	HTTPStatus      int     `json:"http_status"`
+	UpgradeAccepted bool    `json:"upgrade_accepted"`
+	SNISent         string  `json:"sni_sent"`
+	HostSent        string  `json:"host_sent"`
+	PathSent        string  `json:"path_sent"`
+	LatencyMs       float64 `json:"latency_ms"`
+	ErrorStage      string  `json:"error_stage,omitempty"`
+	ErrorMessage    string  `json:"error_message,omitempty"`
+}
+
+// WSSHandshakeCheckDetailed performs granular WebSocket upgrade verification over TLS.
+// It strictly validates Host, SNI, and Path independently without mutual fallbacks,
+// and strictly validates that the HTTP response line begins with HTTP 101 Switching Protocols.
+func WSSHandshakeCheckDetailed(ip string, port int, sni string, host string, path string, timeout time.Duration) WSSHandshakeResult {
+	res := WSSHandshakeResult{
+		SNISent:  sni,
+		HostSent: host,
+		PathSent: path,
 	}
-	if sni == "" {
-		sni = host
+
+	if strings.TrimSpace(host) == "" || strings.TrimSpace(sni) == "" || strings.TrimSpace(path) == "" {
+		res.Success = false
+		res.ErrorStage = "config"
+		res.ErrorMessage = "Host, SNI, and Path must all be non-empty for GOWAY-WSS"
+		return res
 	}
-	if path == "" {
-		path = "/pyway"
-	}
+
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
+		res.PathSent = path
 	}
 	if timeout <= 0 {
 		timeout = 3 * time.Second
 	}
 
+	start := time.Now()
 	addr := net.JoinHostPort(ip, fmt.Sprintf("%d", port))
 	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
-		return false
+		res.ErrorStage = "tcp"
+		res.ErrorMessage = err.Error()
+		return res
 	}
 	defer conn.Close()
+	res.TCPSuccess = true
 
 	tlsConf := &tls.Config{InsecureSkipVerify: true, ServerName: sni}
 	tlsConn := tls.Client(conn, tlsConf)
 	if err := tlsConn.SetDeadline(time.Now().Add(timeout)); err != nil {
-		return false
+		res.ErrorStage = "tls"
+		res.ErrorMessage = err.Error()
+		return res
 	}
 	if err := tlsConn.Handshake(); err != nil {
-		return false
+		res.ErrorStage = "tls"
+		res.ErrorMessage = err.Error()
+		return res
 	}
+	res.TLSHandshake = true
 
-	req := fmt.Sprintf("GET %s HTTP/1.1\r\n", path) +
-		fmt.Sprintf("Host: %s\r\n", host) +
-		"Upgrade: websocket\r\n" +
-		"Connection: Upgrade\r\n" +
-		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
-		"Sec-WebSocket-Version: 13\r\n" +
-		"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n" +
-		"\r\n"
+	req := fmt.Sprintf("GET %s HTTP/1.1\r\n"+
+		"Host: %s\r\n"+
+		"Upgrade: websocket\r\n"+
+		"Connection: Upgrade\r\n"+
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"+
+		"Sec-WebSocket-Version: 13\r\n"+
+		"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n"+
+		"\r\n", path, host)
 	if _, err := tlsConn.Write([]byte(req)); err != nil {
-		return false
+		res.ErrorStage = "http_write"
+		res.ErrorMessage = err.Error()
+		return res
+	}
+	res.HTTPUpgradeSent = true
+
+	br := bufio.NewReader(tlsConn)
+	statusLine, err := br.ReadString('\n')
+	if err != nil {
+		res.ErrorStage = "http_read"
+		res.ErrorMessage = err.Error()
+		return res
 	}
 
-	buf := make([]byte, 512)
-	n, err := tlsConn.Read(buf)
-	if err != nil || n == 0 {
-		return false
+	statusLine = strings.TrimRight(statusLine, "\r\n")
+	parts := strings.SplitN(statusLine, " ", 3)
+	if len(parts) < 2 || !strings.HasPrefix(parts[0], "HTTP/") {
+		res.ErrorStage = "http_parse"
+		res.ErrorMessage = fmt.Sprintf("malformed HTTP status line: %q", statusLine)
+		return res
 	}
-	resp := string(buf[:n])
-	return strings.Contains(resp, "101")
+
+	statusCode, parseErr := strconv.Atoi(parts[1])
+	if parseErr != nil {
+		res.ErrorStage = "http_parse"
+		res.ErrorMessage = fmt.Sprintf("invalid status code in: %q", statusLine)
+		return res
+	}
+	res.HTTPStatus = statusCode
+
+	if statusCode == 101 {
+		res.UpgradeAccepted = true
+		res.Success = true
+		res.LatencyMs = float64(time.Since(start).Microseconds()) / 1000.0
+	} else {
+		res.Success = false
+		res.ErrorStage = "http_status"
+		res.ErrorMessage = fmt.Sprintf("expected HTTP status 101 Switching Protocols, got %d (%s)", statusCode, statusLine)
+	}
+	return res
+}
+
+// WSSHandshakeCheck simulates goway's WebSocket upgrade handshake over TLS using target parameters.
+// Preserved for backward compatibility, returns res.Success from WSSHandshakeCheckDetailed.
+func WSSHandshakeCheck(ip string, port int, sni string, host string, path string, timeout time.Duration) bool {
+	res := WSSHandshakeCheckDetailed(ip, port, sni, host, path, timeout)
+	return res.Success
 }
 
 // HTTPSConnectivityCheck performs low-bandwidth L2 HTTPS/TLS reachability verification,
