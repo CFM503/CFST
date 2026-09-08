@@ -1,16 +1,23 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -81,40 +88,132 @@ func TestSeedCandidatesCFSTDoesNotUseWSS(t *testing.T) {
 }
 
 // TestSeedCandidatesGOWAYWSSUsesProfile proves that only ProfileGOWAYWSS invokes WSS with configured Host and Path.
+// It uses a stable raw TLS listener (not httptest) so the production
+// WSSHandshakeCheck() path (TCP -> TLS -> WebSocket Upgrade -> Host/Path -> 101)
+// is verified deterministically on Windows/Linux without net/http 101 hijack quirks.
+// Plain-TCP L1 pings fail the TLS Accept and are counted quietly; only a real
+// TLS handshake carrying Upgrade: websocket counts as a WSS attempt.
 func TestSeedCandidatesGOWAYWSSUsesProfile(t *testing.T) {
-	var wssReceivedHost string
-	var wssReceivedPath string
 	var wssAttempted atomic.Bool
+	var tcpAcceptErrors atomic.Int32
+	var tlsHandshakes atomic.Int32
+	var mu sync.Mutex
+	var wssReceivedHost, wssReceivedPath, wssReceivedUpgrade, wssReceivedSNI string
 
-	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.ToLower(r.Header.Get("Upgrade")) == "websocket" {
-			wssAttempted.Store(true)
-			wssReceivedHost = r.Host
-			wssReceivedPath = r.URL.Path
-			w.WriteHeader(http.StatusSwitchingProtocols)
-			return
+	// Self-signed cert for 127.0.0.1; client uses InsecureSkipVerify so SNI mismatch is fine.
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate test key: %v", err)
+	}
+	tmpl := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{"localhost"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("failed to create test certificate: %v", err)
+	}
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: priv}},
+	})
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	// Accept loop: plain-TCP L1 pings surface as Accept errors (quiet, no log spam).
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				if strings.Contains(err.Error(), "closed") {
+					return
+				}
+				tcpAcceptErrors.Add(1)
+				continue
+			}
+			tlsHandshakes.Add(1)
+			go func(c net.Conn) {
+				defer c.Close()
+				_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+				tlsConn, ok := c.(*tls.Conn)
+				if !ok {
+					return
+				}
+				sni := tlsConn.ConnectionState().ServerName
+				br := bufio.NewReader(tlsConn)
+				reqLine, err := br.ReadString('\n')
+				if err != nil {
+					return
+				}
+				parts := strings.Split(strings.TrimSpace(reqLine), " ")
+				reqPath := ""
+				if len(parts) >= 2 {
+					reqPath = parts[1]
+				}
+				host, upgrade := "", ""
+				for {
+					line, err := br.ReadString('\n')
+					if err != nil {
+						return
+					}
+					trimmed := strings.TrimSpace(line)
+					if trimmed == "" {
+						break
+					}
+					if idx := strings.Index(trimmed, ":"); idx > 0 {
+						k := strings.ToLower(strings.TrimSpace(trimmed[:idx]))
+						v := strings.TrimSpace(trimmed[idx+1:])
+						switch k {
+						case "host":
+							host = v
+						case "upgrade":
+							upgrade = v
+						}
+					}
+				}
+				if strings.ToLower(upgrade) == "websocket" {
+					wssAttempted.Store(true)
+					mu.Lock()
+					wssReceivedHost = host
+					wssReceivedPath = reqPath
+					wssReceivedUpgrade = upgrade
+					wssReceivedSNI = sni
+					mu.Unlock()
+				}
+				_, _ = tlsConn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nContent-Length: 0\r\n\r\n"))
+			}(conn)
 		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer ts.Close()
-
-	u, _ := url.Parse(ts.URL)
-	port, _ := strconv.Atoi(u.Port())
+	}()
 
 	prof := NewProfileGOWAYWSS("edge.goway.custom", "/custom-pyway", "sni.goway.custom", port)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	// Must go through the real production scanner -> production WSSHandshakeCheck().
 	_ = ScanRoutesWithProfile(ctx, []string{"127.0.0.1"}, port, 1, prof, nil)
 
+	mu.Lock()
+	gotHost, gotPath, gotUpgrade, gotSNI := wssReceivedHost, wssReceivedPath, wssReceivedUpgrade, wssReceivedSNI
+	mu.Unlock()
 	if !wssAttempted.Load() {
-		t.Fatalf("expected WSS handshake to be attempted for ProfileGOWAYWSS")
+		t.Fatalf("expected WSS handshake to be attempted for ProfileGOWAYWSS (tcpAcceptErrors=%d tlsHandshakes=%d host=%q path=%q upgrade=%q sni=%q port=%d)",
+			tcpAcceptErrors.Load(), tlsHandshakes.Load(), gotHost, gotPath, gotUpgrade, gotSNI, port)
 	}
-	if wssReceivedHost != "edge.goway.custom" {
-		t.Fatalf("expected WSS host edge.goway.custom, got %s", wssReceivedHost)
+	if gotHost != "edge.goway.custom" {
+		t.Fatalf("expected WSS host edge.goway.custom, got %q (path=%q upgrade=%q sni=%q)", gotHost, gotPath, gotUpgrade, gotSNI)
 	}
-	if wssReceivedPath != "/custom-pyway" {
-		t.Fatalf("expected WSS path /custom-pyway, got %s", wssReceivedPath)
+	if gotPath != "/custom-pyway" {
+		t.Fatalf("expected WSS path /custom-pyway, got %q (host=%q upgrade=%q sni=%q)", gotPath, gotHost, gotUpgrade, gotSNI)
+	}
+	if strings.ToLower(gotUpgrade) != "websocket" {
+		t.Fatalf("expected Upgrade: websocket, got %q (host=%q path=%q sni=%q)", gotUpgrade, gotHost, gotPath, gotSNI)
 	}
 }
 
