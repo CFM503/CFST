@@ -912,3 +912,200 @@ func TestDiscoveryExistingRouteBypassBlocked(t *testing.T) {
 		t.Fatalf("existing route must NOT retain HealthHealthy after failure")
 	}
 }
+
+func TestDiscoveryGOWAYWSSFailureUpdatesExistingRoute(t *testing.T) {
+	store := NewRouteStore()
+	cfg := DefaultProbeConfig()
+	cfg.Profile = NewProfileGOWAYWSS("wss.example.com", "/pyway", "sni.example.com", 443)
+	sched := NewProbeScheduler(store, cfg)
+	dm := NewDiscoveryManager(store, sched)
+
+	targetIP := "198.51.100.110"
+	store.UpsertRoute(RouteMetrics{
+		ID:                 GenerateRouteID(targetIP, 443),
+		IP:                 targetIP,
+		Port:               443,
+		Tier:               TierCandidate,
+		Health:             HealthHealthy,
+		HandshakeSuccess:   true,
+		GOWAYWSSCompatible: true,
+		LastTested:         time.Now().Add(-5 * time.Minute),
+	})
+
+	dm.ipProvider = func() []string {
+		return []string{targetIP}
+	}
+	dm.scanFunc = func(ctx context.Context, ips []string, port int, concurrent int, profile ProbeProfile, progress func(done, total, valid int)) ([]NodeResult, int, int) {
+		return []NodeResult{}, 1, 0
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	status, err := dm.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunOnce failed: %v", err)
+	}
+
+	if status.ExistingRoutes != 0 {
+		t.Fatalf("failed route must NOT be counted as valid existing route, got %d", status.ExistingRoutes)
+	}
+
+	rec, exists := store.Get(targetIP)
+	if !exists {
+		t.Fatalf("expected record to exist in store")
+	}
+	if rec.Metrics.GOWAYWSSCompatible {
+		t.Fatalf("expected GOWAYWSSCompatible == false, got true")
+	}
+	if rec.Metrics.HandshakeSuccess {
+		t.Fatalf("expected HandshakeSuccess == false, got true")
+	}
+}
+
+func TestDiscoveryGOWAYWSSFailureRecovery(t *testing.T) {
+	store := NewRouteStore()
+	cfg := DefaultProbeConfig()
+	cfg.Profile = NewProfileGOWAYWSS("wss.example.com", "/pyway", "sni.example.com", 443)
+	sched := NewProbeScheduler(store, cfg)
+	dm := NewDiscoveryManager(store, sched)
+
+	targetIP := "198.51.100.111"
+	store.UpsertRoute(RouteMetrics{
+		ID:                 GenerateRouteID(targetIP, 443),
+		IP:                 targetIP,
+		Port:               443,
+		Tier:               TierCandidate,
+		Health:             HealthHealthy,
+		HandshakeSuccess:   true,
+		GOWAYWSSCompatible: true,
+		LastTested:         time.Now().Add(-5 * time.Minute),
+	})
+
+	dm.ipProvider = func() []string {
+		return []string{targetIP}
+	}
+
+	// Round 1: WSS fails, validNodes is empty
+	dm.scanFunc = func(ctx context.Context, ips []string, port int, concurrent int, profile ProbeProfile, progress func(done, total, valid int)) ([]NodeResult, int, int) {
+		return []NodeResult{}, 1, 0
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err := dm.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunOnce round 1 failed: %v", err)
+	}
+
+	rec, exists := store.Get(targetIP)
+	if !exists {
+		t.Fatalf("expected record to exist in store after round 1")
+	}
+	if rec.Metrics.GOWAYWSSCompatible {
+		t.Fatalf("round 1: expected GOWAYWSSCompatible == false, got true")
+	}
+
+	// Round 2: WSS succeeds with HTTP 101
+	dm.scanFunc = func(ctx context.Context, ips []string, port int, concurrent int, profile ProbeProfile, progress func(done, total, valid int)) ([]NodeResult, int, int) {
+		return []NodeResult{
+			{
+				IP:                 targetIP,
+				Port:               443,
+				TCPLatency:         25.0,
+				GOWAYWSSCompatible: true,
+				GOWAYWSSHTTPStatus: 101,
+				GOWAYWSSLatency:    35.0,
+			},
+		}, 1, 1
+	}
+
+	_, err = dm.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunOnce round 2 failed: %v", err)
+	}
+
+	rec, exists = store.Get(targetIP)
+	if !exists {
+		t.Fatalf("expected record to exist in store after round 2")
+	}
+	if !rec.Metrics.GOWAYWSSCompatible {
+		t.Fatalf("round 2 recovery: expected GOWAYWSSCompatible == true, got false")
+	}
+	if !rec.Metrics.HandshakeSuccess {
+		t.Fatalf("round 2 recovery: expected HandshakeSuccess == true, got false")
+	}
+	if rec.Metrics.GOWAYWSSHTTPStatus != 101 {
+		t.Fatalf("round 2 recovery: expected HTTPStatus == 101, got %d", rec.Metrics.GOWAYWSSHTTPStatus)
+	}
+}
+
+func TestDiscoveryGOWAYWSSDoesNotModifyUnscannedRoute(t *testing.T) {
+	store := NewRouteStore()
+	cfg := DefaultProbeConfig()
+	cfg.Profile = NewProfileGOWAYWSS("wss.example.com", "/pyway", "sni.example.com", 443)
+	sched := NewProbeScheduler(store, cfg)
+	dm := NewDiscoveryManager(store, sched)
+
+	ipA := "198.51.100.120"
+	ipB := "198.51.100.121"
+
+	store.UpsertRoute(RouteMetrics{
+		ID:                 GenerateRouteID(ipA, 443),
+		IP:                 ipA,
+		Port:               443,
+		Tier:               TierActive,
+		Health:             HealthHealthy,
+		HandshakeSuccess:   true,
+		GOWAYWSSCompatible: true,
+		LastTested:         time.Now().Add(-5 * time.Minute),
+	})
+	store.UpsertRoute(RouteMetrics{
+		ID:                 GenerateRouteID(ipB, 443),
+		IP:                 ipB,
+		Port:               443,
+		Tier:               TierActive,
+		Health:             HealthHealthy,
+		HandshakeSuccess:   true,
+		GOWAYWSSCompatible: true,
+		LastTested:         time.Now().Add(-5 * time.Minute),
+	})
+
+	// Only ipA is in scanned ips
+	dm.ipProvider = func() []string {
+		return []string{ipA}
+	}
+	// ipA fails WSS (validNodes empty)
+	dm.scanFunc = func(ctx context.Context, ips []string, port int, concurrent int, profile ProbeProfile, progress func(done, total, valid int)) ([]NodeResult, int, int) {
+		return []NodeResult{}, 1, 0
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err := dm.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunOnce failed: %v", err)
+	}
+
+	recA, existsA := store.Get(ipA)
+	if !existsA {
+		t.Fatalf("expected route A to exist")
+	}
+	if recA.Metrics.GOWAYWSSCompatible {
+		t.Fatalf("scanned route A must have GOWAYWSSCompatible == false")
+	}
+
+	recB, existsB := store.Get(ipB)
+	if !existsB {
+		t.Fatalf("expected unscanned route B to exist")
+	}
+	if !recB.Metrics.GOWAYWSSCompatible {
+		t.Fatalf("unscanned route B must remain GOWAYWSSCompatible == true")
+	}
+	if !recB.Metrics.HandshakeSuccess {
+		t.Fatalf("unscanned route B must remain HandshakeSuccess == true")
+	}
+}
+

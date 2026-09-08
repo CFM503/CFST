@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,6 +33,7 @@ type DiscoveryManager struct {
 	inProgress       atomic.Bool
 	stopCh           chan struct{}
 	scanFunc         func(ctx context.Context, ips []string, port int, concurrent int, profile ProbeProfile, progress func(done, total, valid int)) ([]NodeResult, int, int)
+	ipProvider       func() []string
 	onStartGoroutine func()
 	onExitGoroutine  func()
 }
@@ -161,7 +163,12 @@ func (dm *DiscoveryManager) RunOnce(ctx context.Context) (DiscoveryStatus, error
 		scanCount = 200
 	}
 
-	ips := GenerateIPs(scanCount, true, "")
+	var ips []string
+	if dm.ipProvider != nil {
+		ips = dm.ipProvider()
+	} else {
+		ips = GenerateIPs(scanCount, true, "")
+	}
 	if len(ips) == 0 {
 		return dm.GetStatus(), fmt.Errorf("no candidate IPs generated for discovery")
 	}
@@ -185,6 +192,21 @@ func (dm *DiscoveryManager) RunOnce(ctx context.Context) (DiscoveryStatus, error
 	var bestNewCandidate *RouteMetrics
 
 	isGOWAYWSS := cfg.Profile.Type == ProfileGOWAYWSS || (cfg.Profile.Type == ProfileCustom && cfg.Profile.Protocol == "wss")
+
+	scannedIPs := make(map[string]struct{}, len(ips))
+	for _, ip := range ips {
+		ip = strings.TrimSpace(ip)
+		if ip != "" {
+			scannedIPs[ip] = struct{}{}
+		}
+	}
+
+	validNodeIPs := make(map[string]struct{}, len(validNodes))
+	for _, node := range validNodes {
+		if strings.TrimSpace(node.IP) != "" {
+			validNodeIPs[node.IP] = struct{}{}
+		}
+	}
 
 	for _, node := range validNodes {
 		// Strict GOWAY-WSS compatibility gate:
@@ -249,6 +271,41 @@ func (dm *DiscoveryManager) RunOnce(ctx context.Context) (DiscoveryStatus, error
 			if bestNewCandidate == nil || rm.FinalScore > bestNewCandidate.FinalScore || (rm.FinalScore == bestNewCandidate.FinalScore && rm.RTT < bestNewCandidate.RTT) {
 				bestNewCandidate = rm
 			}
+		}
+	}
+
+	if isGOWAYWSS {
+		for ip := range scannedIPs {
+			if _, valid := validNodeIPs[ip]; valid {
+				continue
+			}
+
+			rec, exists := dm.store.Get(ip)
+			if !exists || rec == nil {
+				continue
+			}
+
+			rm := rec.Metrics
+
+			// 本轮 scanner 没有返回该节点，
+			// 说明它没有通过当前 GOWAY-WSS Gate。
+			rm.GOWAYWSSCompatible = false
+			rm.HandshakeSuccess = false
+
+			// 清除本轮无法得到的成功状态。
+			// 不要保留旧的 WSS=true。
+			rm.GOWAYWSSLatency = 0
+			rm.GOWAYWSSHTTPStatus = 0
+
+			if rm.GOWAYWSSErrorStage == "" {
+				rm.GOWAYWSSErrorStage = "wss_gate"
+			}
+
+			if rm.GOWAYWSSErrorMessage == "" {
+				rm.GOWAYWSSErrorMessage = "node failed GOWAY-WSS compatibility gate"
+			}
+
+			dm.store.RecordProbeResult(rm, false)
 		}
 	}
 
