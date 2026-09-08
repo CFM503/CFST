@@ -34,7 +34,6 @@ type Config struct {
 	FilterMode      string
 	SNI             string
 	WSSHost         string
-	WSSPath         string
 	Profile         string // "CFST" (default), "GOWAY-WSS", "CUSTOM"
 
 	// Route Quality Probe daemon options
@@ -68,8 +67,7 @@ func DefaultConfig() Config {
 		Skip429:            true,
 		QuickDuration:      3,
 		FilterMode:         "speed",
-		WSSHost:            "",
-		WSSPath:            "/pyway",
+		WSSHost:            "colo.4467107.xyz",
 		Profile:            "CFST",
 		DaemonMode:         false,
 		APIAddr:            "127.0.0.1:9876",
@@ -90,11 +88,7 @@ func DefaultConfig() Config {
 func (cfg Config) GetProbeProfile() ProbeProfile {
 	switch strings.ToUpper(strings.TrimSpace(cfg.Profile)) {
 	case "GOWAY-WSS", "GOWAY_WSS", "WSS":
-		path := cfg.WSSPath
-		if path == "" {
-			path = "/pyway"
-		}
-		return NewProfileGOWAYWSS(cfg.WSSHost, path, cfg.SNI, cfg.Port)
+		return NewProfileGOWAYWSS(cfg.WSSHost, "/pyway", cfg.SNI, cfg.Port)
 	case "CUSTOM":
 		return NewProfileCustom(cfg.URL, cfg.SNI, cfg.Port)
 	default:

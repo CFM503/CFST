@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -119,21 +120,74 @@ func TestDiscoveryUsesCFSTProfile(t *testing.T) {
 	var wssAttempted atomic.Bool
 	var httpsAttempted atomic.Bool
 
-	tlsConf := generateTestTLSConfig(t)
-	ln, port := startDualProtocolListener(t, tlsConf, nil,
-		func(conn net.Conn, reqLine string, headers map[string]string) {
-			httpsAttempted.Store(true)
-			if strings.ToLower(headers["upgrade"]) == "websocket" || strings.Contains(reqLine, "/pyway") {
-				wssAttempted.Store(true)
-			}
-			body := "0123456789abcdef"
-			if strings.HasPrefix(reqLine, "HEAD") {
-				_, _ = fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\ncf-ray: 12345-HKG\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", len(body))
-			} else {
-				_, _ = fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\ncf-ray: 12345-HKG\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
-			}
-		})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
 	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				if strings.Contains(err.Error(), "closed") {
+					return
+				}
+				continue
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+				br := bufio.NewReader(c)
+				reqLine, err := br.ReadString('\n')
+				if err != nil {
+					return // plain-TCP L1 ping: connected, sent nothing
+				}
+				fields := strings.Split(strings.TrimSpace(reqLine), " ")
+				method, reqPath := "", "/"
+				if len(fields) >= 2 {
+					method = strings.ToUpper(fields[0])
+					reqPath = fields[1]
+				}
+				upgrade := ""
+				for {
+					line, err := br.ReadString('\n')
+					if err != nil {
+						return
+					}
+					if strings.TrimSpace(line) == "" {
+						break
+					}
+					if idx := strings.Index(line, ":"); idx > 0 {
+						if strings.ToLower(strings.TrimSpace(line[:idx])) == "upgrade" {
+							upgrade = strings.TrimSpace(line[idx+1:])
+						}
+					}
+				}
+				if strings.ToLower(upgrade) == "websocket" || reqPath == "/pyway" {
+					wssAttempted.Store(true)
+				}
+				httpsAttempted.Store(true)
+				body := "0123456789abcdef"
+				if method == "HEAD" {
+					_, _ = fmt.Fprintf(c, "HTTP/1.1 200 OK\r\ncf-ray: 12345-HKG\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", len(body))
+				} else {
+					_, _ = fmt.Fprintf(c, "HTTP/1.1 200 OK\r\ncf-ray: 12345-HKG\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
+				}
+			}(conn)
+		}
+	}()
+
+	// Readiness pre-flight
+	for i := 0; i < 20; i++ {
+		c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 200*time.Millisecond)
+		if err == nil {
+			c.Close()
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	cfg := DefaultProbeConfig()
 	if cfg.Profile.Type != ProfileCFST {

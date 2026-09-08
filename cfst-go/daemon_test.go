@@ -1,11 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -83,25 +89,94 @@ func TestSeedCandidatesCFSTDoesNotUseWSS(t *testing.T) {
 
 // TestSeedCandidatesGOWAYWSSUsesProfile proves that only ProfileGOWAYWSS invokes WSS with configured Host and Path.
 func TestSeedCandidatesGOWAYWSSUsesProfile(t *testing.T) {
-	var wssReceivedHost string
-	var wssReceivedPath string
 	var wssAttempted atomic.Bool
 	var mu sync.Mutex
+	var wssReceivedHost, wssReceivedPath string
 
-	tlsConf := generateTestTLSConfig(t)
-	ln, port := startDualProtocolListener(t, tlsConf,
-		func(tlsConn *tls.Conn, sni, host, path, upgrade string) (int, string) {
-			if strings.ToLower(upgrade) == "websocket" {
-				wssAttempted.Store(true)
-				mu.Lock()
-				wssReceivedHost = host
-				wssReceivedPath = path
-				mu.Unlock()
-				return 101, ""
-			}
-			return 200, "OK"
-		}, nil)
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate test key: %v", err)
+	}
+	tmpl := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{"localhost"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("failed to create test certificate: %v", err)
+	}
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: priv}},
+	})
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
 	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				if strings.Contains(err.Error(), "closed") {
+					return
+				}
+				continue
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+				tlsConn, ok := c.(*tls.Conn)
+				if !ok {
+					return
+				}
+				br := bufio.NewReader(tlsConn)
+				reqLine, err := br.ReadString('\n')
+				if err != nil {
+					return
+				}
+				parts := strings.Split(strings.TrimSpace(reqLine), " ")
+				reqPath := ""
+				if len(parts) >= 2 {
+					reqPath = parts[1]
+				}
+				host, upgrade := "", ""
+				for {
+					line, err := br.ReadString('\n')
+					if err != nil {
+						return
+					}
+					trimmed := strings.TrimSpace(line)
+					if trimmed == "" {
+						break
+					}
+					if idx := strings.Index(trimmed, ":"); idx > 0 {
+						k := strings.ToLower(strings.TrimSpace(trimmed[:idx]))
+						v := strings.TrimSpace(trimmed[idx+1:])
+						switch k {
+						case "host":
+							host = v
+						case "upgrade":
+							upgrade = v
+						}
+					}
+				}
+				if strings.ToLower(upgrade) == "websocket" {
+					wssAttempted.Store(true)
+					mu.Lock()
+					wssReceivedHost = host
+					wssReceivedPath = reqPath
+					mu.Unlock()
+				}
+				_, _ = tlsConn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"))
+			}(conn)
+		}
+	}()
 
 	prof := NewProfileGOWAYWSS("edge.goway.custom", "/custom-pyway", "sni.goway.custom", port)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -222,7 +297,7 @@ func TestArchitectureAntiRegression(t *testing.T) {
 
 	// C. Even if legacy WSSHost is non-empty, ConfigToProbeConfig MUST remain ProfileCFST unless Profile is explicitly GOWAY-WSS
 	cWithWSSHost := DefaultConfig()
-	cWithWSSHost.WSSHost = "ws.example.com"
+	cWithWSSHost.WSSHost = "colo.4467107.xyz"
 	cWithWSSHost.Profile = ""
 	pWithWSSHost := ConfigToProbeConfig(cWithWSSHost)
 	if pWithWSSHost.Profile.Type != ProfileCFST {

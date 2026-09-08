@@ -50,11 +50,7 @@ func ConfigToProbeConfig(cfg Config) ProbeConfig {
 	// Profile is strictly explicit!
 	switch strings.ToUpper(strings.TrimSpace(cfg.Profile)) {
 	case "GOWAY-WSS", "GOWAY_WSS", "WSS":
-		path := cfg.WSSPath
-		if path == "" {
-			path = "/pyway"
-		}
-		probeCfg.Profile = NewProfileGOWAYWSS(cfg.WSSHost, path, cfg.SNI, cfg.Port)
+		probeCfg.Profile = NewProfileGOWAYWSS(cfg.WSSHost, "/pyway", cfg.SNI, cfg.Port)
 	case "CUSTOM":
 		probeCfg.Profile = NewProfileCustom(cfg.URL, cfg.SNI, cfg.Port)
 	default:

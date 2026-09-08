@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: cfst-go/go.mod
+
+      - name: Go Version
+        working-directory: cfst-go
+        run: go version
+
+      - name: Run Unit Tests
+        working-directory: cfst-go
+        run: go test -v ./...
+
+      - name: Run Race Detector Tests
+        working-directory: cfst-go
+        run: go test -race ./...
+
+      - name: Run Go Vet
+        working-directory: cfst-go
+        run: go vet ./...
+
+  windows-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: cfst-go/go.mod
+
+      - name: Go Version
+        working-directory: cfst-go
+        run: go version
+
+      - name: Run Windows Unit Tests
+        working-directory: cfst-go
+        run: go test ./...
+
+      - name: Run Windows Go Vet
+        working-directory: cfst-go
+        run: go vet ./...
