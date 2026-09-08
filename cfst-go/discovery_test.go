@@ -1,13 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -116,31 +116,94 @@ func TestDiscoveryDoesNotDuplicateExistingRoute(t *testing.T) {
 }
 
 // TestDiscoveryUsesCFSTProfile verifies that default continuous discovery runs ProfileCFST (HTTPS, speed.cloudflare.com, no WSS).
+// It uses a raw TCP listener with an explicit readiness pre-flight so the
+// production ScanRoutesWithProfileDetailed() path (TCP Ping + HTTPS check,
+// strictly NO WSS) is verified deterministically on Windows/Linux CI.
 func TestDiscoveryUsesCFSTProfile(t *testing.T) {
 	var wssAttempted atomic.Bool
 	var httpsAttempted atomic.Bool
+	var tcpAccepts atomic.Int32
+	var httpRequests atomic.Int32
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to listen: %v", err)
 	}
 	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
 
-	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
-	port, _ := strconv.Atoi(portStr)
-
-	server := &http.Server{
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if strings.ToLower(r.Header.Get("Upgrade")) == "websocket" || r.URL.Path == "/pyway" {
-				wssAttempted.Store(true)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				if strings.Contains(err.Error(), "closed") {
+					return
+				}
+				continue
 			}
-			httpsAttempted.Store(true)
-			w.Header().Set("cf-ray", "12345-HKG")
-			w.WriteHeader(http.StatusOK)
-		}),
+			tcpAccepts.Add(1)
+			go func(c net.Conn) {
+				defer c.Close()
+				_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+				br := bufio.NewReader(c)
+				reqLine, err := br.ReadString('\n')
+				if err != nil {
+					return // plain-TCP L1 ping: connected, sent nothing
+				}
+				fields := strings.Split(strings.TrimSpace(reqLine), " ")
+				method, reqPath := "", "/"
+				if len(fields) >= 2 {
+					method = strings.ToUpper(fields[0])
+					reqPath = fields[1]
+				}
+				upgrade := ""
+				for {
+					line, err := br.ReadString('\n')
+					if err != nil {
+						return
+					}
+					if strings.TrimSpace(line) == "" {
+						break
+					}
+					if idx := strings.Index(line, ":"); idx > 0 {
+						if strings.ToLower(strings.TrimSpace(line[:idx])) == "upgrade" {
+							upgrade = strings.TrimSpace(line[idx+1:])
+						}
+					}
+				}
+				if strings.ToLower(upgrade) == "websocket" || reqPath == "/pyway" {
+					wssAttempted.Store(true)
+				}
+				httpsAttempted.Store(true)
+				httpRequests.Add(1)
+				body := "0123456789abcdef"
+				if method == "HEAD" {
+					_, _ = fmt.Fprintf(c, "HTTP/1.1 200 OK\r\ncf-ray: 12345-HKG\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", len(body))
+				} else {
+					_, _ = fmt.Fprintf(c, "HTTP/1.1 200 OK\r\ncf-ray: 12345-HKG\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
+				}
+			}(conn)
+		}
+	}()
+
+	// Readiness pre-flight: prove the kernel is accepting on the port before
+	// the production scan, warming the Windows loopback path deterministically.
+	var dialErr error
+	ready := false
+	for i := 0; i < 20; i++ {
+		var c net.Conn
+		c, dialErr = net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 500*time.Millisecond)
+		if dialErr == nil {
+			c.Close()
+			ready = true
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
-	go func() { _ = server.Serve(ln) }()
-	defer server.Close()
+	if !ready {
+		t.Fatalf("test listener on 127.0.0.1:%d never became reachable (infra): %v", port, dialErr)
+	}
+	acceptsBaseline := tcpAccepts.Load()
 
 	cfg := DefaultProbeConfig()
 	if cfg.Profile.Type != ProfileCFST {
@@ -159,10 +222,10 @@ func TestDiscoveryUsesCFSTProfile(t *testing.T) {
 		t.Fatalf("default Discovery scan must NEVER perform WebSocket handshake or request /pyway!")
 	}
 	if tcpValid < 1 {
-		t.Fatalf("expected tcpValid >= 1, got %d", tcpValid)
+		t.Fatalf("expected tcpValid >= 1, got %d (tcpAccepts=%d newAccepts=%d httpRequests=%d port=%d)", tcpValid, tcpAccepts.Load(), tcpAccepts.Load()-acceptsBaseline, httpRequests.Load(), port)
 	}
 	if httpsValid < 1 {
-		t.Fatalf("expected httpsValid >= 1, got %d", httpsValid)
+		t.Fatalf("expected httpsValid >= 1, got %d (tcpAccepts=%d httpRequests=%d httpsAttempted=%v port=%d)", httpsValid, tcpAccepts.Load(), httpRequests.Load(), httpsAttempted.Load(), port)
 	}
 	if len(validNodes) != 1 {
 		t.Fatalf("expected 1 valid node, got %d", len(validNodes))
