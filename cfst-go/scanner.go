@@ -698,7 +698,7 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 }
 
 func RunCLI(cfg Config) {
-	fmt.Printf("Cloudflare SpeedTest v2.2.1 (Route Quality Probe - Go Edition)\n\n")
+	fmt.Printf("Cloudflare SpeedTest v2.2.2 (Route Quality Probe - Go Edition)\n\n")
 
 	ips := GenerateIPs(cfg.MaxScan, cfg.Unique, cfg.IPFile)
 	fmt.Printf("🔍 Scanning %d IPs (concurrency: %d)...\n", len(ips), cfg.ScanConcurrent)
@@ -850,14 +850,17 @@ func RunCLI(cfg Config) {
 
 	for i, res := range results {
 		tier := TierCandidate
-		if i == 0 {
+		switch routeRole(i) {
+		case "ACTIVE":
 			tier = TierActive
-		} else if i <= 2 {
+		case "STANDBY":
 			tier = TierStandby
 		}
 		rm := FromNodeResult(res, tier)
 		GlobalRouteStore.UpsertRoute(*rm)
 	}
+
+	printFinalRouteSelection(results, cfg)
 
 	saveCSV(cfg.Output, results)
 	fmt.Printf("\n💾 Saved to: %s\n", cfg.Output)
@@ -872,6 +875,65 @@ func RunCLI(cfg Config) {
 	}
 }
 
+func routeRole(index int) string {
+	switch {
+	case index == 0:
+		return "ACTIVE"
+	case index <= 2:
+		return "STANDBY"
+	default:
+		return "CANDIDATE"
+	}
+}
+
+func printFinalRouteSelection(results []NodeResult, cfg Config) {
+	if len(results) == 0 {
+		return
+	}
+	best := results[0]
+	fmt.Println()
+	fmt.Println("════════════════════════════════════════════════════════════")
+	fmt.Println("✅ GOWAY-WSS Best Route")
+	fmt.Println("════════════════════════════════════════════════════════════")
+	fmt.Printf("IP: %s\n", best.IP)
+	fmt.Printf("Colo: %s\n", best.Colo)
+	fmt.Printf("Latency: %.1f ms\n", best.TCPLatency)
+	fmt.Printf("Jitter: %.1f ms\n", best.Jitter)
+	fmt.Printf("Speed: %.2f MB/s\n", best.DownloadSpeed)
+	fmt.Printf("P10: %.2f MB/s\n", best.P10Speed)
+	fmt.Printf("MinSpd: %.2f MB/s\n", best.MinSpeed)
+	fmt.Printf("Stable: %.0f%%\n", best.Stability)
+	fmt.Printf("Score: %.1f\n", best.Score)
+
+	profile := cfg.GetProbeProfile()
+	isGOWAYWSS := profile.Type == ProfileGOWAYWSS
+	if isGOWAYWSS {
+		fmt.Println("WSS: PASS")
+		fmt.Printf("SNI: %s\n", profile.SNI)
+		fmt.Printf("Host: %s\n", profile.Host)
+		fmt.Printf("Path: %s\n", profile.Path)
+	}
+	fmt.Println("Role: ACTIVE")
+	fmt.Println("════════════════════════════════════════════════════════════")
+
+	if len(results) > 1 {
+		fmt.Println()
+		fmt.Println("Standby Routes:")
+		limit := 2
+		if len(results)-1 < limit {
+			limit = len(results) - 1
+		}
+		for i := 1; i <= limit; i++ {
+			r := results[i]
+			fmt.Printf(
+				"  #%d %-15s %-6s Speed %.2f MB/s  Score %.1f\n",
+				i, r.IP, r.Colo, r.DownloadSpeed, r.Score,
+			)
+		}
+	}
+	fmt.Println()
+}
+
 func saveCSV(path string, results []NodeResult) {
 	f, err := os.Create(path)
 	if err != nil {
@@ -884,9 +946,10 @@ func saveCSV(path string, results []NodeResult) {
 	w := csv.NewWriter(f)
 	defer w.Flush()
 
-	w.Write([]string{"IP", "Colo", "Latency", "Jitter", "SgSpeed_MB", "Speed_MB", "P10Speed_MB", "MinSpeed_MB", "LoadLatency", "Stability", "Score"})
-	for _, r := range results {
+	w.Write([]string{"Role", "IP", "Colo", "Latency", "Jitter", "SgSpeed_MB", "Speed_MB", "P10Speed_MB", "MinSpeed_MB", "LoadLatency", "Stability", "Score"})
+	for i, r := range results {
 		w.Write([]string{
+			routeRole(i),
 			r.IP, r.Colo,
 			fmt.Sprintf("%.1f", r.TCPLatency),
 			fmt.Sprintf("%.1f", r.Jitter),
