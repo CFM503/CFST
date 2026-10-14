@@ -1,5 +1,23 @@
 # Changelog
 
+## v2.3.0 (2026-10-14)
+
+### Release: Single-File Architecture & Anti-403 Fast-Converging Route Optimizer
+- **Single-File Architecture Consolidation (`main.go`)**:
+  - Unified all probe subsystems, network engines, EWMA smoothers, multi-horizon scoring, scheduler, discovery worker, REST API, Web UI server, and embedded HTML assets into a single standalone `main.go` at repository root.
+  - Web UI frontend (`index.html`) is directly embedded via Base64, eliminating all external asset and build dependencies.
+- **Strict Anti-403 & WAF Filter Hardening (`HTTPSConnectivityCheck`)**:
+  - Upgraded connectivity status verification to strictly reject HTTP `>= 400` or `< 200`. Blocked 403 Forbidden, 429 Rate-Limited, and 400 Bad Request nodes from being misclassified as valid candidates.
+- **Dedicated SNI Website Probing & Decoupled Bandwidth Testing (`SingleStreamTestDetailed`)**:
+  - In default CFST mode, preserved custom `-sni` domain for real-world anti-403 verification against the user's specific target website (`https://<sni>/`).
+  - Automatically normalized request `Host: speed.cloudflare.com` when testing against official speed test endpoints, preventing Host/Path mismatches.
+- **Fast-Converging Scan Profile & Network-Aware Latency Evaluation (`DefaultConfig`, `ScanRoutesWithProfileDetailed`)**:
+  - Enabled `Unique: true` by default to sample across 800 distinct `/24` C-subnets with 300 concurrent workers.
+  - Optimized TCP Ping from 5 to 3 rounds with a 1000ms timeout for rapid loss detection.
+  - Incorporated TLS + HTTP TTFB into latency ranking (`avgLat = avgLat*0.7 + (ttfb/2.0)*0.3`), prioritizing nodes with minimal Layer-4 and Layer-7 connection overhead.
+- **Unified Web UI Probing Pipeline (`RegisterWebRoutes`)**:
+  - Upgraded Web UI SSE test flow from legacy TCP-only `ScanPing` to unified `ScanRoutesWithProfile`.
+
 ## v2.2.1 (2026-09-08)
 
 ### Release: Post-WSS Gate Speed Testing Decoupling & Documentation Enhancement

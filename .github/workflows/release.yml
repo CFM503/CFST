@@ -64,13 +64,15 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: CFST v2.2.2
+          name: CFST v2.3.0
           body: |
-            GOWAY-WSS Final Active Route Selection & Result Visibility Release.
-            - Added explicit final GOWAY-WSS best-route output
-            - Added Active/Standby/Candidate role information to CSV
-            - Preserved WSS compatibility gate and Cloudflare HTTPS speed testing separation
-            - Preserved existing RouteStore tier-selection behavior
+            CFST v2.3.0: Single-File Architecture & Anti-403 Fast-Converging Route Optimizer Release.
+            - Consolidated entire codebase into a standalone single-file `main.go` with embedded Base64 Web UI assets
+            - Strict Anti-403 WAF gate: rejected HTTP >= 400 and < 200 nodes from candidate pools
+            - Dedicated SNI website probing with decoupled Cloudflare official speed test normalization
+            - Fast-converging scan parameters (Unique C-subnets, 3-ping pre-filter, 30~45s execution)
+            - Incorporated TLS + HTTP TTFB into composite latency scoring
+            - Unified Web UI probing pipeline with Profile architecture
             - Windows 11 x64 release only
           files: dist/CFST-windows-amd64.exe
           generate_release_notes: false

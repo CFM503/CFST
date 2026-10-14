@@ -2050,7 +2050,7 @@ func (s *RouteStore) SaveSnapshot(path string) error {
 	s.mu.RUnlock()
 
 	container := SnapshotContainer{
-		Version:   "2.2.1",
+		Version:   "2.3.0",
 		Timestamp: time.Now(),
 		Routes:    uniqueRecords,
 	}
@@ -2444,7 +2444,11 @@ func SingleStreamTestDetailed(ctx context.Context, target ResolvedProbeTarget, d
 	if err != nil {
 		return SpeedMetrics{}
 	}
-	req.Host = target.Host
+	if strings.Contains(target.URL, "speed.cloudflare.com") {
+		req.Host = "speed.cloudflare.com"
+	} else {
+		req.Host = target.Host
+	}
 	req.Header.Set("Connection", "keep-alive")
 
 	if !strings.Contains(target.URL, "speed.cloudflare.com") {
@@ -3013,7 +3017,8 @@ func HTTPSConnectivityCheck(ctx context.Context, ip string, port int, sni string
 		}
 	}
 
-	if statusCode >= 500 {
+	// 严格拦截 403 Forbidden、400、429、5xx 等所有异常或拦截状态码（仅放行 2xx/3xx）
+	if statusCode >= 400 || statusCode < 200 {
 		return false, ttfb, statusCode, colo, fmt.Errorf("HTTP %d", statusCode)
 	}
 
@@ -4582,7 +4587,7 @@ func RunDaemon(cfg Config) {
 	GlobalScoreEngine.SetMode(ScoreMode(cfg.ScoreMode))
 
 	fmt.Println("============================================================")
-	fmt.Println("   CFST Route Quality Probe v2.2.1 (Continuous Daemon Mode)")
+	fmt.Println("   CFST Route Quality Probe v2.3.0 (Continuous Daemon Mode)")
 	fmt.Printf("   Listening on: http://%s\n", cfg.APIAddr)
 	fmt.Printf("   Score Mode:   %s\n", cfg.ScoreMode)
 	fmt.Printf("   Intervals:    Active: %ds | Standby: %ds | Candidate: %ds | Failed: %ds\n",
@@ -4790,19 +4795,19 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		Port:               443,
-		MaxScan:            3000,
-		TopN:               100,
-		DLConc:             1,
-		DownloadNum:        20,
-		Duration:           20,
-		StopThreshold:      30.0,
-		Unique:             false,
+		MaxScan:            800,  // 配合 Unique=true 扫描 800 个不同 C 段，覆盖广且极快
+		TopN:               20,   // 优选延迟最低的前 20 个进入测速
+		DLConc:             2,    // 2 线程并发测速，耗时减半
+		DownloadNum:        8,    // 测出 8 个高质量节点即可
+		Duration:           6,    // 每个测 6 秒足够测出稳定峰值与 P10
+		StopThreshold:      15.0, // 找到高于 15MB/s 的优质节点触发快速收敛
+		Unique:             true, // 每个 /24 C段只取 1 个 IP，避免同网段重复浪费时间
 		Output:             "result_colo.csv",
-		ScanConcurrent:     200,
+		ScanConcurrent:     300,  // 提升扫描并发
 		WebPort:            "9876",
 		URL:                "https://speed.cloudflare.com/__down?bytes=500000000",
 		Skip429:            true,
-		QuickDuration:      3,
+		QuickDuration:      2,    // 预筛缩短至 2 秒
 		FilterMode:         "speed",
 		WSSHost:            "",
 		WSSPath:            "/pyway",
@@ -4837,7 +4842,12 @@ func (cfg Config) GetProbeProfile() ProbeProfile {
 		if isCustomURL(cfg.URL) {
 			return NewProfileCustom(cfg.URL, cfg.SNI, cfg.Port)
 		}
-		return NewProfileCFST()
+		prof := NewProfileCFST()
+		if strings.TrimSpace(cfg.SNI) != "" {
+			prof.SNI = strings.TrimSpace(cfg.SNI)
+			prof.Host = prof.SNI
+		}
+		return prof
 	}
 }
 
@@ -4898,20 +4908,20 @@ func ScanRoutesWithProfileDetailed(ctx context.Context, ips []string, port int, 
 				return
 			}
 
-			// Layer 1: TCP Ping (5 pings)
-			pingCount := 5
-			lats := make([]float64, 0, 5)
+			// Layer 1: TCP Ping (优化为 3 次快速 Ping，超时缩短为 1000ms，大幅提速)
+			pingCount := 3
+			lats := make([]float64, 0, 3)
 			for i := 0; i < pingCount; i++ {
 				if ctx.Err() != nil {
 					return
 				}
-				lat := TCPPing(ip, targetPort, 1500*time.Millisecond)
+				lat := TCPPing(ip, targetPort, 1000*time.Millisecond)
 				if lat > 0 {
 					lats = append(lats, lat)
 				}
 				if i < pingCount-1 {
 					select {
-					case <-time.After(30 * time.Millisecond):
+					case <-time.After(20 * time.Millisecond):
 					case <-ctx.Done():
 						return
 					}
@@ -4919,7 +4929,7 @@ func ScanRoutesWithProfileDetailed(ctx context.Context, ips []string, port int, 
 			}
 
 			d := done.Add(1)
-			if len(lats) < 3 { // require at least 3 successful pings (up to 40% loss tolerated)
+			if len(lats) < 2 { // 至少 2 次成功，快速淘汰高丢包节点
 				if progressCallback != nil && (d%10 == 0 || d == int32(total)) {
 					progressCallback(int(d), total, int(validCount.Load()))
 				}
@@ -4950,8 +4960,15 @@ func ScanRoutesWithProfileDetailed(ctx context.Context, ips []string, port int, 
 			var wssRes WSSHandshakeResult
 			switch profile.Type {
 			case ProfileCFST:
-				// TCP Ping + HTTPSConnectivityCheck (Cloudflare Official, strictly NO WSS)
-				ok, _, _, colo, err := HTTPSConnectivityCheck(ctx, ip, targetPort, profile.SNI, profile.Host, profile.TestURL, 3*time.Second)
+				// 如果指定了 -sni (你的网站域名)，探活时直接请求 https://你的域名/ 实测是否返回 403！
+				checkURL := profile.TestURL
+				checkHost := profile.Host
+				checkSNI := profile.SNI
+				if checkSNI != "" && checkSNI != "speed.cloudflare.com" {
+					checkHost = checkSNI
+					checkURL = "https://" + checkSNI + "/"
+				}
+				ok, ttfb, _, colo, err := HTTPSConnectivityCheck(ctx, ip, targetPort, checkSNI, checkHost, checkURL, 2500*time.Millisecond)
 				if !ok || err != nil {
 					if progressCallback != nil && (d%10 == 0 || d == int32(total)) {
 						progressCallback(int(d), total, int(validCount.Load()))
@@ -4959,6 +4976,10 @@ func ScanRoutesWithProfileDetailed(ctx context.Context, ips []string, port int, 
 					return
 				}
 				detectedColo = colo
+				// 将 TLS + HTTP TTFB 纳入延迟考量（权重 30%），优先选出网页转发最快的节点
+				if ttfb > 0 {
+					avgLat = avgLat*0.7 + (ttfb/2.0)*0.3
+				}
 
 			case ProfileGOWAYWSS:
 				// TCP Ping + WSSHandshakeCheckDetailed using Profile fields
@@ -5434,7 +5455,7 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 }
 
 func RunCLI(cfg Config) {
-	fmt.Printf("Cloudflare SpeedTest v2.2.2 (Route Quality Probe - Go Edition)\n\n")
+	fmt.Printf("Cloudflare SpeedTest v2.3.0 (Route Quality Probe - Go Edition)\n\n")
 
 	ips := GenerateIPs(cfg.MaxScan, cfg.Unique, cfg.IPFile)
 	fmt.Printf("🔍 Scanning %d IPs (concurrency: %d)...\n", len(ips), cfg.ScanConcurrent)
@@ -5750,7 +5771,7 @@ func handleAPIHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":         "ok",
 		"service":        "CFST Route Quality Probe",
-		"version":        "v2.2.1",
+		"version":        "v2.3.0",
 		"uptime_seconds": int64(time.Since(appStartTime).Seconds()),
 		"score_mode":     GlobalScoreEngine.GetMode(),
 		"profile":        cfg.Profile.Type,
@@ -6104,7 +6125,7 @@ func handleAPIConfig(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		cfg := GlobalProbeScheduler.GetConfig()
 		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"version":                "v2.2.1",
+			"version":                "v2.3.0",
 			"score_mode":             GlobalScoreEngine.GetMode(),
 			"profile":                cfg.Profile,
 			"profile_type":           cfg.Profile.Type,
@@ -6294,8 +6315,8 @@ func RegisterWebRoutes(cfg Config) {
 			sendEvent("status", "Generating IPs...")
 			ips := GenerateIPs(reqCfg.MaxScan, reqCfg.Unique, reqCfg.IPFile)
 
-			sendEvent("status", fmt.Sprintf("Ping scanning %d IPs...", len(ips)))
-			validNodes := ScanPing(r.Context(), ips, reqCfg.Port, reqCfg.ScanConcurrent, reqCfg.WSSHost, func(done, total, valid int) {
+			sendEvent("status", fmt.Sprintf("Scanning %d IPs (TCP + HTTPS anti-403 check)...", len(ips)))
+			validNodes := ScanRoutesWithProfile(r.Context(), ips, reqCfg.Port, reqCfg.ScanConcurrent, reqCfg.GetProbeProfile(), func(done, total, valid int) {
 				if done%10 == 0 || done == total {
 					sendEvent("progress_scan", map[string]int{"done": done, "total": total, "valid": valid})
 				}
@@ -6492,7 +6513,7 @@ func main() {
 	flag.Parse()
 
 	if *versionFlag {
-		println("CFST v2.2.2 (GOWAY Route Quality Probe & Long-Term Stability Analyzer)")
+		println("CFST v2.3.0 (GOWAY Route Quality Probe & Long-Term Stability Analyzer)")
 		return
 	}
 
