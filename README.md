@@ -361,13 +361,13 @@ CFST 支持三种运行模式：
 
 ```bash
 # Windows x64
-GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o cfst_windows_amd64.exe ./cfst-go
+GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o cfst_windows_amd64.exe .
 
 # Linux x64
-GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o cfst_linux_amd64 ./cfst-go
+GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o cfst_linux_amd64 .
 
 # macOS arm64
-GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o cfst_darwin_arm64 ./cfst-go
+GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o cfst_darwin_arm64 .
 ```
 
 ---
@@ -377,24 +377,14 @@ GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o cfst_darwin_arm64 ./cfst-g
 ```
 CFST/
 ├── .github/workflows/
+│   ├── ci.yml               # GitHub Actions CI 检查
 │   └── release.yml          # GitHub Actions 跨平台自动打包发布
 ├── README.md                # 架构设计与文档
+├── CHANGELOG.md             # 版本发布日志
 ├── .gitignore               # 忽略编译文件、持久化状态与临时数据
-└── cfst-go/
-    ├── main.go              # CLI 入口与参数解析
-    ├── daemon.go            # Probe 守护进程生命周期与退出保存
-    ├── metrics.go           # 统一 RouteMetrics 与健康状态机
-    ├── score.go             # 多时域评分引擎（Instant/Short/Long/Final）
-    ├── ewma.go              # 双半衰期 EWMA 指数移动平均跟踪器
-    ├── history.go           # 滑动窗口 (5m~24h)、24h Peak Hour 矩阵与 RouteStore
-    ├── probe.go             # 分级分层后台探针调度器 (L1~L5)
-    ├── api.go               # GoPass 专用本地 REST JSON API
-    ├── scanner.go           # 扫描流水线、CSV 生成与旧版兼容
-    ├── engine.go            # 网络底层探测 primitives (Ping, WSS, Speed)
-    ├── web.go               # Web UI 与 SSE 实时事件服务
-    ├── index.html           # 前端可视化交互页面
-    ├── CHANGELOG.md         # 版本发布日志
-    └── *_test.go            # 单元测试与端到端测试套件
+├── go.mod                   # Go 模块定义
+├── ip.txt                   # 可选自定义 IP 范围列表
+└── main.go                  # 单文件完整源码（整合全部测量引擎、调度器、API、Web UI 与内嵌资源）
 ```
 
 ---
