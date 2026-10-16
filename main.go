@@ -1,3 +1,8 @@
+// ============================================================================
+// CFST - Cloudflare Route Quality Probe & Long-Term Stability Analyzer
+// Version: v2.4.0
+// ============================================================================
+
 package main
 
 import (
@@ -27,6 +32,11 @@ import (
 	"syscall"
 	"time"
 )
+
+// ============================================================================
+// APPLICATION METADATA & VERSION
+// ============================================================================
+const AppVersion = "2.4.0"
 
 // ============================================================================
 // EMBEDDED WEB UI ASSETS (Self-contained, zero external files needed)
@@ -2058,7 +2068,7 @@ func (s *RouteStore) SaveSnapshot(path string) error {
 	s.mu.RUnlock()
 
 	container := SnapshotContainer{
-		Version:   "2.4.0",
+		Version:   AppVersion,
 		Timestamp: time.Now(),
 		Routes:    uniqueRecords,
 	}
@@ -4682,7 +4692,7 @@ func RunDaemon(cfg Config) {
 	GlobalScoreEngine.SetMode(ScoreMode(cfg.ScoreMode))
 
 	fmt.Println("============================================================")
-	fmt.Println("   CFST Route Quality Probe v2.4.0 (Continuous Daemon Mode)")
+	fmt.Printf("   CFST Route Quality Probe v%s (Continuous Daemon Mode)\n", AppVersion)
 	fmt.Printf("   Listening on: http://%s\n", cfg.APIAddr)
 	fmt.Printf("   Score Mode:   %s\n", cfg.ScoreMode)
 	fmt.Printf("   Intervals:    Active: %ds | Standby: %ds | Candidate: %ds | Failed: %ds\n",
@@ -5624,7 +5634,7 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 }
 
 func RunCLI(cfg Config) {
-	fmt.Printf("Cloudflare SpeedTest v2.4.0 (Route Quality Probe - Go Edition)\n\n")
+	fmt.Printf("Cloudflare SpeedTest v%s (Route Quality Probe - Go Edition)\n\n", AppVersion)
 
 	ips := GenerateIPs(cfg.MaxScan, cfg.Unique, cfg.IPFile)
 	fmt.Printf("🔍 Scanning %d IPs (concurrency: %d)...\n", len(ips), cfg.ScanConcurrent)
@@ -5940,7 +5950,7 @@ func handleAPIHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":         "ok",
 		"service":        "CFST Route Quality Probe",
-		"version":        "v2.4.0",
+		"version":        "v" + AppVersion,
 		"uptime_seconds": int64(time.Since(appStartTime).Seconds()),
 		"score_mode":     GlobalScoreEngine.GetMode(),
 		"profile":        cfg.Profile.Type,
@@ -6294,7 +6304,7 @@ func handleAPIConfig(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		cfg := GlobalProbeScheduler.GetConfig()
 		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"version":                "v2.4.0",
+			"version":                "v" + AppVersion,
 			"score_mode":             GlobalScoreEngine.GetMode(),
 			"profile":                cfg.Profile,
 			"profile_type":           cfg.Profile.Type,
@@ -6682,7 +6692,7 @@ func main() {
 	flag.Parse()
 
 	if *versionFlag {
-		println("CFST v2.4.0 (GOWAY Route Quality Probe & Long-Term Stability Analyzer)")
+		println("CFST v" + AppVersion + " (GOWAY Route Quality Probe & Long-Term Stability Analyzer)")
 		return
 	}
 
