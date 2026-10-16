@@ -1,5 +1,17 @@
 # Changelog
 
+## v2.4.1 (2026-10-16)
+
+### Release: Anti-403 SpeedTarget Normalizer & Smart SNI/Path Auto-Detection
+- **官方测速端点自动归一化与防 403 阻断 (`resolveSpeedTestTarget`)**:
+  - 测速阶段全面修正：只要测速目标为官方 `speed.cloudflare.com`，均强制将 Profile 重置为官方默认配置（Host 与 SNI 统一对齐官方域名），同时保留配置端口，彻底根除因自定义 SNI/Host 与官方测速地址不匹配引发的 403 Forbidden 测速中断。
+- **智能 SNI 协议剥离与路径自动识别 (`GetProbeProfile`)**:
+  - 自动剥除 `-sni` 参数中的 `https://`、`http://`、`wss://`、`ws://` 协议前缀，增强 CLI 与 Web 输入容错性。
+  - 支持在 SNI 参数中直接携带路径（如 `domain.com/ws`），智能拆分 `sniHost` 与 `sniPath`。
+  - 智能握手升级：当用户在 `-sni` 中携带路径或指定了 `-wsshost` 时，系统自动无缝升级为 GOWAY-WSS 严格 101 握手探活模式。
+- **Cloudflare 默认 IPv4 扫描网段精简 (`CloudflareIPv4Ranges`)**:
+  - 剔除专用于 DNS、Pages、Workers 或 WARP 的专有网段（162.159.* 网段及 131.0.72.0/22），避免这些特殊网段因不支持常规 CDN 反代而高频触发 403 阻断。
+
 ## v2.4.0 (2026-10-16)
 
 ### Release: Fail-Fast Speed Engine, Piecewise High-Speed Scoring & Smart Subnet Sampling

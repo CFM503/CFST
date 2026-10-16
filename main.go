@@ -1,6 +1,6 @@
 // ============================================================================
 // CFST - Cloudflare Route Quality Probe & Long-Term Stability Analyzer
-// Version: v2.4.0
+// Version: v2.4.1
 // ============================================================================
 
 package main
@@ -36,7 +36,7 @@ import (
 // ============================================================================
 // APPLICATION METADATA & VERSION
 // ============================================================================
-const AppVersion = "2.4.0"
+const AppVersion = "2.4.1"
 
 // ============================================================================
 // EMBEDDED WEB UI ASSETS (Self-contained, zero external files needed)
@@ -2128,9 +2128,7 @@ var CloudflareIPv4Ranges = []string{
 	"173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
 	"141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
 	"197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
-	"104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
-	// High-performance Cloudflare subnets (DNS, Pages, Workers, WARP)
-	"162.159.36.0/22", "162.159.44.0/24", "162.159.192.0/24", "162.159.193.0/24",
+	"104.24.0.0/14", "172.64.0.0/13",
 }
 
 type cidrInfo struct {
@@ -4932,25 +4930,67 @@ func DefaultConfig() Config {
 }
 
 // GetProbeProfile returns the effective ProbeProfile derived strictly from Config.
-// The default is strictly ProfileCFST unless cfg.Profile is explicitly "GOWAY-WSS" or "CUSTOM".
 func (cfg Config) GetProbeProfile() ProbeProfile {
+	rawSNI := strings.TrimSpace(cfg.SNI)
+	rawSNI = strings.TrimPrefix(rawSNI, "https://")
+	rawSNI = strings.TrimPrefix(rawSNI, "http://")
+	rawSNI = strings.TrimPrefix(rawSNI, "wss://")
+	rawSNI = strings.TrimPrefix(rawSNI, "ws://")
+
+	sniHost := rawSNI
+	sniPath := ""
+	if slashIdx := strings.Index(rawSNI, "/"); slashIdx != -1 {
+		sniHost = strings.TrimSpace(rawSNI[:slashIdx])
+		sniPath = strings.TrimSpace(rawSNI[slashIdx:])
+	}
+
 	switch strings.ToUpper(strings.TrimSpace(cfg.Profile)) {
 	case "GOWAY-WSS", "GOWAY_WSS", "WSS":
 		path := cfg.WSSPath
+		if sniPath != "" {
+			path = sniPath
+		}
 		if path == "" {
 			path = "/pyway"
 		}
-		return NewProfileGOWAYWSS(cfg.WSSHost, path, cfg.SNI, cfg.Port)
+		host := cfg.WSSHost
+		if host == "" {
+			host = sniHost
+		}
+		sni := sniHost
+		if sni == "" {
+			sni = host
+		}
+		return NewProfileGOWAYWSS(host, path, sni, cfg.Port)
 	case "CUSTOM":
-		return NewProfileCustom(cfg.URL, cfg.SNI, cfg.Port)
+		return NewProfileCustom(cfg.URL, sniHost, cfg.Port)
 	default:
+		// 如果用户在 SNI 中包含了路径 (如 domain.com/ws) 或显式传了 wsshost，自动升级为 GOWAY-WSS 101 严格握手检测
+		if sniPath != "" || strings.TrimSpace(cfg.WSSHost) != "" {
+			path := sniPath
+			if path == "" {
+				path = cfg.WSSPath
+			}
+			if path == "" {
+				path = "/"
+			}
+			host := cfg.WSSHost
+			if host == "" {
+				host = sniHost
+			}
+			sni := sniHost
+			if sni == "" {
+				sni = host
+			}
+			return NewProfileGOWAYWSS(host, path, sni, cfg.Port)
+		}
 		if isCustomURL(cfg.URL) {
-			return NewProfileCustom(cfg.URL, cfg.SNI, cfg.Port)
+			return NewProfileCustom(cfg.URL, sniHost, cfg.Port)
 		}
 		prof := NewProfileCFST()
-		if strings.TrimSpace(cfg.SNI) != "" {
-			prof.SNI = strings.TrimSpace(cfg.SNI)
-			prof.Host = prof.SNI
+		if sniHost != "" {
+			prof.SNI = sniHost
+			prof.Host = sniHost
 		}
 		return prof
 	}
@@ -5349,16 +5389,15 @@ func detectColoBatch(ctx context.Context, candidates []NodeResult, port int, con
 }
 
 // resolveSpeedTestTarget returns the target used for the HTTP download-speed phase.
-//
-// Important:
-// GOWAY-WSS / CUSTOM-WSS profiles are only used for the WSS compatibility gate.
-// After WSS compatibility has already been established, the speed-quality phase
-// MUST use the Cloudflare official HTTPS download target instead of the GOWAY WSS target.
 func resolveSpeedTestTarget(cfg Config, ip string) ResolvedProbeTarget {
 	profile := cfg.GetProbeProfile()
 	isWSS := profile.Type == ProfileGOWAYWSS || (profile.Type == ProfileCustom && strings.EqualFold(profile.Protocol, "wss"))
-	if isWSS {
+	// 只要测速 URL 是官方 speed.cloudflare.com，测速阶段必须将 SNI 和 Host 切回 speed.cloudflare.com，防止因自定义 SNI 与 Host 不匹配触发 403
+	if isWSS || !isCustomURL(cfg.URL) {
 		profile = NewProfileCFST()
+		if cfg.Port > 0 {
+			profile.Port = cfg.Port
+		}
 	}
 	return ResolveProbeTarget(
 		ProbeConfig{Profile: profile},
