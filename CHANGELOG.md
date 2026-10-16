@@ -1,5 +1,29 @@
 # Changelog
 
+## v2.4.0 (2026-10-16)
+
+### Release: Fail-Fast Speed Engine, Piecewise High-Speed Scoring & Smart Subnet Sampling
+- **分段评分曲线与超高速节点区分度提升 (`ScoreEngine.calcMetricScore`)**:
+  - 均速评分重构为分段曲线：$\le 15$ MB/s 获得 0~85 分，$15 \sim 50$ MB/s 线性递增至 100 分，彻底拉开 20~50 MB/s 超高速节点区分度。
+  - P10 速度评分升级为分段曲线：$\le 12$ MB/s 获得 0~85 分，$12 \sim 35$ MB/s 递增至 100 分，强力保障视频流媒体抗缓冲保底体验。
+  - 最低速度评分上限提升至 10 MB/s；延迟评分基准调整为 25ms（系数 0.55），兼顾网页首包 TTFB/RTT。
+- **单流测速计时解耦、早停淘汰与被动 Colo 缓存 (`SingleStreamTestDetailed`)**:
+  - 握手建连与实际下载流计时彻底分离，增加独立 4s 握手缓冲期与 3.5s 响应头超时定时器，避免建连耗时蚕食有效测速时间。
+  - 引入 Early-Abort 慢速早停机制：测速满 3 秒后若均速 $< 0.25$ MB/s 或连续断流 2 次以上立即主动中断淘汰，极大加快扫描周转。
+  - 新增全局并发安全的 `ipColoCache`：在 HTTP 响应头中被动解析 `cf-ray` 获取机房代码，消除重复请求 `/cdn-cgi/trace` 的开销与 ERR 覆盖风险。
+- **子网平方根平滑加权与 C 段保底抽样 (`GenerateIPs`)**:
+  - 引入子网平方根平滑加权算法（Sqrt Weighting），消除 `/13` 巨型网段对 `/22`、`/24` 高性能黄金子网的吞没效应。
+  - 增加 C 段保底抽样：第一阶段优先对各网段抽取不同 C 段 IP 保底，确保 100% 覆盖所有子网，再随机打散。
+- **全流程探测 Fail-Fast 快速淘汰与指标融合 (`ExecuteLayeredProbeWithSnapshot`, `ScanRoutesWithProfileDetailed`)**:
+  - L1 TCP Ping 增加 Fail-Fast 短路机制：5 次 Ping 中累计失败 3 次（或 3 次中失败 2 次）立即中断退出死节点，超时压缩至 1200ms/900ms。
+  - L2 探活融合首包响应延迟（TTFB / WSS Latency）到平均延迟排序中，使初筛排序更契合代理实际使用体验。
+  - 优化 Cloudflare 官方测速地址为极轻量 `__down?bytes=0` GET 请求，彻底消除 HEAD 405 Method Not Allowed 引起的二次握手。
+- **并发测速级联取消与多级决胜排序 (`runQuickFilter`, `runParallelDownloadTest`)**:
+  - 引入可级联取消的子 Context（`testCtx, testCancel`）：一旦测满目标数量或触发快速退出，立即中断所有其它后台正在下载的协程，杜绝带宽浪费与卡顿等待。
+  - Fast-Exit 快速收敛判定强化：要求均速与 P10 下限速度双达标，防止偶发瞬时峰值误触发。
+  - 多级决胜排序（Tie-Breaking）：总分接近时依次按 P10 下限速度、平均下载速度、TCP 延迟排序。
+  - Web UI 默认测速参数优化（800 IP / Top 20 / 2 并发 / 6s 测速 / 2s 预筛）。
+
 ## v2.3.0 (2026-10-14)
 
 ### Release: Single-File Architecture & Anti-403 Fast-Converging Route Optimizer
