@@ -1,5 +1,26 @@
 # Changelog
 
+## v2.4.5 (2026-10-17)
+
+### Release: Strict Quality Gate, Dynamic Load-Latency Sampling & QoS Drop Detection
+- **长连接严苛品质门控与满载延迟/抖动重度扣分 (`NodeResult.CalcScore`)**:
+  - 引入严苛的连接品质惩罚：中途断流每次重扣 12 分，丢包直接扣减 $35 \times \text{PacketLoss}$。
+  - 引入满载延迟暴涨（Bufferbloat）惩罚机制：当满载延迟超出空载基准（$\text{LoadLatency} > \text{TCPLatency} \times 2.2 + 60\text{ms}$）时触发缓冲膨胀扣分，精准识别并惩罚突发流量下排队拥塞的劣质节点。
+- **单流测速真实满载延迟动态采样与 TCP 慢启动去噪 (`SingleStreamTestDetailed`)**:
+  - 在持续大流量下载的第 2 秒与第 5 秒并发进行真实 TCP 满载延迟探测（`LoadLatency`），精确测量压榨状态下的网络响应。
+  - TCP 慢启动去噪：平滑处理第 1 秒窗口爬坡期，防止因常规 TCP 握手慢启动导致 P10/MinSpeed 误判。
+  - 后半程掉速惩罚：对比前半程与后半程均速，若后半程严重衰减（识别运营商 QoS 掐断或假高速），自动扣减 Stability 稳定性得分。
+  - 淘汰机制精确化：仅当满 3 秒完全 0 字节时提前退出死连接，有流量的节点完整测满时长（默认 8 秒）。
+- **初筛代价函数升级与 0 丢包优先保底 (`routePreRankKey`, `runQuickFilter`)**:
+  - 候选节点初筛由单一延迟升级为综合代价函数：`TCPLatency + Jitter*2.5 + PacketLoss*180.0`，严格确保 0 丢包、低抖动节点优先入围。
+  - 快速预筛综合考量均速 (50%)、P10 下限 (35%)、稳定性 (15%) 与断流惩罚；并在预筛后追加保底机制，确保进入测速池的候选节点数量充足。
+- **单线程独占长测速与多级决胜排序优化 (`DefaultConfig`, `runParallelDownloadTest`)**:
+  - 默认测速配置升级：单线程独占测试（`DLConc: 1`）、测速时长增加到 8 秒（`Duration: 8`）、预筛时长调整为 3 秒（`QuickDuration: 3`），彻底避免多并发下载在本地网卡/路由器层面的带宽争抢，测出真实、稳定的长连接质量。
+  - 决胜排序规则优化：0 断流 0 丢包优先 $\to$ P10 下限速度优先 $\to$ 稳定性优先 $\to$ 满载延迟低优先。
+- **并发安全与内存优化**:
+  - `RouteStore.GetMetrics` 增强切片与指针深拷贝，新增并发安全的 `GetEWMASnapshots`。
+  - `LightweightHTTPProbeTarget` 复用 `downloadBufPool` 内存池；`GetColoWithContext` 避免死锁超时。
+
 ## v2.4.1 (2026-10-16)
 
 ### Release: Anti-403 SpeedTarget Normalizer & Smart SNI/Path Auto-Detection
