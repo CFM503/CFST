@@ -7,4 +7,5 @@ dist/
 sin_ips.txt
 .claude/
 test_ip.txt
+.cfst_last.json
 

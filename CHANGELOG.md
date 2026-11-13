@@ -1,5 +1,23 @@
 # Changelog
 
+## v2.5.0 (2026-11-14)
+
+### Release: 100% /24 All-Subnet Funnel, Precise 403 Exclusion, Dual-Dimension GOWAY Probing & Interactive Wizard
+- **全网段无盲区探索与分层预筛漏斗 (`GenerateIPs`, `selectDiverseCandidates`, `DefaultConfig`)**:
+  - 无参数与默认配置升级为 **100% Cloudflare `/24` 全网段扫描**（`MaxScan = 0`, `Unique = true`，遍历约 5,900+ 个 `/24` C 段；L1 TCP Ping 优化为 3 次 @ 850ms，失败 2 次 Fail-Fast，并发 400），并消除 `/24` 抽样碰撞及 IPv6 CIDR 解析崩溃风险。
+  - 新增 `(Colo, /20)` 分层轮询预筛器 `selectDiverseCandidates`（Preset 候选池：fast=60 / standard=160 / deep=320），防止低延迟但被限速的单一 `/16` 或机房垄断候选池。
+  - 扩展均速（`50..100 MB/s`）与 P10 保底速度（`35..80 MB/s`）高分段评分曲线，默认 `StopThreshold = 0` 确保全局真正高速节点完整收敛；`runQuickFilter` 彻底取消死节点回填。
+- **HTTP 403 精确识别与零浪费快速排除 (`SingleStreamTestDetailed`, `ScanRoutesWithProfileDetailed`, `runParallelDownloadTest`)**:
+  - L2/L3/L4 全链路显式捕获 HTTP `403`（`Aborted403` / `HTTPStatus`），从源头剔除并在测速队列实现 **0ms 无退避跳过**（不再误当 `429` 指数睡眠最高 3s）。
+  - 在多 IP 同段扫描时启用 `/24` 403 熔断保护；`FromNodeResult` 与评分引擎严格将 403 标记为失效，不予推荐或加分。
+- **无 VPS 下载测试文件下的 GOWAY 双维真实评估 (`MeasureWSSStability`, `ResolveSpeedTargetForProbe`)**:
+  - 仅凭 VPS 域名即可通过：**3 轮零流量 GOWAY `WSS 101` 握手复检**（`WSSHandshakeCheckContext` 强制 HTTP/1.1 ALPN）实测回源端到端平均延迟、抖动与成功率 + 自动切回 Cloudflare 官方 `speed.cloudflare.com`（1GB 上限）测量高吞吐与 P10。
+  - 同步修复 Daemon 常驻模式 L3/L4 测速误打 VPS 域名导致 403/404、`FromNodeResult`/`ToNodeResult` 丢失 WSS 扩展指标、`TierCandidate` 缺少 L4 校准无法晋升，以及 `evaluateAndSchedule` 优先级排序。
+- **极简交互与参数一致性 (`runInteractiveWizardWithIO`, `parseGowayTarget`, `resolveGowayFields`, Web UI)**:
+  - TTY 终端无参数直接运行自动启动交互向导，记忆上次配置至 `.cfst_last.json`（下次直接回车一键复用）；非 TTY 管道/脚本/CI 或加 `-y` 自动跳过向导。
+  - 新增 `-goway <domain[:port][/path]>` 一键参数、`-preset (fast|standard|deep)`、`-all` 与 `-y`，并全面统一 CLI / Wizard / Daemon / Web UI 的参数解析。
+  - 升级内嵌 Web UI：前置模式、VPS 域名、路径与全网段勾选框，折叠高级设置并增加 `WSS RTT` 列。
+
 ## v2.4.5 (2026-10-17)
 
 ### Release: Strict Quality Gate, Dynamic Load-Latency Sampling & QoS Drop Detection

@@ -1,6 +1,6 @@
 # CFST - Cloudflare Route Quality Probe & SpeedTest
 
-> v2.4.5 | Go Edition
+> v2.5.0 | Go Edition
 
 CFST 已从一次性 Cloudflare IP 测速工具全面重构升级为 **GOWAY 线路质量长期探针 + 稳定性分析 + 高峰期选路数据源 (Route Quality Probe & Stability Analyzer)**。
 
@@ -266,28 +266,33 @@ CFST 支持三种运行模式：
 
 ---
 
-### 1. GOWAY-WSS 兼容性门禁测速 (推荐)
+### 1. GOWAY-WSS 交互式向导与双维优选 (推荐，无需 VPS 下载测试文件)
 
-针对部署了 GOWAY 隧道的 CDN 节点选路，采用**两阶段严格分离机制**：
-- **阶段一 (WSS 门禁)**：对候选 Cloudflare IP 执行 TCP Ping 与 TLS WebSocket 握手，严格校验服务端是否响应 `HTTP 101 Switching Protocols`。只有返回 101 的合法节点才被标记为兼容。
-- **阶段二 (测速与评分)**：通过 WSS 门禁的节点自动切换至 Cloudflare 官方 HTTPS 测速端点，测算抗缓冲保底速度（P10）、卡顿率与稳定性评分。
+即使 VPS 上只有域名与 GOWAY 服务（无任何下载测试文件），CFST 也能精准优选：
+- **零参数交互式向导**：直接在终端无参数运行会进入极简交互向导，输入 VPS 域名即可开始，并自动将上次选择记忆在 `.cfst_last.json` 中（下次直接回车复用）；无 TTY/管道环境或加 `-y` 则直接全网段静默运行。
+- **阶段一 (全网段探索 + 403 精确排除)**：默认遍历 Cloudflare **100% `/24` 网段**（~5,900+ 个 C 段，单轮约 15~25 秒），精确识别并剔除真实 **HTTP 403**（零退避不浪费睡眠，多 IP 模式下支持 `/24` 熔断），同时通过 `(Colo, /20)` 分层轮询避开单一限速网段垄断候选池。
+- **阶段二 (双维校验)**：自动向 `speed.cloudflare.com`（1GB 上限）测算高吞吐持续带宽 / P10 / 断流卡顿；并通过 **3 轮零流量 GOWAY `WSS 101` 复检** 实测边缘节点到 VPS 回源的真实握手延迟、抖动与成功率。
 
 > [!NOTE]
-> 请将命令中的示例域名 `goway.example.com` 替换为您实际部署的 GOWAY 域名或 SNI。
+> 请将示例域名 `goway.example.com` 替换为您实际部署的 GOWAY VPS 域名。
 
-#### CLI 一次性测速
+#### 极简 CLI 一键命令
 ```bash
-# 基础测速命令（示例域名）
-./CFST-windows-amd64.exe -profile GOWAY-WSS -wsshost goway.example.com -wsspath /pyway -sni goway.example.com
+# 无参数启动交互式向导（自动记忆上次域名配置；管道/脚本下直接全网段运行）
+./CFST-windows-amd64.exe
 
-# 进阶参数调优：扫描 500 个 IP、初筛 20 个候选、每个测速 10 秒、结果输出到 result.csv
-./CFST-windows-amd64.exe -profile GOWAY-WSS -wsshost goway.example.com -wsspath /pyway -sni goway.example.com -max 500 -topn 20 -dt 10 -o result.csv
+# 一键 GOWAY 极简语法：domain[:port][/path]（自动同步 Host/SNI，全网段扫描）
+./CFST-windows-amd64.exe -goway goway.example.com/pyway
+
+# 快速模式 (~800 C段) / 深度模式 (全网段长测)
+./CFST-windows-amd64.exe -goway goway.example.com/pyway -preset fast
+./CFST-windows-amd64.exe -goway goway.example.com:8443/ws -preset deep -o result.csv
 ```
 
 #### Daemon 常驻守护进程模式 (对接 GoPass 控制器)
 ```bash
-# 后台常驻模式：自动周期性探测 Active/Standby/Candidate 线路，提供本地 REST API (http://127.0.0.1:9876)
-./CFST-windows-amd64.exe -daemon -profile GOWAY-WSS -wsshost goway.example.com -wsspath /pyway -sni goway.example.com
+# 后台常驻模式：GOWAY 与 Cloudflare 测速目标自动隔离，L3/L4 测速绝不误打 VPS 触发 403/404
+./CFST-windows-amd64.exe -daemon -goway goway.example.com/pyway
 ```
 
 ---
@@ -297,13 +302,13 @@ CFST 支持三种运行模式：
 官方纯净测速模式，不执行任何 WebSocket 升级请求，严格直连 Cloudflare 官方端点：
 
 ```bash
-# 默认扫描 3000 个官方 IPv4 并进行保底速度测试
-./CFST-windows-amd64.exe
+# 非交互式直接全网段（100% /24）优选
+./CFST-windows-amd64.exe -y
 
-# 常用参数：开启 C 段去重、只测前 10 个最优节点、测速 15 秒
-./CFST-windows-amd64.exe -u -dn 10 -dt 15 -o cfst_result.csv
+# 常用参数：自定义输出前 10 个节点、每节点测速 10 秒
+./CFST-windows-amd64.exe -y -dn 10 -dt 10 -o cfst_result.csv
 
-# 启动 Web UI 网页交互控制台
+# 启动 Web UI 网页交互控制台（支持 GOWAY-WSS 模式与 WSS RTT 展示）
 ./CFST-windows-amd64.exe -web
 ```
 
@@ -327,10 +332,14 @@ CFST 支持三种运行模式：
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `-profile` | `CFST` | 探针配置类型：`CFST`（官方 HTTPS）、`GOWAY-WSS`、`CUSTOM` |
-| `-wsshost` | `""` | GOWAY WSS 握手校验 Fake Host（例如 `goway.example.com`） |
+| `-goway` | `""` | GOWAY VPS 极简目标（格式 `domain[:port][/path]`，例如 `goway.example.com/pyway`） |
+| `-preset` | `standard` | 扫描档位：`fast` (~800 C段)、`standard` (100% `/24` 全网段)、`deep` (全网段深度) |
+| `-all` | `false` | 强制开启 100% Cloudflare `/24` 全网段扫描（等价于 `-max 0 -u true`） |
+| `-y` | `false` | 跳过交互向导，直接按当前默认参数/命令行参数开始扫描 |
+| `-profile` | `CFST` | 探针配置类型：`CFST`、`GOWAY-WSS`、`CUSTOM`（传入 `-goway`/`-wsshost`/`-sni domain/path` 自动启用 `GOWAY-WSS`） |
+| `-wsshost` | `""` | GOWAY WSS 握手校验 Host（例如 `goway.example.com`） |
 | `-wsspath` | `/pyway` | GOWAY WSS 握手请求路径 |
-| `-sni` | `""` | 自定义 TLS SNI（例如 `goway.example.com`） |
+| `-sni` | `""` | 自定义 TLS SNI（支持 `domain/path` 自动解析） |
 | `-daemon` | `false` | 启动常驻 Route Quality Probe 探针守护进程模式 |
 | `-api-addr` | `127.0.0.1:9876` | REST API 本地监听地址 |
 | `-mode` | `normal` | 评分模式（`normal` 或 `peak` 晚高峰模式） |
@@ -340,20 +349,20 @@ CFST 支持三种运行模式：
 | `-failed-interval` | `60` | Failed 故障线路复活重试周期（秒） |
 | `-state` | `cfst_state.json` | 线路状态与时序历史持久化文件 |
 | `-p` | `443` | 目标端口 |
-| `-max` | `3000` | 初始扫描最大 IP 数量 |
-| `-topn` | `100` | 初筛进入详细测试的候选数量 |
-| `-qd` | `3` | 快速初筛测速时长（秒） |
-| `-dlc` | `1` | 测速并发数 |
-| `-dn` | `20` | 测速节点数量 |
-| `-dt` | `20` | 测速持续时长（秒） |
-| `-st` | `30.0` | 停止阈值（MB/s） |
-| `-u` | `false` | 启用 C 段去重 |
+| `-max` | `0` | 扫描上限（`0` 且 `-u=true` 时遍历 **100%** Cloudflare `/24` 网段） |
+| `-topn` | `30` | 预筛后进入深度测速的候选数量 |
+| `-qd` | `2` | 快速预筛测速时长（秒） |
+| `-dlc` | `1` | 测速并发数（推荐 `1` 避免并发争抢失真） |
+| `-dn` | `10` | 深度测速输出节点数量 |
+| `-dt` | `8` | 单个节点深度测速持续时长（秒） |
+| `-st` | `0` | 提前停止阈值 MB/s（`0` 为不提前终止，确保测出全局真正最快节点） |
+| `-u` | `true` | 启用 `/24` C 段去重 |
 | `-f` | `""` | 自定义 IP 列表文件 |
 | `-o` | `result_colo.csv` | CSV 结果输出路径 |
-| `-sc` | `200` | TCP 扫描并发度 |
-| `-skip429` | `true` | 静默跳过 429 限流节点 |
-| `-url` | `https://speed.cloudflare.com/__down...` | 自定义下载测速 URL |
-| `-web` | `false` | 启动 Web UI 界面 |
+| `-sc` | `400` | TCP 扫描并发度 |
+| `-skip429` | `true` | 静默跳过 429 限流节点（HTTP 403 始终零退避直接排除） |
+| `-url` | `https://speed.cloudflare.com/__down?bytes=1000000000` | 下载测速 URL（1GB 上限） |
+| `-web` | `false` | 启动 Web UI 界面（可选 `-web <port>`） |
 
 ---
 
@@ -384,7 +393,8 @@ CFST/
 ├── .gitignore               # 忽略编译文件、持久化状态与临时数据
 ├── go.mod                   # Go 模块定义
 ├── ip.txt                   # 可选自定义 IP 范围列表
-└── main.go                  # 单文件完整源码（整合全部测量引擎、调度器、API、Web UI 与内嵌资源）
+├── main.go                  # 单文件完整源码（整合全部测量引擎、调度器、API、交互向导与内嵌 Web UI）
+└── main_test.go             # 单元测试与防回归测试套件
 ```
 
 ---
