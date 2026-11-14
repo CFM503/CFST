@@ -1,5 +1,24 @@
 # Changelog
 
+## v2.6.0 (2026-11-14)
+
+### Redesign: Elite Competitive Funnel, L2 Anti-Overload Limiter, Interleaved `/20` Sampling & Qualified Early-Stop
+- **重构 `selectDiverseCandidates`：精英竞争门控 + 头部多配额分层轮询 (`selectDiverseCandidates`, `routePreRankKey`)**:
+  - **根因修复**：v2.5.0/v2.5.1 对所有 `(Colo, /20)` 桶执行无门槛 1-IP-per-bucket 轮询。由于 Cloudflare 全网存在 200~350 个 `(Colo, /20)` 桶（绝大部分是 `104.16.0.0/13` 内的欧美远端 `FRA`/`LAX`/`AMS` 桶），外层循环仅走完 1 轮即填满 `maxPool`，导致每个优质亚洲/近端桶（如 `SIN|172.64.144.0/20`）被硬性限死只能入选 **1 个 IP**，其余 19+ 个同段高速 `/24` 节点全部被丢弃并被 150 个 `0.20 MB/s` 远端桶顶替。
+  - **新架构**：引入最优基准门控（`routePreRankKey <= bestKey*1.85 + 60ms` 且 `PacketLoss <= bestLoss + 5%`），直接将远端高延迟（`300ms+`）与高丢包桶挡在第一梯队轮询之外；聚焦前 `12` 个最低代价精英桶，每轮为头部最优桶分配 `2~4` 个配额，使 `SIN`/`HKG`/`NRT`/`SJC` 高速网段能够成批入选，同时保留跨网段多样性。
+- **L2 独立握手并发限流器与 L1 4-Ping 高精度去噪 (`ScanRoutesWithProfileDetailed`, `measureTCPPingStats`)**:
+  - **防止自建 VPS 握手过载**：在 `GOWAY-WSS` 模式下，L2 的 `101` 握手全部回源至用户的单台 VPS。新增独立 `l2Sem` 信号量（`WSS = 48`、`HTTPS = 96`），L1 并发收敛至 `<= 300`，彻底消除数百并发 TLS+WS 握手瞬间打爆单台 VPS 引起的连接超时与 `1800ms+` 虚高延迟。
+  - **恢复 4 次 L1 TCP Ping（要求 `>= 3/4` 成功，累计失败 2 次即刻 Fail-Fast）**：在 L1 源头直接拦截 `>= 33.3%` 丢包节点；当采样数 `>= 4` 时自动剔除单次极端建连热身毛刺（`> 次大值 * 1.85`），使稳态 RTT 与 Jitter 更加精准。
+- **跨 `/20` 交错洗牌与黄金默认档位 (`interleaveSubnetsBy20`, `GenerateIPs`, `DefaultConfig`, `applyPreset`, `presetQuickPoolSize`)**:
+  - 新增 `interleaveSubnetsBy20`：在每个 CIDR 池内部按 `/20` 前缀分桶洗牌并交错排列，使 `Standard` 默认档（`MaxScan = 1500` Sqrt 加权抽样，100% 覆盖中小型黄金段且均匀横跨 `150+` 个 `/20` 路由块）无需每次发起 5,952 全网段风暴即可稳定扫出大批高速节点（传 `-all` 或选 `Deep` 档仍可 100% 扫描全部 5,952 个 `/24`）。
+  - 预筛池收敛至精英规模（`fast = 40`, `standard = 60`, `deep = 90`），预筛时长恢复为 `3 秒`（`QuickDuration = 3`），并将预筛请求流控为 `150MB` 分片 + `25ms` 步进退避，彻底消除连续 160~320 次 1GB 请求触发的 Cloudflare 边缘限速（`0.20 MB/s`）。
+- **L3 预筛与 L4 深度测速「达标早停 (Qualified Early-Stop)」(`runQuickFilter`, `runParallelDownloadTest`, `SingleStreamTestDetailed`)**:
+  - `SingleStreamTestDetailed` 慢启动去噪门槛支持 `3s` 预筛（`len >= 3`）；`runQuickFilter` 融合均速、P10、最低速、稳定性及空载延迟/抖动/丢包代价排序，并在高速节点充足时自动剔除 `< 0.80 MB/s` 的限速节点。
+  - `runParallelDownloadTest` 不再一凑够 `DownloadNum` 个非零结果就盲目停机，而是统计**真正达标的高质量节点数 (`qualifiedCount`)**（要求 `Speed >= 2.5 MB/s`、`P10 >= 1.2 MB/s`、`0 断流`、`Loss <= 15%`、`Stability >= 65`、`WSS >= 67%`）；若前排混入 `0.20 MB/s` 节点，自动向后继续测试 `TopN` 候选池直至凑满 `DownloadNum` 个真高速节点，最后排序截取最优 `DownloadNum` 个输出。
+  - 8s 满载下载结束后预留 `40ms` 网卡队列排空窗口再执行 WSS/TCP Ping 复检，且仅在丢包率不劣化（`loss <= cand.PacketLoss`）时覆盖，防止下载尾包误伤 0 丢包节点。
+- **分段延迟评分曲线与严苛防抖权重 (`calcMetricScore`, `CalcScore`, `calcWSSQualityPenalty`)**:
+  - 将原先 `> 206ms` 一刀切归零的线性延迟分升级为 `35ms / 120ms / 250ms / 450ms` 四段式渐进曲线，权重提升至 `0.07`，P10 权重提升至 `0.22`，抖动扣分斜率加陡至 `3.0/ms`，并收紧满载 Bufferbloat 与 WSS 抖动/超高延迟惩罚。
+
 ## v2.5.1 (2026-11-14)
 
 ### Fix: GOWAY-WSS Scoring Fairness, TCP Ping Recheck & Pure Latency Baseline

@@ -36,7 +36,7 @@ import (
 // ============================================================================
 // APPLICATION METADATA & VERSION
 // ============================================================================
-const AppVersion = "2.5.1"
+const AppVersion = "2.6.0"
 
 // ============================================================================
 // EMBEDDED WEB UI ASSETS (Self-contained, zero external files needed)
@@ -482,13 +482,13 @@ type HorizonWeights struct {
 func DefaultNormalWeights() ComponentWeights {
 	return ComponentWeights{
 		SpeedWeight:      0.20,
-		P10SpeedWeight:   0.20,
-		MinSpeedWeight:   0.10,
+		P10SpeedWeight:   0.22,
+		MinSpeedWeight:   0.08,
 		StabilityWeight:  0.20,
 		PacketLossWeight: 0.10,
 		JitterWeight:     0.10,
-		LatencyWeight:    0.05,
-		HandshakeWeight:  0.05,
+		LatencyWeight:    0.07,
+		HandshakeWeight:  0.03,
 		ColoBonus:        3.0,
 	}
 }
@@ -502,8 +502,8 @@ func DefaultPeakWeights() ComponentWeights {
 		StabilityWeight:  0.25,
 		PacketLossWeight: 0.10,
 		JitterWeight:     0.10,
-		LatencyWeight:    0.025,
-		HandshakeWeight:  0.025,
+		LatencyWeight:    0.03,
+		HandshakeWeight:  0.02,
 		ColoBonus:        2.0,
 	}
 }
@@ -617,16 +617,24 @@ func (e *ScoreEngine) calcMetricScore(w ComponentWeights, speed, p10Speed, minSp
 		scoreMinSpeed = 0
 	}
 
-	// 4. Latency score: base 25ms, 兼顾网页代理转发首包响应 (TTFB/RTT)
-	scoreLatency := 100.0 - (latency-25.0)*0.55
-	if scoreLatency < 0 {
+	// 4. Latency score: 分段渐进曲线，避免 >206ms 处全部归零导致 210ms 与 440ms 无法区分
+	var scoreLatency float64
+	if latency <= 0 {
 		scoreLatency = 0
-	} else if scoreLatency > 100.0 {
+	} else if latency <= 35.0 {
 		scoreLatency = 100.0
+	} else if latency <= 120.0 {
+		scoreLatency = 100.0 - ((latency-35.0)/85.0)*20.0 // 35ms->100, 120ms->80
+	} else if latency <= 250.0 {
+		scoreLatency = 80.0 - ((latency-120.0)/130.0)*40.0 // 120ms->80, 250ms->40
+	} else if latency <= 450.0 {
+		scoreLatency = 40.0 - ((latency-250.0)/200.0)*40.0 // 250ms->40, 450ms->0
+	} else {
+		scoreLatency = 0
 	}
 
-	// 5. Jitter score: >10ms starts steep penalty
-	scoreJitter := 100.0 - jitter*2.5
+	// 5. Jitter score: 严控波动，>5ms 即拉开差距，>=33ms 归零
+	scoreJitter := 100.0 - jitter*3.0
 	if scoreJitter < 0 {
 		scoreJitter = 0
 	} else if scoreJitter > 100.0 {
@@ -767,7 +775,7 @@ func (e *ScoreEngine) EvaluateRoute(m *RouteMetrics, shortEWMA, longEWMA EWMASna
 		m.LongTermScore*hw.LongTermWeight +
 		peakScore*hw.PeakHourWeight +
 		conf*hw.ConfidenceWeight
-	final -= calcWSSSuccessPenalty(m.GOWAYWSSCompatible, m.WSSSuccessRate)
+	final -= calcWSSQualityPenalty(m.GOWAYWSSCompatible, m.WSSSuccessRate, m.GOWAYWSSLatency, m.WSSJitter)
 
 	if final < 0 {
 		final = 0
@@ -783,6 +791,21 @@ func calcWSSSuccessPenalty(compatible bool, successRate float64) float64 {
 		return 0
 	}
 	return (1.0 - successRate) * 30.0
+}
+
+// calcWSSQualityPenalty 综合评估 GOWAY WSS 握手成功率、抖动与超高回源延迟惩罚
+func calcWSSQualityPenalty(compatible bool, successRate, wssLatency, wssJitter float64) float64 {
+	if !compatible {
+		return 0
+	}
+	penalty := calcWSSSuccessPenalty(compatible, successRate)
+	if wssJitter > 35.0 {
+		penalty += math.Min(6.0, (wssJitter-35.0)*0.08)
+	}
+	if wssLatency > 600.0 {
+		penalty += math.Min(6.0, (wssLatency-600.0)*0.004)
+	}
+	return penalty
 }
 
 // ============================================================================
@@ -2225,16 +2248,16 @@ func (n *NodeResult) CalcScore() {
 		effectiveP10 = n.MinSpeed
 	}
 	score := GlobalScoreEngine.calcMetricScore(w, effectiveSpeed, effectiveP10, n.MinSpeed, n.TCPLatency, n.Jitter, n.PacketLoss, n.Stability, true, n.Colo)
-	// 长连接严苛质量门控：严惩中途断流、高丢包、WSS 握手不稳及满载延迟暴涨（Bufferbloat）
+	// 长连接严苛质量门控：严惩中途断流、丢包、WSS 握手不稳及满载延迟暴涨（Bufferbloat）
 	if n.StallCount > 0 {
 		score -= float64(n.StallCount) * 12.0
 	}
-	if n.PacketLoss > 0.10 {
-		score -= (n.PacketLoss - 0.10) * 35.0
+	if n.PacketLoss > 0.05 {
+		score -= (n.PacketLoss - 0.05) * 30.0
 	}
-	score -= calcWSSSuccessPenalty(n.GOWAYWSSCompatible, n.WSSSuccessRate)
-	if n.LoadLatency > 0 && n.TCPLatency > 0 && n.LoadLatency > n.TCPLatency*2.2+60.0 {
-		bloatPenalty := math.Min(10.0, (n.LoadLatency-(n.TCPLatency*2.2+60.0))*0.04)
+	score -= calcWSSQualityPenalty(n.GOWAYWSSCompatible, n.WSSSuccessRate, n.GOWAYWSSLatency, n.WSSJitter)
+	if n.LoadLatency > 0 && n.TCPLatency > 0 && n.LoadLatency > n.TCPLatency*1.8+40.0 {
+		bloatPenalty := math.Min(12.0, (n.LoadLatency-(n.TCPLatency*1.8+40.0))*0.05)
 		score -= bloatPenalty
 	}
 	if score < 0 {
@@ -2724,8 +2747,8 @@ func SingleStreamTestDetailed(ctx context.Context, target ResolvedProbeTarget, d
 	copy(intervalsCopy, intervals)
 	sampleMu.Unlock()
 
-	// TCP 慢启动（Slow-Start）去噪：若第 1 秒非断流但处于明显的窗口爬坡期，平滑其对稳态 P10/MinSpeed/CV 的失真影响
-	if len(intervalsCopy) >= 4 && !intervalsCopy[0].IsStall && intervalsCopy[1].IntervalSpeed > 1.0 {
+	// TCP 慢启动（Slow-Start）去噪：若第 1 秒非断流但处于明显的窗口爬坡期，平滑其对稳态 P10/MinSpeed/CV 的失真影响（支持 3s 预筛与 8s 全测）
+	if len(intervalsCopy) >= 3 && !intervalsCopy[0].IsStall && intervalsCopy[1].IntervalSpeed > 1.0 {
 		if intervalsCopy[0].IntervalSpeed < intervalsCopy[1].IntervalSpeed*0.65 {
 			intervalsCopy[0].IntervalSpeed = intervalsCopy[0].IntervalSpeed*0.30 + intervalsCopy[1].IntervalSpeed*0.70
 		}
@@ -2812,6 +2835,46 @@ func enumerateCSubnets(cidr string) ([]uint32, *cidrInfo) {
 	return subnets, info
 }
 
+// interleaveSubnetsBy20 将同一个大 CIDR 块内的 /24 网段按 /20 路由前缀分桶洗牌并交错排列，
+// 确保当按比例抽样（如 Standard 1,500 个 /24）时，从栈尾弹出能均匀覆盖该段内所有 /20 集群，绝不扎堆。
+func interleaveSubnetsBy20(subnets []uint32) []uint32 {
+	if len(subnets) <= 2 {
+		rand.Shuffle(len(subnets), func(i, j int) { subnets[i], subnets[j] = subnets[j], subnets[i] })
+		return subnets
+	}
+	groupMap := make(map[uint32][]uint32)
+	var keys []uint32
+	for _, sn := range subnets {
+		k := sn & 0xFFFFF000 // /20 prefix
+		if _, ok := groupMap[k]; !ok {
+			keys = append(keys, k)
+		}
+		groupMap[k] = append(groupMap[k], sn)
+	}
+	rand.Shuffle(len(keys), func(i, j int) { keys[i], keys[j] = keys[j], keys[i] })
+	for _, k := range keys {
+		g := groupMap[k]
+		rand.Shuffle(len(g), func(i, j int) { g[i], g[j] = g[j], g[i] })
+		groupMap[k] = g
+	}
+	out := make([]uint32, 0, len(subnets))
+	for len(out) < len(subnets) {
+		progressed := false
+		for _, k := range keys {
+			g := groupMap[k]
+			if len(g) > 0 {
+				out = append(out, g[len(g)-1])
+				groupMap[k] = g[:len(g)-1]
+				progressed = true
+			}
+		}
+		if !progressed {
+			break
+		}
+	}
+	return out
+}
+
 func randHostInSubnet(subnetBase uint32, info *cidrInfo) string {
 	var ip uint32
 	if info.hostBits <= 2 {
@@ -2877,7 +2940,7 @@ func GenerateIPs(maxScan int, unique bool, ipFile string) []string {
 			if len(subnets) == 0 || info == nil {
 				continue
 			}
-			rand.Shuffle(len(subnets), func(i, j int) { subnets[i], subnets[j] = subnets[j], subnets[i] })
+			subnets = interleaveSubnetsBy20(subnets)
 			totalCSubnets += len(subnets)
 			pools = append(pools, &cidrPool{
 				info:    info,
@@ -3093,18 +3156,29 @@ func measureTCPPingStats(ctx context.Context, ip string, port, count, minSuccess
 	if len(lats) < minSuccess {
 		return 0, 0, float64(count-len(lats)) / float64(count), false
 	}
+	// 若采样数 >= 4 且存在单次极端建连毛刺（如首包 ARP/路由表热身 > 次大值 1.85 倍），计算稳态延迟与抖动时剔除该单点噪声
+	calcLats := lats
+	if len(lats) >= 4 {
+		sortedLats := make([]float64, len(lats))
+		copy(sortedLats, lats)
+		sort.Float64s(sortedLats)
+		secondMax := sortedLats[len(sortedLats)-2]
+		if secondMax > 0 && sortedLats[len(sortedLats)-1] > secondMax*1.85 && sortedLats[len(sortedLats)-1]-secondMax > 25.0 {
+			calcLats = sortedLats[:len(sortedLats)-1]
+		}
+	}
 	var sum float64
-	for _, l := range lats {
+	for _, l := range calcLats {
 		sum += l
 	}
-	avgLat = sum / float64(len(lats))
-	if len(lats) > 1 {
+	avgLat = sum / float64(len(calcLats))
+	if len(calcLats) > 1 {
 		var variance float64
-		for _, l := range lats {
+		for _, l := range calcLats {
 			diff := l - avgLat
 			variance += diff * diff
 		}
-		jitter = math.Sqrt(variance / float64(len(lats)))
+		jitter = math.Sqrt(variance / float64(len(calcLats)))
 	}
 	loss = float64(count-len(lats)) / float64(count)
 	return avgLat, jitter, loss, true
@@ -5415,19 +5489,19 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		Port:               443,
-		MaxScan:            0,    // 0 + Unique=true => 扫描 100% 全量 /24 网段（约 5,900+ 个）
-		TopN:               30,   // 优选前 30 个进入深度测速
+		MaxScan:            1500, // Sqrt 加权跨段均衡抽样 1,500 个独立 /24（100% 覆盖黄金中小段，避免 5,952 全扫冲击本地网关与 VPS；传 -all 可强制全扫）
+		TopN:               25,   // 优选前 25 个精英节点进入深度测速
 		DLConc:             1,    // 单线程独占带宽精确测速，杜绝多连接争抢导致 P10 与稳定性失真
 		DownloadNum:        10,   // 输出前 10 个高质量长连接节点
 		Duration:           8,    // 每个测 8 秒，充分检验稳态吞吐与后半程抗限速能力
 		StopThreshold:      0,    // 0 = 不提前中断，确保全局真正最快/最高吞吐的节点胜出
 		Unique:             true, // 每个 /24 C段只取 1 个 IP，避免同网段重复浪费时间
 		Output:             "result_colo.csv",
-		ScanConcurrent:     400, // 高并发全网段快速扫描
+		ScanConcurrent:     260, // 兼顾扫描速度与本地 NAT/路由器连接表稳定，防止并发过高造成假丢包
 		WebPort:            "9876",
 		URL:                "https://speed.cloudflare.com/__down?bytes=1000000000", // 1GB 上限防止高速线路提前下完
 		Skip429:            true,
-		QuickDuration:      2, // 预筛 2 秒快速淘汰慢/限速节点
+		QuickDuration:      3, // 预筛 3 秒（充分跨越 TCP 慢启动窗口，准确识别真实吞吐与限速）
 		FilterMode:         "speed",
 		WSSHost:            "",
 		WSSPath:            "/pyway",
@@ -5456,41 +5530,40 @@ func applyPreset(cfg *Config) {
 	switch strings.ToLower(strings.TrimSpace(cfg.Preset)) {
 	case "fast":
 		cfg.MaxScan = 800
-		cfg.TopN = 15
-		cfg.DownloadNum = 6
-		cfg.Duration = 5
-		cfg.QuickDuration = 2
-		cfg.ScanConcurrent = 400
+		cfg.TopN = 18
+		cfg.DownloadNum = 8
+		cfg.Duration = 6
+		cfg.QuickDuration = 3
+		cfg.ScanConcurrent = 240
 		cfg.Unique = true
 	case "standard", "":
-		// Respect AllSubnets / default standard settings
 		if cfg.Preset == "standard" {
-			cfg.MaxScan = 0
-			cfg.TopN = 30
+			cfg.MaxScan = 1500
+			cfg.TopN = 25
 			cfg.DownloadNum = 10
 			cfg.Duration = 8
-			cfg.QuickDuration = 2
-			cfg.ScanConcurrent = 400
+			cfg.QuickDuration = 3
+			cfg.ScanConcurrent = 260
 			cfg.Unique = true
 		}
 	case "deep":
 		cfg.MaxScan = 0
-		cfg.TopN = 50
+		cfg.TopN = 40
 		cfg.DownloadNum = 15
-		cfg.Duration = 12
+		cfg.Duration = 10
 		cfg.QuickDuration = 3
-		cfg.ScanConcurrent = 500
+		cfg.ScanConcurrent = 280
 		cfg.Unique = true
 	}
 }
 
 func presetQuickPoolSize(cfg Config) int {
-	pool := 160
+	pool := 60
 	switch strings.ToLower(strings.TrimSpace(cfg.Preset)) {
 	case "fast":
-		pool = 60
+		pool = 40
 	case "deep":
-		pool = 320
+		pool = 90
 	}
 	if cfg.TopN*2 > pool {
 		pool = cfg.TopN * 2
@@ -5556,9 +5629,11 @@ func prefix20Key(ip string) string {
 	return fmt.Sprintf("%d.%d.%d.0/20", v4[0], v4[1], v4[2]&0xF0)
 }
 
-// selectDiverseCandidates selects up to maxPool candidates stratified by (Colo, /20) buckets
-// using round-robin ordered by latency/jitter/loss key, preventing a single throttled low-RTT /16
-// or Colo from crowding out faster clusters.
+// selectDiverseCandidates 采用「精英竞争门控 + 头部多配额分层轮询」选择最多 maxPool 个预筛候选节点：
+//  1. 严格计算最优基准代价 bestKey，仅允许代价 <= bestKey*1.85+60ms 且丢包率 <= 最优+5% 的高质量节点进入第一梯队分桶；
+//     彻底杜绝欧美远端高延迟（FRA/LAX/AMS 300ms+）或高丢包桶混入轮询，避免挤占亚洲/美西优质机房（SIN/HKG/NRT/SJC）名额。
+//  2. 仅保留前 12 个最低延迟代价的精英 (Colo, /20) 桶，且头部最优桶每轮分配 2~4 个配额，既保证最快集群的深度挖掘，又兼顾跨网段多样性。
+//  3. 若第一梯队桶取完仍不足 maxPool，再按全局 routePreRankKey 顺序从剩余节点中择优回填。
 func selectDiverseCandidates(nodes []NodeResult, maxPool int) []NodeResult {
 	sorted := make([]NodeResult, len(nodes))
 	copy(sorted, nodes)
@@ -5569,12 +5644,19 @@ func selectDiverseCandidates(nodes []NodeResult, maxPool int) []NodeResult {
 		return sorted
 	}
 
+	bestKey := routePreRankKey(sorted[0])
+	maxCompetitiveKey := bestKey*1.85 + 60.0
+	maxCompetitiveLoss := sorted[0].PacketLoss + 0.05
+
 	type bucket struct {
 		key   string
 		items []NodeResult
 	}
 	bucketMap := make(map[string]*bucket)
 	for _, n := range sorted {
+		if routePreRankKey(n) > maxCompetitiveKey || n.PacketLoss > maxCompetitiveLoss {
+			continue
+		}
 		colo := strings.ToUpper(strings.TrimSpace(n.Colo))
 		if colo == "" || colo == "ERR" || colo == "UNK" {
 			colo = "UNK"
@@ -5600,23 +5682,60 @@ func selectDiverseCandidates(nodes []NodeResult, maxPool int) []NodeResult {
 		}
 		return buckets[i].key < buckets[j].key
 	})
+	const maxEliteBuckets = 12
+	if len(buckets) > maxEliteBuckets {
+		buckets = buckets[:maxEliteBuckets]
+	}
 
 	selected := make([]NodeResult, 0, maxPool)
+	pickedIP := make(map[string]bool, maxPool)
 	cursor := make([]int, len(buckets))
-	for len(selected) < maxPool {
+	for len(selected) < maxPool && len(buckets) > 0 {
 		progressed := false
 		for bi, b := range buckets {
-			if cursor[bi] < len(b.items) {
-				selected = append(selected, b.items[cursor[bi]])
-				cursor[bi]++
-				progressed = true
-				if len(selected) >= maxPool {
-					break
+			quota := 1
+			if len(buckets) >= 6 {
+				if bi < 2 {
+					quota = 4
+				} else if bi < 5 {
+					quota = 2
 				}
+			} else {
+				if bi == 0 {
+					quota = 3
+				} else {
+					quota = 2
+				}
+			}
+			for q := 0; q < quota && cursor[bi] < len(b.items); q++ {
+				item := b.items[cursor[bi]]
+				cursor[bi]++
+				if !pickedIP[item.IP] {
+					pickedIP[item.IP] = true
+					selected = append(selected, item)
+					progressed = true
+					if len(selected) >= maxPool {
+						break
+					}
+				}
+			}
+			if len(selected) >= maxPool {
+				break
 			}
 		}
 		if !progressed {
 			break
+		}
+	}
+
+	// Pass 2: 若精英桶未填满 maxPool，严格按全局最优代价顺序补齐
+	for _, n := range sorted {
+		if len(selected) >= maxPool {
+			break
+		}
+		if !pickedIP[n.IP] {
+			pickedIP[n.IP] = true
+			selected = append(selected, n)
 		}
 	}
 	return selected
@@ -5665,7 +5784,21 @@ func ScanRoutesWithProfileDetailed(ctx context.Context, ips []string, port int, 
 	if concurrency < 1 {
 		concurrency = 1
 	}
+	if concurrency > 300 {
+		concurrency = 300
+	}
 	sem := make(chan struct{}, concurrency)
+
+	// 独立 L2 握手信号量：在 GOWAY-WSS 模式下，所有边缘节点的 101 握手均会回源至用户单台 VPS。
+	// 严格限制 L2 并发（WSS 48 / HTTPS 96），防止几百个并发 TLS+WS 握手瞬间打满 VPS 队列导致假超时与 1800ms+ 虚高延迟。
+	l2Limit := 96
+	if profile.Type == ProfileGOWAYWSS || (profile.Type == ProfileCustom && strings.EqualFold(profile.Protocol, "wss")) {
+		l2Limit = 48
+	}
+	if concurrency < l2Limit {
+		l2Limit = concurrency
+	}
+	l2Sem := make(chan struct{}, l2Limit)
 	var wg sync.WaitGroup
 
 	for _, ip := range ips {
@@ -5697,8 +5830,8 @@ func ScanRoutesWithProfileDetailed(ctx context.Context, ips []string, port int, 
 				return
 			}
 
-			// Layer 1: TCP Ping (3 次采样 + 累计失败 2 次即刻 Fail-Fast 淘汰)
-			avgLat, jitter, loss, tcpOK := measureTCPPingStats(ctx, ip, targetPort, 3, 2, 2, 1000*time.Millisecond)
+			// Layer 1: 4 次高精度 TCP Ping（要求至少 3 次成功，累计失败 2 次立即 Fail-Fast 淘汰，直接挡住 >=33% 丢包与高抖动残次节点）
+			avgLat, jitter, loss, tcpOK := measureTCPPingStats(ctx, ip, targetPort, 4, 3, 2, 900*time.Millisecond)
 			if ctx.Err() != nil {
 				return
 			}
@@ -5712,6 +5845,13 @@ func ScanRoutesWithProfileDetailed(ctx context.Context, ips []string, port int, 
 			}
 
 			tcpValidCount.Add(1)
+
+			select {
+			case l2Sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-l2Sem }()
 
 			// Layer 2: Profile-driven check (excluding real HTTP 403s)
 			// 保持 TCPLatency 为纯净的 TCP RTT，不混入应用层 TTFB/WSS 延迟，以保证 Bufferbloat 基准与延迟分准确
@@ -5814,13 +5954,13 @@ func ScanRoutesWithProfileDetailed(ctx context.Context, ips []string, port int, 
 	return validNodes, int(tcpValidCount.Load()), int(l2ValidCount.Load())
 }
 
-// routePreRankKey 综合空载延迟、抖动与丢包率计算初筛代价（越低越优，确保 0 丢包、低抖动节点优先入围）
+// routePreRankKey 综合空载延迟、抖动与丢包率计算初筛代价（越低越优，重罚丢包与抖动，确保 0 丢包、低波动、低延迟节点优先入围）
 func routePreRankKey(n NodeResult) float64 {
 	effectiveLat := n.TCPLatency
 	if n.GOWAYWSSLatency > 0 {
-		effectiveLat = n.TCPLatency*0.7 + (n.GOWAYWSSLatency/2.0)*0.3
+		effectiveLat = n.TCPLatency*0.65 + (n.GOWAYWSSLatency/2.0)*0.35
 	}
-	return effectiveLat + n.Jitter*2.5 + n.PacketLoss*180.0
+	return effectiveLat + n.Jitter*3.5 + n.PacketLoss*260.0
 }
 
 // avgLatency returns the average TCPLatency of a node slice.
@@ -5973,6 +6113,16 @@ func runQuickFilter(ctx context.Context, candidates []NodeResult, cfg Config, to
 				return
 			}
 			target := resolveSpeedTestTarget(cfg, c.IP)
+			if strings.Contains(target.URL, "speed.cloudflare.com/__down?bytes=1000000000") {
+				target.URL = strings.Replace(target.URL, "bytes=1000000000", "bytes=150000000", 1)
+			}
+			if idx >= numWorkers && strings.Contains(target.URL, "speed.cloudflare.com") {
+				select {
+				case <-time.After(25 * time.Millisecond):
+				case <-ctx.Done():
+					return
+				}
+			}
 			sm := SingleStreamTestDetailed(ctx, target, cfg.QuickDuration, nil, c.TCPLatency, c.Jitter, c.PacketLoss)
 			results[idx] = quickResult{
 				idx:         idx,
@@ -5992,16 +6142,40 @@ func runQuickFilter(ctx context.Context, candidates []NodeResult, cfg Config, to
 	}
 	wg.Wait()
 
-	// 综合预筛均速、P10 下限速度与稳定性排序，直接淘汰断流与 HTTP 403 节点（绝不回填死节点）
+	// 综合预筛均速、P10 下限、最低速度、稳定性以及节点延迟/抖动/丢包代价排序，直接淘汰断流与 HTTP 403 节点
+	quickRankScore := func(r quickResult) float64 {
+		if r.aborted403 || r.speed <= 0 {
+			return -1e9
+		}
+		c := candidates[r.idx]
+		routePenalty := c.TCPLatency*0.025 + c.Jitter*0.25 + c.PacketLoss*25.0 + c.GOWAYWSSLatency*0.006
+		return r.speed*0.45 + r.p10*0.35 + r.minSpeed*0.10 + (r.stability/10.0)*0.20 - float64(r.stalls)*10.0 - routePenalty
+	}
 	sort.Slice(results, func(i, j int) bool {
-		scoreI := results[i].speed*0.50 + results[i].p10*0.35 + (results[i].stability/10.0)*0.15 - float64(results[i].stalls)*5.0
-		scoreJ := results[j].speed*0.50 + results[j].p10*0.35 + (results[j].stability/10.0)*0.15 - float64(results[j].stalls)*5.0
-		return scoreI > scoreJ
+		return quickRankScore(results[i]) > quickRankScore(results[j])
 	})
+
+	goodCount := 0
+	for _, r := range results {
+		if !r.aborted403 && r.speed >= 2.0 && r.stalls == 0 {
+			goodCount++
+		}
+	}
+	minGoodFloor := cfg.DownloadNum
+	if minGoodFloor <= 0 || minGoodFloor > topN/2 {
+		minGoodFloor = topN / 2
+	}
+	if minGoodFloor < 3 {
+		minGoodFloor = 3
+	}
 
 	var filtered []NodeResult
 	for _, r := range results {
 		if r.aborted403 || r.speed <= 0 {
+			continue
+		}
+		// 若已有充足的高速健康候选节点，直接剔除预筛阶段已被明显限速（<0.8 MB/s）的劣质节点，避免浪费 8 秒深测时间
+		if goodCount >= minGoodFloor && len(filtered) >= minGoodFloor && r.speed < 0.80 {
 			continue
 		}
 		c := candidates[r.idx]
@@ -6070,11 +6244,30 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 		})
 	}
 
+	isQualifiedResult := func(res NodeResult) bool {
+		if res.DownloadSpeed < 2.5 || res.P10Speed < 1.2 || res.StallCount > 0 || res.PacketLoss > 0.15 || res.Stability < 65.0 {
+			return false
+		}
+		if isWSSProfile && res.WSSSuccessRate > 0 && res.WSSSuccessRate < 0.67 {
+			return false
+		}
+		return true
+	}
+
 	go func() {
+		qualifiedCount := 0
+		maxCollect := cfg.DownloadNum * 2
+		if maxCollect < 20 {
+			maxCollect = 20
+		}
 		for res := range resultCh {
 			mu.Lock()
 			results = append(results, res)
 			n := len(results)
+			if isQualifiedResult(res) {
+				qualifiedCount++
+			}
+			qCount := qualifiedCount
 			mu.Unlock()
 			if progressRow != nil {
 				progressRow(res)
@@ -6086,7 +6279,9 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 				closeDone()
 				return
 			}
-			if n >= cfg.DownloadNum {
+			// 仅当真正达标的优质节点（高吞吐、0断流、低丢包、高稳定）凑满 DownloadNum 时才提前收工；
+			// 若前排混入 0.2 MB/s 限速或断流节点，自动继续向后测试 TopN 池中的后续优质节点！
+			if cfg.DownloadNum > 0 && (qCount >= cfg.DownloadNum || n >= maxCollect) {
 				closeDone()
 				return
 			}
@@ -6183,6 +6378,15 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 						cand.LoadLatency = cand.TCPLatency
 					}
 
+					// 刚结束 8s 满载大流量下载，若为公网测速则留出 40ms 排空网卡/路由器缓冲队列，避免尾包重传干扰后续 WSS/Ping 测量
+					if strings.Contains(candTarget.URL, "speed.cloudflare.com") {
+						select {
+						case <-time.After(40 * time.Millisecond):
+						case <-testCtx.Done():
+							return
+						}
+					}
+
 					// GOWAY-WSS 零流量端到端二次复检（3轮 WSS 101 握手）测量回源真实延迟、抖动与成功率
 					if isWSSProfile {
 						avgWSS, jitWSS, rateWSS, wColo := MeasureWSSStability(testCtx, cand.IP, origProfile.Port, origProfile.SNI, origProfile.Host, origProfile.Path, 3, 2200*time.Millisecond)
@@ -6205,16 +6409,18 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 						}
 					}
 
-					// 对最终入围下载的候选节点补跑 5 轮 TCP Ping 复核，消除 L1 3 次粗测的偶发超时导致的 33% 离散假丢包
+					// 对最终入围下载的候选节点补跑 4 轮 TCP Ping 复核：仅在丢包率不劣化时更新，既能修复 L1 偶发拥塞，又防止下载尾包误伤 0 丢包好节点
 					pingPort := cand.Port
 					if pingPort <= 0 {
 						pingPort = cfg.Port
 					}
-					if avgLat, jit, loss, ok := measureTCPPingStats(testCtx, cand.IP, pingPort, 5, 1, 0, 1000*time.Millisecond); ok {
-						cand.TCPLatency = avgLat
-						cand.Jitter = jit
-						cand.PacketLoss = loss
-						sm.Stability = CalcCompositeStability(&sm, cand.TCPLatency, cand.Jitter, cand.PacketLoss)
+					if avgLat, jit, loss, ok := measureTCPPingStats(testCtx, cand.IP, pingPort, 4, 3, 2, 900*time.Millisecond); ok {
+						if loss <= cand.PacketLoss {
+							cand.TCPLatency = avgLat
+							cand.Jitter = jit
+							cand.PacketLoss = loss
+							sm.Stability = CalcCompositeStability(&sm, cand.TCPLatency, cand.Jitter, cand.PacketLoss)
+						}
 					}
 					if testCtx.Err() != nil {
 						return
@@ -6280,6 +6486,9 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 		}
 		return results[i].LoadLatency < results[j].LoadLatency
 	})
+	if cfg.DownloadNum > 0 && len(results) > cfg.DownloadNum {
+		results = results[:cfg.DownloadNum]
+	}
 	return results
 }
 
@@ -7502,9 +7711,9 @@ func runInteractiveWizardWithIO(cfg *Config, r io.Reader, w io.Writer, lastCfgPa
 	}
 
 	fmt.Fprintln(w, "\n扫描档位:")
-	fmt.Fprintln(w, "  [1] Fast     - 抽样 ~800 个 /24 网段 (~40秒)")
-	fmt.Fprintln(w, "  [2] Standard - 100% 全网段扫描 (~5,900+ /24, 最稳最快)  (默认)")
-	fmt.Fprintln(w, "  [3] Deep     - 100% 全网段 + 长稳态验证 (Top 50 / 12秒)")
+	fmt.Fprintln(w, "  [1] Fast     - 快速均衡抽样 ~800 个 /24 网段 (~35秒)")
+	fmt.Fprintln(w, "  [2] Standard - 黄金跨段均衡抽样 ~1,500 个 /24 网段 (防网关/VPS过载，最稳最快)  (默认)")
+	fmt.Fprintln(w, "  [3] Deep     - 100% 全量 ~5,952 个 /24 网段 + 深度稳态验证 (Top 40 / 10秒)")
 	pChoice := readLine("选择档位 [2]: ")
 	switch pChoice {
 	case "1":
@@ -7515,7 +7724,7 @@ func runInteractiveWizardWithIO(cfg *Config, r io.Reader, w io.Writer, lastCfgPa
 		lc.AllSubnets = true
 	default:
 		lc.Preset = "standard"
-		lc.AllSubnets = true
+		lc.AllSubnets = false
 	}
 
 	applyWizardChoice(cfg, lc)

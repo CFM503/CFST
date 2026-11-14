@@ -643,3 +643,71 @@ func TestMeasureTCPPingStats_LocalListener(t *testing.T) {
 		t.Fatalf("expected closed port to fail with loss=1.0, got ok=%v loss=%.2f", closedOK, closedLoss)
 	}
 }
+
+func TestSelectDiverseCandidates_RejectsDistantAndLossyBuckets(t *testing.T) {
+	var nodes []NodeResult
+	// 12 fast SIN nodes in 172.64.144.0/20 (95~106ms, 0% loss)
+	for i := 0; i < 12; i++ {
+		nodes = append(nodes, NodeResult{
+			IP:         fmt.Sprintf("172.64.%d.10", 144+i),
+			Colo:       "SIN",
+			TCPLatency: 95.0 + float64(i),
+			Jitter:     1.2,
+			PacketLoss: 0.0,
+		})
+	}
+	// 8 fast HKG nodes in 162.159.192.0/20 (105~112ms, 0% loss)
+	for i := 0; i < 8; i++ {
+		nodes = append(nodes, NodeResult{
+			IP:         fmt.Sprintf("162.159.%d.20", 192+i),
+			Colo:       "HKG",
+			TCPLatency: 105.0 + float64(i),
+			Jitter:     1.5,
+			PacketLoss: 0.0,
+		})
+	}
+	// 120 distant FRA/LAX/AMS buckets (each in its own /20!) with high latency (340~500ms) or 25% loss
+	for b := 0; b < 120; b++ {
+		nodes = append(nodes, NodeResult{
+			IP:         fmt.Sprintf("104.%d.%d.50", 16+(b/16), (b%16)*16+1),
+			Colo:       "FRA",
+			TCPLatency: 340.0 + float64(b),
+			Jitter:     15.0,
+			PacketLoss: 0.25,
+		})
+	}
+
+	selected := selectDiverseCandidates(nodes, 20)
+	if len(selected) != 20 {
+		t.Fatalf("expected 20 selected candidates, got %d", len(selected))
+	}
+	for _, s := range selected {
+		if s.Colo == "FRA" || s.TCPLatency > 200 || s.PacketLoss > 0 {
+			t.Fatalf("distant/lossy bucket leaked into top 20 elite pool: %+v", s)
+		}
+	}
+}
+
+func TestPiecewiseLatencyScoreAndInterleavedSubnets(t *testing.T) {
+	eng := NewScoreEngine(ModeNormal)
+	w := eng.ActiveWeights()
+	// 210ms node must score strictly higher than 420ms node (was both 0 on latency in v2.5.1)
+	s210 := eng.calcMetricScore(w, 25, 20, 15, 210.0, 1.0, 0.0, 90.0, true, "SIN")
+	s420 := eng.calcMetricScore(w, 25, 20, 15, 420.0, 1.0, 0.0, 90.0, true, "SIN")
+	if s210 <= s420 {
+		t.Fatalf("expected 210ms node (%.1f) to score higher than 420ms node (%.1f)", s210, s420)
+	}
+
+	// Standard 1,500 sample must cover >= 150 distinct /20 prefixes
+	ips := GenerateIPs(1500, true, "")
+	if len(ips) != 1500 {
+		t.Fatalf("expected 1500 IPs, got %d", len(ips))
+	}
+	seen20 := make(map[string]bool)
+	for _, ip := range ips {
+		seen20[prefix20Key(ip)] = true
+	}
+	if len(seen20) < 150 {
+		t.Fatalf("expected interleaved /24 sampling to span >= 150 distinct /20 blocks, got %d", len(seen20))
+	}
+}
