@@ -9,11 +9,13 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/csv"
 	"fmt"
 	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -489,5 +491,155 @@ func TestMeasureWSSStability_Local101Mock(t *testing.T) {
 	avg, jit, rate, colo := MeasureWSSStability(context.Background(), "127.0.0.1", port, "vps.example.com", "vps.example.com", "/pyway", 3, 2*time.Second)
 	if rate != 1.0 || avg <= 0 || jit < 0 || colo != "NRT" {
 		t.Fatalf("unexpected MeasureWSSStability result: avg=%.2f jit=%.2f rate=%.2f colo=%q", avg, jit, rate, colo)
+	}
+}
+
+func TestCalcScore_WSSSuccessRateAndPacketLossGate(t *testing.T) {
+	// Node A: high speed but 33% WSS handshake success rate
+	flakyWSS := NodeResult{
+		IP:                 "172.64.151.138",
+		Colo:               "SIN",
+		TCPLatency:         110.0,
+		Jitter:             14.8,
+		PacketLoss:         0.0,
+		DownloadSpeed:      28.62,
+		SingleSpeed:        28.62,
+		P10Speed:           19.22,
+		MinSpeed:           16.78,
+		LoadLatency:        141.2,
+		Stability:          79.0,
+		GOWAYWSSCompatible: true,
+		GOWAYWSSLatency:    1831.3,
+		WSSSuccessRate:     0.33,
+	}
+	flakyWSS.CalcScore()
+
+	// Node B: 100% WSS handshake success rate + higher P10/stability, even with 20% rechecked loss
+	stableWSS20Loss := NodeResult{
+		IP:                 "172.64.156.150",
+		Colo:               "SIN",
+		TCPLatency:         130.0,
+		Jitter:             0.7,
+		PacketLoss:         0.20,
+		DownloadSpeed:      29.46,
+		SingleSpeed:        29.46,
+		P10Speed:           25.52,
+		MinSpeed:           21.61,
+		LoadLatency:        157.5,
+		Stability:          87.0,
+		GOWAYWSSCompatible: true,
+		GOWAYWSSLatency:    1798.2,
+		WSSSuccessRate:     1.0,
+	}
+	stableWSS20Loss.CalcScore()
+
+	if stableWSS20Loss.Score <= flakyWSS.Score {
+		t.Fatalf("expected 100%% WSS node (%.1f) to outscore 33%% WSS node (%.1f)", stableWSS20Loss.Score, flakyWSS.Score)
+	}
+
+	// ScoreEngine.EvaluateRoute must also apply the WSS handshake instability penalty
+	engine := NewScoreEngine(ModeNormal)
+	rm := FromNodeResult(flakyWSS, TierCandidate)
+	engine.EvaluateRoute(rm, EWMASnapshot{}, EWMASnapshot{}, 0)
+	if rm.FinalScore >= 75.0 {
+		t.Fatalf("expected EvaluateRoute FinalScore to reflect 33%% WSS penalty (<75), got %.1f", rm.FinalScore)
+	}
+
+	// EvaluateTierTransitions must block 33% WSS route from Standby/Active promotion
+	origSchedCfg := GlobalProbeScheduler.GetConfig()
+	defer GlobalProbeScheduler.UpdateConfig(origSchedCfg)
+	wssSchedCfg := origSchedCfg
+	wssSchedCfg.Profile = NewProfileGOWAYWSS("vps.example.com", "/pyway", "vps.example.com", 443)
+	GlobalProbeScheduler.UpdateConfig(wssSchedCfg)
+
+	store := NewRouteStore()
+	rm.ObservationDuration = 600
+	rm.Confidence = 70
+	rm.FinalScore = 80
+	store.UpsertRoute(*rm)
+	store.mu.Lock()
+	store.routes[rm.ID].Samples = make([]MeasurementSample, 5)
+	store.mu.Unlock()
+	store.EvaluateTierTransitions(time.Now())
+	tierAfter, _ := store.GetMetrics(rm.IP)
+	if tierAfter.Tier != TierCandidate {
+		t.Fatalf("expected 33%% WSS route to stay TierCandidate, got %s", tierAfter.Tier)
+	}
+}
+
+func TestRoutePreRankKey_AndSaveCSVColumns(t *testing.T) {
+	a := NodeResult{TCPLatency: 100, Jitter: 2, PacketLoss: 0, GOWAYWSSLatency: 1200}
+	b := NodeResult{TCPLatency: 100, Jitter: 2, PacketLoss: 0, GOWAYWSSLatency: 400}
+	if routePreRankKey(b) >= routePreRankKey(a) {
+		t.Fatalf("expected lower WSSLatency node to pre-rank better: a=%.1f b=%.1f", routePreRankKey(a), routePreRankKey(b))
+	}
+	if a.TCPLatency != 100 || b.TCPLatency != 100 {
+		t.Fatalf("routePreRankKey must not mutate TCPLatency")
+	}
+
+	csvPath := filepath.Join(t.TempDir(), "out.csv")
+	saveCSV(csvPath, []NodeResult{{
+		IP:              "172.64.156.150",
+		Colo:            "SIN",
+		TCPLatency:      120.5,
+		Jitter:          0.7,
+		PacketLoss:      0.2,
+		SingleSpeed:     29.46,
+		DownloadSpeed:   29.46,
+		P10Speed:        25.52,
+		MinSpeed:        21.61,
+		LoadLatency:     157.5,
+		Stability:       87,
+		StallCount:      1,
+		GOWAYWSSLatency: 1798.2,
+		WSSJitter:       28.5,
+		WSSSuccessRate:  1.0,
+		Score:           77.8,
+	}})
+	f, err := os.Open(csvPath)
+	if err != nil {
+		t.Fatalf("open csv: %v", err)
+	}
+	defer f.Close()
+	rows, err := csv.NewReader(f).ReadAll()
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("read csv failed: rows=%d err=%v", len(rows), err)
+	}
+	header := strings.Join(rows[0], ",")
+	if !strings.Contains(header, "Loss") || !strings.Contains(header, "Stalls") {
+		t.Fatalf("expected Loss and Stalls columns in CSV header, got %q", header)
+	}
+	if rows[1][5] != "20%" || rows[1][12] != "1" {
+		t.Fatalf("unexpected Loss/Stalls cell values in CSV row: %+v", rows[1])
+	}
+}
+
+func TestMeasureTCPPingStats_LocalListener(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	port, _ := strconv.Atoi(portStr)
+
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+
+	avg, jit, loss, ok := measureTCPPingStats(context.Background(), "127.0.0.1", port, 5, 1, 0, 500*time.Millisecond)
+	_ = ln.Close()
+	if !ok || loss != 0 || avg <= 0 || jit < 0 {
+		t.Fatalf("expected clean local TCP ping stats, got avg=%.2f jit=%.2f loss=%.2f ok=%v", avg, jit, loss, ok)
+	}
+
+	_, _, closedLoss, closedOK := measureTCPPingStats(context.Background(), "127.0.0.1", port, 3, 2, 2, 200*time.Millisecond)
+	if closedOK || closedLoss != 1.0 {
+		t.Fatalf("expected closed port to fail with loss=1.0, got ok=%v loss=%.2f", closedOK, closedLoss)
 	}
 }

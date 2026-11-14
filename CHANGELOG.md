@@ -1,5 +1,19 @@
 # Changelog
 
+## v2.5.1 (2026-11-14)
+
+### Fix: GOWAY-WSS Scoring Fairness, TCP Ping Recheck & Pure Latency Baseline
+- **WSS 握手成功率纳入正式评分与 ACTIVE 晋升门槛 (`NodeResult.CalcScore`, `ScoreEngine.EvaluateRoute`, `EvaluateTierTransitionsLocked`, `runParallelDownloadTest`)**:
+  - 修复 `CalcScore()` 固定传入满分握手参数导致 `WSSSuccessRate = 33%` 节点未受任何扣分、仅因吞吐略高或极小分差以外仍能当选 `ACTIVE` 的问题；新增 `calcWSSSuccessPenalty` 按 `(1 - WSSSuccessRate) * 30` 对不稳定握手节点扣分（如 67% 扣 10 分、33% 扣 20 分）。
+  - 在多级决胜排序与 Daemon 晋升门控中，优先保障 `WSSSuccessRate >= 67%` 的健康节点，防止低握手率节点抢占 `ACTIVE`。
+- **L4 入围节点 TCP Ping 二次复核与温和丢包惩罚 (`measureTCPPingStats`, `runParallelDownloadTest`)**:
+  - 针对通过下载测速的最终候选节点，补跑 5 轮 TCP Ping（1000ms 超时）复核并同步重算 `CalcCompositeStability`，消除 L1 3 次粗测偶发 1 次超时导致的 `33.3%` 离散假丢包误伤。
+  - 将 `CalcScore()` 中的额外丢包直扣调整为仅针对 `PacketLoss > 10%` 超过部分扣分，避免单次偶发抖动超时被双重重罚 `21.67` 分。
+- **分离纯 TCP 延迟与 WSS/TTFB 延迟 (`ScanRoutesWithProfileDetailed`, `routePreRankKey`)**:
+  - 修复 L2 阶段将 `WSSLatency/2` 或 `TTFB/2` 混入 `TCPLatency` 导致空载 `Latency` 虚高于满载 `LoadLatency`、从而使 Bufferbloat 检测失灵的问题；改在 `routePreRankKey` 初筛排序内部临时加权计算，保持 `TCPLatency` 为纯净 TCP RTT。
+- **可观测性与版本一致性 (`saveCSV`, `RunCLI`, `indexHTML`)**:
+  - 终端测速表与导出 CSV 补齐 `Loss`（以及 CSV 的 `Stalls`）列，直观暴露丢包与断流扣分依据；Web UI 标题与版本文本统一动态跟随 `AppVersion`。
+
 ## v2.5.0 (2026-11-14)
 
 ### Release: 100% /24 All-Subnet Funnel, Precise 403 Exclusion, Dual-Dimension GOWAY Probing & Interactive Wizard

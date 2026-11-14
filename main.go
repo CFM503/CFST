@@ -36,7 +36,7 @@ import (
 // ============================================================================
 // APPLICATION METADATA & VERSION
 // ============================================================================
-const AppVersion = "2.5.0"
+const AppVersion = "2.5.1"
 
 // ============================================================================
 // EMBEDDED WEB UI ASSETS (Self-contained, zero external files needed)
@@ -48,7 +48,7 @@ var indexHTML = func() []byte {
 	if err != nil {
 		panic("failed to decode embedded index.html: " + err.Error())
 	}
-	return data
+	return []byte(strings.ReplaceAll(string(data), "v2.5.0", "v"+AppVersion))
 }()
 
 // ============================================================================
@@ -761,12 +761,13 @@ func (e *ScoreEngine) EvaluateRoute(m *RouteMetrics, shortEWMA, longEWMA EWMASna
 		conf = 50.0
 	}
 
-	// 6. FinalScore = Instant + ShortTerm + LongTerm + PeakHour + Confidence
+	// 6. FinalScore = Instant + ShortTerm + LongTerm + PeakHour + Confidence - WSS instability penalty
 	final := m.InstantScore*hw.InstantWeight +
 		m.ShortTermScore*hw.ShortTermWeight +
 		m.LongTermScore*hw.LongTermWeight +
 		peakScore*hw.PeakHourWeight +
 		conf*hw.ConfidenceWeight
+	final -= calcWSSSuccessPenalty(m.GOWAYWSSCompatible, m.WSSSuccessRate)
 
 	if final < 0 {
 		final = 0
@@ -774,6 +775,14 @@ func (e *ScoreEngine) EvaluateRoute(m *RouteMetrics, shortEWMA, longEWMA EWMASna
 		final = 100.0
 	}
 	m.FinalScore = math.Round(final*10) / 10
+}
+
+// calcWSSSuccessPenalty penalizes flaky GOWAY WSS handshakes (e.g. 67% -> -10, 33% -> -20).
+func calcWSSSuccessPenalty(compatible bool, successRate float64) float64 {
+	if !compatible || successRate <= 0 || successRate >= 1.0 {
+		return 0
+	}
+	return (1.0 - successRate) * 30.0
 }
 
 // ============================================================================
@@ -1951,7 +1960,7 @@ func (s *RouteStore) evaluateTierTransitionsLocked(now time.Time) {
 			continue
 		}
 		m := &rec.Metrics
-		wssGateOK := !isGOWAYWSS || m.GOWAYWSSCompatible
+		wssGateOK := !isGOWAYWSS || (m.GOWAYWSSCompatible && (m.WSSSuccessRate == 0 || m.WSSSuccessRate >= 0.67))
 		if m.ObservationDuration >= 300.0 && len(rec.Samples) >= 3 && m.Confidence >= 35.0 &&
 			m.Health == HealthHealthy && m.FinalScore >= 70.0 && m.PacketLoss <= 0.05 &&
 			m.Jitter <= 25.0 && m.StallCount == 0 && wssGateOK {
@@ -1976,7 +1985,7 @@ func (s *RouteStore) evaluateTierTransitionsLocked(now time.Time) {
 				continue
 			}
 			m := &rec.Metrics
-			wssGateOK := !isGOWAYWSS || m.GOWAYWSSCompatible
+			wssGateOK := !isGOWAYWSS || (m.GOWAYWSSCompatible && (m.WSSSuccessRate == 0 || m.WSSSuccessRate >= 0.67))
 			if m.Health == HealthHealthy && m.Confidence >= 50.0 && m.FinalScore >= 70.0 && m.PacketLoss <= 0.02 && m.StallCount == 0 && wssGateOK {
 				if bestStandby == nil || m.FinalScore > bestStandby.Metrics.FinalScore {
 					bestStandby = rec
@@ -1996,7 +2005,7 @@ func (s *RouteStore) evaluateTierTransitionsLocked(now time.Time) {
 				continue
 			}
 			m := &rec.Metrics
-			wssGateOK := !isGOWAYWSS || m.GOWAYWSSCompatible
+			wssGateOK := !isGOWAYWSS || (m.GOWAYWSSCompatible && (m.WSSSuccessRate == 0 || m.WSSSuccessRate >= 0.67))
 			if m.Health == HealthHealthy && m.Confidence >= 60.0 && m.ObservationDuration >= 900.0 &&
 				m.FinalScore >= activeRec.Metrics.FinalScore+5.0 && m.P10Speed >= activeRec.Metrics.P10Speed &&
 				m.PacketLoss <= 0.02 && m.StallCount == 0 && wssGateOK {
@@ -2216,13 +2225,14 @@ func (n *NodeResult) CalcScore() {
 		effectiveP10 = n.MinSpeed
 	}
 	score := GlobalScoreEngine.calcMetricScore(w, effectiveSpeed, effectiveP10, n.MinSpeed, n.TCPLatency, n.Jitter, n.PacketLoss, n.Stability, true, n.Colo)
-	// 长连接严苛质量门控：严惩中途断流、丢包及满载延迟暴涨（Bufferbloat）
+	// 长连接严苛质量门控：严惩中途断流、高丢包、WSS 握手不稳及满载延迟暴涨（Bufferbloat）
 	if n.StallCount > 0 {
 		score -= float64(n.StallCount) * 12.0
 	}
-	if n.PacketLoss > 0 {
-		score -= n.PacketLoss * 35.0
+	if n.PacketLoss > 0.10 {
+		score -= (n.PacketLoss - 0.10) * 35.0
 	}
+	score -= calcWSSSuccessPenalty(n.GOWAYWSSCompatible, n.WSSSuccessRate)
 	if n.LoadLatency > 0 && n.TCPLatency > 0 && n.LoadLatency > n.TCPLatency*2.2+60.0 {
 		bloatPenalty := math.Min(10.0, (n.LoadLatency-(n.TCPLatency*2.2+60.0))*0.04)
 		score -= bloatPenalty
@@ -3047,6 +3057,57 @@ func TCPPing(ip string, port int, timeout time.Duration) float64 {
 		return 0.001
 	}
 	return lat
+}
+
+// measureTCPPingStats executes count TCP pings and returns average latency, jitter, packet loss, and whether minSuccess was met.
+func measureTCPPingStats(ctx context.Context, ip string, port, count, minSuccess, maxFailures int, timeout time.Duration) (avgLat, jitter, loss float64, ok bool) {
+	if count <= 0 {
+		count = 3
+	}
+	if minSuccess <= 0 {
+		minSuccess = 1
+	}
+	lats := make([]float64, 0, count)
+	failures := 0
+	for i := 0; i < count; i++ {
+		if ctx != nil && ctx.Err() != nil {
+			return 0, 0, 1.0, false
+		}
+		lat := TCPPing(ip, port, timeout)
+		if lat > 0 {
+			lats = append(lats, lat)
+		} else {
+			failures++
+			if maxFailures > 0 && failures >= maxFailures {
+				break
+			}
+		}
+		if i < count-1 {
+			select {
+			case <-time.After(15 * time.Millisecond):
+			case <-ctx.Done():
+				return 0, 0, 1.0, false
+			}
+		}
+	}
+	if len(lats) < minSuccess {
+		return 0, 0, float64(count-len(lats)) / float64(count), false
+	}
+	var sum float64
+	for _, l := range lats {
+		sum += l
+	}
+	avgLat = sum / float64(len(lats))
+	if len(lats) > 1 {
+		var variance float64
+		for _, l := range lats {
+			diff := l - avgLat
+			variance += diff * diff
+		}
+		jitter = math.Sqrt(variance / float64(len(lats)))
+	}
+	loss = float64(count-len(lats)) / float64(count)
+	return avgLat, jitter, loss, true
 }
 
 // WSSHandshakeResult records the outcome and diagnostics of a GOWAY WSS compatibility check.
@@ -5354,12 +5415,12 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		Port:               443,
-		MaxScan:            0,  // 0 + Unique=true => 扫描 100% 全量 /24 网段（约 5,900+ 个）
-		TopN:               30, // 优选前 30 个进入深度测速
-		DLConc:             1,  // 单线程独占带宽精确测速，杜绝多连接争抢导致 P10 与稳定性失真
-		DownloadNum:        10, // 输出前 10 个高质量长连接节点
-		Duration:           8,  // 每个测 8 秒，充分检验稳态吞吐与后半程抗限速能力
-		StopThreshold:      0,  // 0 = 不提前中断，确保全局真正最快/最高吞吐的节点胜出
+		MaxScan:            0,    // 0 + Unique=true => 扫描 100% 全量 /24 网段（约 5,900+ 个）
+		TopN:               30,   // 优选前 30 个进入深度测速
+		DLConc:             1,    // 单线程独占带宽精确测速，杜绝多连接争抢导致 P10 与稳定性失真
+		DownloadNum:        10,   // 输出前 10 个高质量长连接节点
+		Duration:           8,    // 每个测 8 秒，充分检验稳态吞吐与后半程抗限速能力
+		StopThreshold:      0,    // 0 = 不提前中断，确保全局真正最快/最高吞吐的节点胜出
 		Unique:             true, // 每个 /24 C段只取 1 个 IP，避免同网段重复浪费时间
 		Output:             "result_colo.csv",
 		ScanConcurrent:     400, // 高并发全网段快速扫描
@@ -5637,33 +5698,13 @@ func ScanRoutesWithProfileDetailed(ctx context.Context, ips []string, port int, 
 			}
 
 			// Layer 1: TCP Ping (3 次采样 + 累计失败 2 次即刻 Fail-Fast 淘汰)
-			pingCount := 3
-			lats := make([]float64, 0, pingCount)
-			failures := 0
-			for i := 0; i < pingCount; i++ {
-				if ctx.Err() != nil {
-					return
-				}
-				lat := TCPPing(ip, targetPort, 850*time.Millisecond)
-				if lat > 0 {
-					lats = append(lats, lat)
-				} else {
-					failures++
-					if failures >= 2 {
-						break
-					}
-				}
-				if i < pingCount-1 {
-					select {
-					case <-time.After(15 * time.Millisecond):
-					case <-ctx.Done():
-						return
-					}
-				}
+			avgLat, jitter, loss, tcpOK := measureTCPPingStats(ctx, ip, targetPort, 3, 2, 2, 1000*time.Millisecond)
+			if ctx.Err() != nil {
+				return
 			}
 
 			d := done.Add(1)
-			if len(lats) < 2 {
+			if !tcpOK {
 				if progressCallback != nil && (d%10 == 0 || d == int32(total)) {
 					progressCallback(int(d), total, int(validCount.Load()))
 				}
@@ -5672,24 +5713,8 @@ func ScanRoutesWithProfileDetailed(ctx context.Context, ips []string, port int, 
 
 			tcpValidCount.Add(1)
 
-			var sum float64
-			for _, l := range lats {
-				sum += l
-			}
-			avgLat := sum / float64(len(lats))
-
-			jitter := 0.0
-			if len(lats) > 1 {
-				var variance float64
-				for _, l := range lats {
-					diff := l - avgLat
-					variance += diff * diff
-				}
-				jitter = math.Sqrt(variance / float64(len(lats)))
-			}
-			loss := float64(pingCount-len(lats)) / float64(pingCount)
-
 			// Layer 2: Profile-driven check (excluding real HTTP 403s)
+			// 保持 TCPLatency 为纯净的 TCP RTT，不混入应用层 TTFB/WSS 延迟，以保证 Bufferbloat 基准与延迟分准确
 			var detectedColo string
 			var wssRes WSSHandshakeResult
 			switch profile.Type {
@@ -5701,7 +5726,7 @@ func ScanRoutesWithProfileDetailed(ctx context.Context, ips []string, port int, 
 					checkHost = checkSNI
 					checkURL = "https://" + checkSNI + "/"
 				}
-				ok, ttfb, statusCode, colo, err := HTTPSConnectivityCheck(ctx, ip, targetPort, checkSNI, checkHost, checkURL, 2200*time.Millisecond)
+				ok, _, statusCode, colo, err := HTTPSConnectivityCheck(ctx, ip, targetPort, checkSNI, checkHost, checkURL, 2200*time.Millisecond)
 				if statusCode == 403 {
 					recordSubnet403(subKey)
 				}
@@ -5712,10 +5737,6 @@ func ScanRoutesWithProfileDetailed(ctx context.Context, ips []string, port int, 
 					return
 				}
 				detectedColo = colo
-				// 将 TLS + HTTP TTFB 纳入延迟考量（权重 30%），优先选出网页转发最快的节点
-				if ttfb > 0 {
-					avgLat = avgLat*0.7 + (ttfb/2.0)*0.3
-				}
 
 			case ProfileGOWAYWSS:
 				wssRes = WSSHandshakeCheckContext(ctx, ip, targetPort, profile.SNI, profile.Host, profile.Path, 2500*time.Millisecond)
@@ -5729,9 +5750,6 @@ func ScanRoutesWithProfileDetailed(ctx context.Context, ips []string, port int, 
 					return
 				}
 				detectedColo = wssRes.Colo
-				if wssRes.Latency > 0 {
-					avgLat = avgLat*0.7 + (wssRes.Latency/2.0)*0.3
-				}
 
 			case ProfileCustom:
 				if profile.Protocol == "wss" {
@@ -5746,11 +5764,8 @@ func ScanRoutesWithProfileDetailed(ctx context.Context, ips []string, port int, 
 						return
 					}
 					detectedColo = wssRes.Colo
-					if wssRes.Latency > 0 {
-						avgLat = avgLat*0.7 + (wssRes.Latency/2.0)*0.3
-					}
 				} else {
-					ok, ttfb, statusCode, colo, err := HTTPSConnectivityCheck(ctx, ip, targetPort, profile.SNI, profile.Host, profile.TestURL, 2500*time.Millisecond)
+					ok, _, statusCode, colo, err := HTTPSConnectivityCheck(ctx, ip, targetPort, profile.SNI, profile.Host, profile.TestURL, 2500*time.Millisecond)
 					if statusCode == 403 {
 						recordSubnet403(subKey)
 					}
@@ -5761,9 +5776,6 @@ func ScanRoutesWithProfileDetailed(ctx context.Context, ips []string, port int, 
 						return
 					}
 					detectedColo = colo
-					if ttfb > 0 {
-						avgLat = avgLat*0.7 + (ttfb/2.0)*0.3
-					}
 				}
 			}
 
@@ -5804,7 +5816,11 @@ func ScanRoutesWithProfileDetailed(ctx context.Context, ips []string, port int, 
 
 // routePreRankKey 综合空载延迟、抖动与丢包率计算初筛代价（越低越优，确保 0 丢包、低抖动节点优先入围）
 func routePreRankKey(n NodeResult) float64 {
-	return n.TCPLatency + n.Jitter*2.5 + n.PacketLoss*180.0
+	effectiveLat := n.TCPLatency
+	if n.GOWAYWSSLatency > 0 {
+		effectiveLat = n.TCPLatency*0.7 + (n.GOWAYWSSLatency/2.0)*0.3
+	}
+	return effectiveLat + n.Jitter*2.5 + n.PacketLoss*180.0
 }
 
 // avgLatency returns the average TCPLatency of a node slice.
@@ -6189,6 +6205,21 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 						}
 					}
 
+					// 对最终入围下载的候选节点补跑 5 轮 TCP Ping 复核，消除 L1 3 次粗测的偶发超时导致的 33% 离散假丢包
+					pingPort := cand.Port
+					if pingPort <= 0 {
+						pingPort = cfg.Port
+					}
+					if avgLat, jit, loss, ok := measureTCPPingStats(testCtx, cand.IP, pingPort, 5, 1, 0, 1000*time.Millisecond); ok {
+						cand.TCPLatency = avgLat
+						cand.Jitter = jit
+						cand.PacketLoss = loss
+						sm.Stability = CalcCompositeStability(&sm, cand.TCPLatency, cand.Jitter, cand.PacketLoss)
+					}
+					if testCtx.Err() != nil {
+						return
+					}
+
 					cand.DownloadSpeed = sm.AverageSpeed
 					cand.SingleSpeed = sm.AverageSpeed
 					cand.P10Speed = sm.P10Speed
@@ -6216,8 +6247,13 @@ func runParallelDownloadTest(ctx context.Context, candidates []NodeResult, cfg C
 	close(resultCh)
 	<-doneCh
 
-	// 多级决胜排序：总分接近时，WSS成功率 -> 0断流0丢包 -> P10下限速度 -> 稳定性 -> 均速 -> 满载/WSS延迟
+	// 多级决胜排序：WSS握手健康优先 -> 总分接近时，WSS成功率 -> 0断流0丢包 -> P10下限速度 -> 稳定性 -> 均速 -> 满载/WSS延迟
 	sort.Slice(results, func(i, j int) bool {
+		wssHealthyI := results[i].WSSSuccessRate == 0 || results[i].WSSSuccessRate >= 0.67
+		wssHealthyJ := results[j].WSSSuccessRate == 0 || results[j].WSSSuccessRate >= 0.67
+		if wssHealthyI != wssHealthyJ {
+			return wssHealthyI
+		}
 		diff := results[i].Score - results[j].Score
 		if math.Abs(diff) > 1.5 {
 			return results[i].Score > results[j].Score
@@ -6369,25 +6405,25 @@ func RunCLI(cfg Config) {
 
 	fmt.Printf("\n🚀 Download Test (%ds duration, %d parallel)\n", cfg.Duration, cfg.DLConc)
 	if cfg.SkipLoadLatency {
-		fmt.Printf("%-16s %-6s %-9s %-9s %-12s %-11s %-11s %-8s %-6s\n",
-			"IP", "Colo", "Latency", "Jitter", "Speed", "P10", "MinSpd", "Stable", "Score")
-		fmt.Println("------------------------------------------------------------------------------------------------")
+		fmt.Printf("%-16s %-6s %-9s %-9s %-6s %-12s %-11s %-11s %-8s %-6s\n",
+			"IP", "Colo", "Latency", "Jitter", "Loss", "Speed", "P10", "MinSpd", "Stable", "Score")
+		fmt.Println("-------------------------------------------------------------------------------------------------------")
 	} else {
-		fmt.Printf("%-16s %-6s %-9s %-9s %-12s %-11s %-11s %-9s %-8s %-6s\n",
-			"IP", "Colo", "Latency", "Jitter", "Speed", "P10", "MinSpd", "LoadLat", "Stable", "Score")
-		fmt.Println("-------------------------------------------------------------------------------------------------------------")
+		fmt.Printf("%-16s %-6s %-9s %-9s %-6s %-12s %-11s %-11s %-9s %-8s %-6s\n",
+			"IP", "Colo", "Latency", "Jitter", "Loss", "Speed", "P10", "MinSpd", "LoadLat", "Stable", "Score")
+		fmt.Println("--------------------------------------------------------------------------------------------------------------------")
 	}
 
 	results := runParallelDownloadTest(ctx, candidates, cfg, func(res NodeResult) {
 		if res.Colo != "429" || !cfg.Skip429 {
 			fmt.Printf("\r%-140s\r", "")
 			if cfg.SkipLoadLatency {
-				fmt.Printf("%-16s %-6s %6.1fms  %5.1fms  %5.2f MB/s  %5.2f MB/s  %5.2f MB/s  %4.0f%%   %5.1f\n",
-					res.IP, res.Colo, res.TCPLatency, res.Jitter,
+				fmt.Printf("%-16s %-6s %6.1fms  %5.1fms  %4.0f%%  %5.2f MB/s  %5.2f MB/s  %5.2f MB/s  %4.0f%%   %5.1f\n",
+					res.IP, res.Colo, res.TCPLatency, res.Jitter, res.PacketLoss*100,
 					res.DownloadSpeed, res.P10Speed, res.MinSpeed, res.Stability, res.Score)
 			} else {
-				fmt.Printf("%-16s %-6s %6.1fms  %5.1fms  %5.2f MB/s  %5.2f MB/s  %5.2f MB/s  %6.1fms  %4.0f%%   %5.1f\n",
-					res.IP, res.Colo, res.TCPLatency, res.Jitter,
+				fmt.Printf("%-16s %-6s %6.1fms  %5.1fms  %4.0f%%  %5.2f MB/s  %5.2f MB/s  %5.2f MB/s  %6.1fms  %4.0f%%   %5.1f\n",
+					res.IP, res.Colo, res.TCPLatency, res.Jitter, res.PacketLoss*100,
 					res.DownloadSpeed, res.P10Speed, res.MinSpeed, res.LoadLatency, res.Stability, res.Score)
 			}
 		}
@@ -6451,6 +6487,7 @@ func printFinalRouteSelection(results []NodeResult, cfg Config) {
 	fmt.Printf("Colo: %s\n", best.Colo)
 	fmt.Printf("Latency: %.1f ms\n", best.TCPLatency)
 	fmt.Printf("Jitter: %.1f ms\n", best.Jitter)
+	fmt.Printf("Loss: %.0f%%\n", best.PacketLoss*100)
 	fmt.Printf("Speed: %.2f MB/s\n", best.DownloadSpeed)
 	fmt.Printf("P10: %.2f MB/s\n", best.P10Speed)
 	fmt.Printf("MinSpd: %.2f MB/s\n", best.MinSpeed)
@@ -6522,19 +6559,21 @@ func saveCSV(path string, results []NodeResult) {
 	w := csv.NewWriter(f)
 	defer w.Flush()
 
-	w.Write([]string{"Role", "IP", "Colo", "Latency", "Jitter", "SgSpeed_MB", "Speed_MB", "P10Speed_MB", "MinSpeed_MB", "LoadLatency", "Stability", "WSSLatency", "WSSJitter", "WSSSuccessRate", "Score"})
+	w.Write([]string{"Role", "IP", "Colo", "Latency", "Jitter", "Loss", "SgSpeed_MB", "Speed_MB", "P10Speed_MB", "MinSpeed_MB", "LoadLatency", "Stability", "Stalls", "WSSLatency", "WSSJitter", "WSSSuccessRate", "Score"})
 	for i, r := range results {
 		w.Write([]string{
 			routeRole(i),
 			r.IP, r.Colo,
 			fmt.Sprintf("%.1f", r.TCPLatency),
 			fmt.Sprintf("%.1f", r.Jitter),
+			fmt.Sprintf("%.0f%%", r.PacketLoss*100),
 			fmt.Sprintf("%.2f", r.SingleSpeed),
 			fmt.Sprintf("%.2f", r.DownloadSpeed),
 			fmt.Sprintf("%.2f", r.P10Speed),
 			fmt.Sprintf("%.2f", r.MinSpeed),
 			fmt.Sprintf("%.1f", r.LoadLatency),
 			fmt.Sprintf("%.0f", r.Stability),
+			fmt.Sprintf("%d", r.StallCount),
 			fmt.Sprintf("%.1f", r.GOWAYWSSLatency),
 			fmt.Sprintf("%.1f", r.WSSJitter),
 			fmt.Sprintf("%.0f%%", r.WSSSuccessRate*100),
