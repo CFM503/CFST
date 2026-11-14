@@ -1,5 +1,21 @@
 # Changelog
 
+## v2.6.1 (2026-11-14)
+
+### Fix: Two-Level `Colo -> /20` Stratification, Hot `/20` Subnet Fission & Trans-Pacific WSS Anti-Starvation
+- **重构二级 `Colo -> /20` 公平分层与亚太优先保护 (`selectDiverseCandidates`, `coloPriorityTier`, `interleaveNodesByPrefix20`, `routePreRankKey`)**:
+  - **实测根因定位**：在国内 ISP + 欧美自建 VPS 拓扑下，`104.16.0.0/13` 等主干段在 `FRA`/`LAX` 上呈现出**反直觉的「空载 TCP 延迟更低 (`184~220ms`) + 回源欧美 VPS 的 WSS 延迟更低 (`639~950ms`)，但下载吞吐被运营商 QoS 死死限速在 `0.10~0.28 MB/s`」**；而真正不限速、满载延迟仅 `141~160ms`、吞吐高达 `23~30 MB/s` 的 `SIN`（新加坡）黄金节点仅存在于极少数 `/20` 路由块（如 `172.64.144.0/20`、`104.18.32.0/20`），且其空载绕行延迟（`338~359ms`）与跨太平洋回源欧美 VPS 的 `WSSLatency`（`1798~1975ms`）反而更高。
+  - **消除 `v2.6.0` 对 `SIN` 的 100% 误杀**：
+    1. `routePreRankKey` 移除 `(GOWAYWSSLatency/2) * 0.35` 重度回源距离惩罚（仅保留 `0.02` 极轻微同分决胜系数），避免亚洲边缘节点因距离欧美 VPS 物理较远而在测速前被直接淘汰；
+    2. `selectDiverseCandidates` 改为**先按 `Colo` 机房一级分桶、再在每个机房内部按 `/20` 交错轮询**，并对亚太/美西黄金机房（Tier-1 `SIN/HKG/NRT/KIX/TYO/ICN/TPE/SJC`）实行优先保底，彻底杜绝 `FRA`/`LAX` 凭借 100+ 个 `/20` 桶的规模优势和空载假低延迟垄断 100% 预筛池。
+- **L3 高速黄金 `/20` 网段自动裂变扩探 (`runQuickFilter`, `generateFissionIPsFrom20s`)**:
+  - 当 L3 快速预筛在任意稀缺黄金 `/20` 路由块（如 `SIN|172.64.144.0/20` 或 `104.18.32.0/20`）中发现 `>= 3.0 MB/s` 的高吞吐种子节点时，自动触发 **Hot `/20` Subnet Fission（黄金网段裂变）**：立即在该 `/20` 旗下的 16 个 `/24` 兄弟子网中裂变生成最多 `40` 个未测同段 IP，现场完成 L1/L2 校验与 `3s` 快速预筛，将原本仅 2~4 个 `SIN` 种子节点直接扩充为 **15~25+ 个同源高速候选节点**送入 L4 深度测速。
+- **恢复 Standard 默认档 `100%` 全 `/24` 网段无盲区覆盖 (`DefaultConfig`, `applyPreset`, `applyWizardChoice`, `presetQuickPoolSize`)**:
+  - `Standard` 与 `Deep` 档默认恢复 `MaxScan = 0`（100% 遍历全部约 5,952 个 `/24` C 段），确保仅占全网 `< 0.5%` 的稀缺 `SIN` 黄金 `/24` 子网 100% 被探测命中，不再因 `1500` 抽样漏掉大半同段兄弟节点；预筛池容量调优为 `fast = 55`, `standard = 96`, `deep = 140`。
+- **放宽跨洋回源 WSS 握手超时与移除物理距离误扣分 (`ScanRoutesWithProfileDetailed`, `runParallelDownloadTest`, `calcWSSQualityPenalty`)**:
+  - 将 L2 `WSSHandshakeCheckContext` 与 L4 `MeasureWSSStability` 单次握手超时统一放宽至 `3500ms`（L2 WSS 并发上限提升至 `64`），消除 `SIN -> 欧美 VPS`（正常握手耗时 `1800~2000ms`）在边界超时（原 `2200ms`）下被误判为 `33%` 握手率的假故障。
+  - `calcWSSQualityPenalty` 移除 `WSSLatency > 600ms` 的一刀切距离扣分，仅对真正代表链路不稳定的 `WSSJitter`（握手抖动）扣分。
+
 ## v2.6.0 (2026-11-14)
 
 ### Redesign: Elite Competitive Funnel, L2 Anti-Overload Limiter, Interleaved `/20` Sampling & Qualified Early-Stop

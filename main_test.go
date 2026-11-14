@@ -711,3 +711,77 @@ func TestPiecewiseLatencyScoreAndInterleavedSubnets(t *testing.T) {
 		t.Fatalf("expected interleaved /24 sampling to span >= 150 distinct /20 blocks, got %d", len(seen20))
 	}
 }
+
+func TestSelectDiverseCandidates_PreservesMinoritySINOverDominantFRA(t *testing.T) {
+	// Reproduce the exact real-world topology from result_colo.csv:
+	// - FRA and LAX dominate 100+ /20 blocks with LOWER empty-link TCPLatency (185~220ms) and LOWER WSSLatency (650ms)
+	// - SIN exists in only 2 /20 blocks (172.64.144.0/20 and 104.18.32.0/20) with HIGHER empty-link TCPLatency (338~359ms)
+	//   and HIGHER trans-Pacific WSSLatency (1850ms) to a US/EU VPS, yet SIN has 25~30 MB/s unthrottled throughput.
+	var nodes []NodeResult
+	for b := 0; b < 60; b++ {
+		for k := 0; k < 4; k++ {
+			nodes = append(nodes, NodeResult{
+				IP:              fmt.Sprintf("104.%d.%d.%d", 16+(b/16), (b%16)*16+k, 10+k),
+				Colo:            "FRA",
+				TCPLatency:      188.0 + float64(k),
+				Jitter:          1.0,
+				PacketLoss:      0.0,
+				GOWAYWSSLatency: 650.0,
+			})
+			nodes = append(nodes, NodeResult{
+				IP:              fmt.Sprintf("104.%d.%d.%d", 20+(b/16), (b%16)*16+k, 20+k),
+				Colo:            "LAX",
+				TCPLatency:      195.0 + float64(k),
+				Jitter:          1.2,
+				PacketLoss:      0.0,
+				GOWAYWSSLatency: 720.0,
+			})
+		}
+	}
+	// Only 6 SIN nodes across 172.64.144.0/20 and 104.18.32.0/20
+	sinIPs := []string{
+		"172.64.151.138", "172.64.156.150", "172.64.148.29",
+		"104.18.35.154", "104.18.45.201", "104.18.39.88",
+	}
+	for i, ip := range sinIPs {
+		nodes = append(nodes, NodeResult{
+			IP:              ip,
+			Colo:            "SIN",
+			TCPLatency:      338.0 + float64(i)*3.5,
+			Jitter:          1.1,
+			PacketLoss:      0.0,
+			GOWAYWSSLatency: 1850.0,
+		})
+	}
+
+	selected := selectDiverseCandidates(nodes, 96)
+	sinCount := 0
+	for _, s := range selected {
+		if s.Colo == "SIN" {
+			sinCount++
+		}
+	}
+	if sinCount != len(sinIPs) {
+		t.Fatalf("expected all %d minority SIN nodes to be preserved in 96-node quickPool, got %d", len(sinIPs), sinCount)
+	}
+
+	// Also verify Hot Subnet Fission expands a seed /20 into sibling /24 IPs
+	seen := make(map[string]bool)
+	for _, ip := range sinIPs {
+		seen[ip] = true
+	}
+	fission := generateFissionIPsFrom20s([]string{"172.64.144.0/20", "104.18.32.0/20"}, seen, 26)
+	if len(fission) != 26 {
+		t.Fatalf("expected 26 fission sibling IPs from two /20s, got %d", len(fission))
+	}
+	for _, ip := range fission {
+		if seen[ip] {
+			t.Fatalf("fission generated duplicate IP %s", ip)
+		}
+		seen[ip] = true
+		p20 := prefix20Key(ip)
+		if p20 != "172.64.144.0/20" && p20 != "104.18.32.0/20" {
+			t.Fatalf("fission IP %s escaped target /20s (got %s)", ip, p20)
+		}
+	}
+}
